@@ -90,6 +90,7 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | `ccx` | Status: key, slots, routing, escape procedure |
 | `ccx models` / `ccx pick` | Browse the catalog / remap the three aliases |
 | `ccx go` | Switch into a fresh session instead of resuming |
+| `ccx uninstall` / `/ccx:uninstall` | Clean removal (keeps your key unless `--purge`) |
 | `ccx -c --routing exacto` | If a cheap provider fumbles tool calls |
 | `ccx off` | Run claude on the subscription again |
 
