@@ -1,4 +1,4 @@
-# ccx
+# ccx — **C**laude **C**ode e**X**ternal backbone
 
 **Keep 100% of your Claude Code — tools, hooks, skills, MCP servers, and the very conversation you're in. Swap only the model.**
 
