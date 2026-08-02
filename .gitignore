@@ -1,0 +1,4 @@
+# Local secrets must never be committed.
+*.env
+!templates/openrouter.env
+keys.env

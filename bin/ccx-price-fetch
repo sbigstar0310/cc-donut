@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Fetch OpenRouter model pricing and cache it in ~/.claude/ccx/price-cache.json.
+# The statusline calls this in the background; only this script uses the network.
+#
+# This public API needs no key. :floor selects the cheapest provider, so cache the minimum price.
+set -euo pipefail
+
+slug="${1:?usage: ccx-price-fetch <author/model-slug>}"
+CACHE_DIR="$HOME/.claude/ccx"
+CACHE="$CACHE_DIR/price-cache.json"
+mkdir -p "$CACHE_DIR"
+
+body=$(curl -fsS --max-time 8 "https://openrouter.ai/api/v1/models/${slug}/endpoints" 2>/dev/null) || exit 0
+
+CCX_PRICE_BODY="$body" python3 - "$CACHE" "$slug" <<'PY'
+import json, os, sys, time
+
+cache_path, slug = sys.argv[1], sys.argv[2]
+try:
+    data = json.loads(os.environ["CCX_PRICE_BODY"]).get("data") or {}
+except Exception:
+    sys.exit(0)
+
+prompts, completions = [], []
+for ep in data.get("endpoints") or []:
+    # Tags containing '/' are service-tier variants such as flex/priority. They require explicit
+    # selection, so exclude them from the default :floor pool (for example flex vs standard).
+    tag = ep.get("tag") or ""
+    if "/" in tag:
+        continue
+    p = ep.get("pricing") or {}
+    try:
+        prompts.append(float(p["prompt"]))
+        completions.append(float(p["completion"]))
+    except (KeyError, TypeError, ValueError):
+        continue
+if not prompts or not completions:
+    sys.exit(0)
+
+try:
+    cache = json.load(open(cache_path))
+except Exception:
+    cache = {}
+models = cache.setdefault("models", {})
+# Prices arrive as USD per token; store them per 1M tokens.
+models[slug] = {
+    "floor_in_per_m": min(prompts) * 1_000_000,
+    "floor_out_per_m": min(completions) * 1_000_000,
+    "max_in_per_m": max(prompts) * 1_000_000,
+    "max_out_per_m": max(completions) * 1_000_000,
+    "fetched_at": int(time.time()),
+}
+
+tmp = cache_path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cache, f)
+os.replace(tmp, cache_path)
+PY

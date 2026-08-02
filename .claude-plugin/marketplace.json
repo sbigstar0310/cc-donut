@@ -1,0 +1,15 @@
+{
+  "name": "ccx",
+  "description": "Emergency OpenRouter backbone for Claude quota exhaustion",
+  "owner": {
+    "name": "sbigstar"
+  },
+  "plugins": [
+    {
+      "name": "ccx",
+      "source": "./",
+      "description": "Emergency OpenRouter backbone for Claude quota exhaustion",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Thin wrapper around the claude-dashboard statusline. It invokes the dashboard as a child
+# process and appends only the required data. It also works without the dashboard plugin.
+#
+# When quota reaches zero Claude cannot respond, so hooks cannot give instructions.
+# The statusline is the only place rendered independently of Claude.
+#
+# While ccx is active, render one dedicated row below the dashboard.
+# ccx-price-fetch fills the cache in the background; rendering never waits for the network.
+#
+# Preserve upstream output on any failure; the statusline must never break.
+set -uo pipefail
+
+CCX_DIR="$HOME/.claude/ccx"
+CACHE="$CCX_DIR/quota-cache.json"
+RUN_STATE="$CCX_DIR/run-state.json"
+OUTAGE_STATE="$CCX_DIR/outage-state.json"
+PRICE_CACHE="$CCX_DIR/price-cache.json"
+mkdir -p "$CCX_DIR"
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PRICE_FETCH="$SELF_DIR/ccx-price-fetch"
+# The statusline warning means "switch now." Use 95%; the hook's 85% delegation threshold differs.
+THRESHOLD=95
+
+payload=$(cat)
+
+# Locate the newest claude-dashboard build dynamically (survives plugin updates)
+orig=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/index.js 2>/dev/null | sort -V | tail -1)
+if [ -n "$orig" ]; then
+  base=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
+else
+  base=""
+fi
+
+if [ -n "${CCX_ACTIVE:-}" ]; then
+  # Dedicated ccx row. stdout = row content; stderr line 1 = model slug whose price cache is missing/stale.
+  stale_file=$(mktemp "${TMPDIR:-/tmp}/ccx-stale.XXXXXX")
+  ccx_line=$(CCX_PAYLOAD="$payload" python3 - "$RUN_STATE" "$PRICE_CACHE" "$OUTAGE_STATE" 2>"$stale_file" <<'PY'
+import json, os, sys, time
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return {}
+
+state = load(sys.argv[1])
+prices = load(sys.argv[2]).get("models", {})
+try:
+    payload = json.loads(os.environ.get("CCX_PAYLOAD", "") or "{}")
+except Exception:
+    payload = {}
+
+# Current model: the statusline payload carries the actually-active model (reflects /model changes immediately)
+model_id = ((payload.get("model") or {}).get("id")) or ""
+slug, routing = model_id, ""
+for r in (":floor", ":exacto", ":nitro"):
+    if slug.endswith(r):
+        routing, slug = r, slug[: -len(r)]
+        break
+
+effort = os.environ.get("CLAUDE_CODE_EFFORT_LEVEL")
+if effort not in {"low", "medium", "high", "max"}:
+    effort = load(os.path.expanduser("~/.claude/settings.json")).get("effortLevel")
+if effort not in {"low", "medium", "high", "max"}:
+    effort = None
+
+def fmt(v):
+    return f"${v:.2f}" if v >= 0.1 else f"${v:.3f}"
+
+# Pricing: :floor pins the cheapest provider (single value); other routings show the provider range
+price_part = "pricing…"
+entry = prices.get(slug)
+if entry:
+    lo_i, lo_o = entry.get("floor_in_per_m"), entry.get("floor_out_per_m")
+    hi_i, hi_o = entry.get("max_in_per_m"), entry.get("max_out_per_m")
+    nums = lambda *v: all(isinstance(x, (int, float)) for x in v)
+    if routing in (":floor", "") and nums(lo_i, lo_o):
+        price_part = f"in {fmt(lo_i)}/M · out {fmt(lo_o)}/M"
+    elif nums(lo_i, hi_i, lo_o, hi_o):
+        price_part = f"in {fmt(lo_i)}–{fmt(hi_i)}/M · out {fmt(lo_o)}–{fmt(hi_o)}/M"
+if slug and (not entry or (time.time() - entry.get("fetched_at", 0)) > 86400):
+    print(slug, file=sys.stderr)
+
+# run = this ccx process's spend; total = whole quota-outage total (survives ccx restarts)
+run_cost = state.get("ccx_spend_usd")
+outage = load(sys.argv[3])
+total_cost = outage.get("outage_spend_usd")
+if isinstance(run_cost, (int, float)):
+    spend_part = f"run ${run_cost:.4f}"
+elif state.get("baseline_usage_usd") is None:
+    spend_part = "spend n/a"
+else:
+    spend_part = "run $0.0000"
+# Show the outage total whenever it exists — including right after a restart,
+# before the first hook has computed this session's run cost.
+if isinstance(total_cost, (int, float)) and "n/a" not in spend_part:
+    spend_part += f" · total ${total_cost:.4f}"
+
+recovery = ""
+window = state.get("recovery_notified_window")
+reset = state.get("recovery_notified_reset")
+# Keep showing while inside the recovered window (reset id unchanged); percent may be >0.
+if window and reset and state.get(f"last_{window}_reset") == reset:
+    recovery = "  \033[1;32m✓ Claude recovered → /exit then claude --resume\033[0m"
+
+model_part = model_id or "model unknown"
+if effort:
+    model_part += f" · {effort}"
+
+sep = " \033[2m│\033[0m "
+print(f"\033[1;35mccx\033[0m{sep}\033[36m{model_part}\033[0m{sep}\033[33m{price_part}\033[0m{sep}\033[33m{spend_part}\033[0m{recovery}", end="")
+PY
+)
+  stale_slug=$(head -n1 "$stale_file" 2>/dev/null || true)
+  rm -f "$stale_file"
+  if [ -n "$stale_slug" ] && [ -x "$PRICE_FETCH" ]; then
+    # Fully detached so rendering never blocks — the cache lands by the next refresh
+    ("$PRICE_FETCH" "$stale_slug" >/dev/null 2>&1 &) || true
+  fi
+  if [ -n "$base" ] && [ -n "$ccx_line" ]; then
+    printf '%s\n%s' "$base" "$ccx_line"
+  else
+    printf '%s%s' "$base" "$ccx_line"
+  fi
+  exit 0
+fi
+
+# ── Normal (subscription) session: append the escape hatch only above the threshold
+suffix=""
+if [ -f "$CACHE" ]; then
+  suffix=$(THRESHOLD="$THRESHOLD" python3 - "$CACHE" 2>/dev/null <<'PY'
+import json, os, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+c = d.get("claude") or {}
+vals = [p for p in (c.get("fiveHourPercent"), c.get("sevenDayPercent"))
+        if isinstance(p, (int, float))]
+if vals and max(vals) >= int(os.environ["THRESHOLD"]):
+    # Red, bold — impossible to miss
+    print("\033[1;31m ⚠ quota " + str(int(max(vals))) + "% → /exit then ccx -c\033[0m", end="")
+PY
+)
+fi
+
+printf '%s%s' "$base" "$suffix"
