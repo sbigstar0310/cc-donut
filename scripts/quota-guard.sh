@@ -16,6 +16,18 @@ mkdir -p "$CCX_DIR"
 TTL=600
 THRESHOLD=85
 
+# Bridge the plugin's userConfig key (set via /plugin → ccx → Configure options,
+# stored in the system keychain, injected here as an env var) into keys.env so
+# the terminal-side `ccx` — which runs outside Claude Code — can use it too.
+# Only fills an empty slot; an existing key is never overwritten.
+KEYS_ENV="$CCX_DIR/providers/keys.env"
+if [ -n "${CLAUDE_PLUGIN_OPTION_OPENROUTER_API_KEY:-}" ] \
+   && ! grep -q '^OPENROUTER_API_KEY="..*"' "$KEYS_ENV" 2>/dev/null; then
+  mkdir -p "$CCX_DIR/providers"
+  printf 'OPENROUTER_API_KEY="%s"\n' "$CLAUDE_PLUGIN_OPTION_OPENROUTER_API_KEY" > "$KEYS_ENV"
+  chmod 600 "$KEYS_ENV"
+fi
+
 file_age() {
   local f="$1" now mtime
   now=$(date +%s)
