@@ -36,7 +36,7 @@ if [ -n "${CCX_ACTIVE:-}" ]; then
   # Dedicated ccx row. stdout = row content; stderr line 1 = model slug whose price cache is missing/stale.
   stale_file=$(mktemp "${TMPDIR:-/tmp}/ccx-stale.XXXXXX")
   ccx_line=$(CCX_PAYLOAD="$payload" python3 - "$RUN_STATE" "$PRICE_CACHE" "$OUTAGE_STATE" 2>"$stale_file" <<'PY'
-import json, os, sys, time
+import json, math, os, sys, time
 
 def load(path):
     try:
@@ -53,7 +53,19 @@ except Exception:
 
 # Current model: the statusline payload carries the actually-active model (reflects /model changes immediately)
 model_id = ((payload.get("model") or {}).get("id")) or ""
+# Normalize compound suffixes: a terminal [1m] is Claude Code's local hint that opens
+# the 1M budget (stripped before the provider), then a routing variant. The EFFECTIVE
+# window is the process's CLAUDE_CODE_AUTO_COMPACT_WINDOW when ccx sized it from
+# verified provider data — show that, so a 912K-pool model reads ~839K, not a fake 1M.
 slug, routing = model_id, ""
+ctx_budget = "200K"
+if slug.endswith("[1m]"):
+    slug = slug[:-4]
+    cw = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+    if cw.isdigit() and int(cw) < 1_000_000:
+        ctx_budget = f"{int(cw) // 1000}K"
+    else:
+        ctx_budget = "1M"
 for r in (":floor", ":exacto", ":nitro"):
     if slug.endswith(r):
         routing, slug = r, slug[: -len(r)]
@@ -79,7 +91,16 @@ if entry:
         price_part = f"in {fmt(lo_i)}/M · out {fmt(lo_o)}/M"
     elif nums(lo_i, hi_i, lo_o, hi_o):
         price_part = f"in {fmt(lo_i)}–{fmt(hi_i)}/M · out {fmt(lo_o)}–{fmt(hi_o)}/M"
-if slug and (not entry or (time.time() - entry.get("fetched_at", 0)) > 86400):
+CACHE_TTL, FUTURE_GRACE = 86400, 300   # shared cache-freshness policy
+stale = True
+if entry:
+    try:
+        age = time.time() - float(entry.get("fetched_at", 0))
+        # Future-dated entries are poisoned or clock-skewed — treat as stale.
+        stale = not math.isfinite(age) or age > CACHE_TTL or age < -FUTURE_GRACE
+    except Exception:
+        stale = True
+if slug and stale:
     print(slug, file=sys.stderr)
 
 # run = this ccx process's spend; total = whole quota-outage total (survives ccx restarts)
@@ -104,9 +125,12 @@ reset = state.get("recovery_notified_reset")
 if window and reset and state.get(f"last_{window}_reset") == reset:
     recovery = "  \033[1;32m✓ Claude recovered → /exit then claude --resume\033[0m"
 
-model_part = model_id or "model unknown"
+display_id = model_id[:-4] if model_id.endswith("[1m]") else model_id
+model_part = display_id or "model unknown"
 if effort:
     model_part += f" · {effort}"
+if display_id:
+    model_part += f" · {ctx_budget}"
 
 sep = " \033[2m│\033[0m "
 print(f"\033[1;35mccx\033[0m{sep}\033[36m{model_part}\033[0m{sep}\033[33m{price_part}\033[0m{sep}\033[33m{spend_part}\033[0m{recovery}", end="")

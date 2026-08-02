@@ -1,5 +1,9 @@
 # ccx — **C**laude **C**ode e**X**ternal backbone
 
+[![License: MIT](https://img.shields.io/github/license/sbigstar0310/ccx)](LICENSE)
+[![tests](https://github.com/sbigstar0310/ccx/actions/workflows/test.yml/badge.svg?branch=main&event=push)](https://github.com/sbigstar0310/ccx/actions/workflows/test.yml?query=branch%3Amain+event%3Apush)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-blueviolet)](#setup--2-minutes-while-you-still-have-quota)
+
 **Keep 100% of your Claude Code — tools, hooks, skills, MCP servers, and the very conversation you're in. Swap only the model.**
 
 Built for the moment your Claude subscription quota dies mid-task: you're back in the same conversation in 10 seconds, on any OpenRouter model, for pennies — and back on your subscription the moment it recovers.
@@ -65,7 +69,7 @@ Sensible defaults are pre-wired onto the aliases you already use:
 | --- | --- | --- | --- |
 | `/model haiku` | deepseek/deepseek-v4-flash | $0.09 / $0.18 | scans, grep, trivial edits |
 | `/model sonnet` | openai/gpt-5.6-luna | $0.10 / $0.60 | everyday coding |
-| `/model opus` | openai/gpt-5.6-terra | $1.00 / $6.00 | hard problems, debugging |
+| `/model opus` | moonshotai/kimi-k3 | $2.90 / $14.00 | hard problems, debugging |
 
 But you're not limited to these. Any slug from [openrouter.ai/models](https://openrouter.ai/models) works mid-session:
 
@@ -138,7 +142,7 @@ macOS and break Linux users.
 <summary><b>Caveats</b></summary>
 
 - **Officially unsupported path**: both Anthropic and OpenRouter state that Claude Code targeting non-Claude models isn't guaranteed. It works via the standard model-slot variables today, but a Claude Code update could break it — hence `ccx doctor`.
-- Gateway models display a 200K context regardless of the model's real window; use `/compact` on long sessions.
+- Behind a gateway, Claude Code budgets 200K context unless the model ID carries the `[1m]` hint. ccx applies `[1m]` automatically when cached OpenRouter endpoint data confirms every provider in the routing pool serves >200K for that slug (unverified models stay at the safe 200K budget; check with `ccx doctor`). `[1m]` goes only on the conversation slots (sonnet/opus) — the haiku chore slot keeps the safe 200K budget, because Claude Code has one global auto-compact window per process and hinting a small chore-model pool would crush it for every model. The **effective window** is the smallest verified pool minimum among hinted slots with headroom (`min × 0.92`, capped at `min − 40K`), so auto-compaction fires at the model's real context ceiling (e.g. ~839K for a 912K-pool model), never at a fake 1M. `[1m]` does not enlarge the upstream model.
 - Remote Control, voice input, and fast mode are off while on the external backbone.
 - macOS-focused (the key dialog uses osascript); the core flow is plain bash + python3 + curl.
 

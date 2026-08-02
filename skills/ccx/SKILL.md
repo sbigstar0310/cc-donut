@@ -89,7 +89,7 @@ prices move and new models ship), do this:
    | slot     | recommended                | $/M in·out   | why |
    | /model haiku  | deepseek/deepseek-v4-flash | 0.11 · 0.22 | cheapest usable; scans & grep |
    | /model sonnet | openai/gpt-5.6-luna        | 0.10 · 0.60 | best value at everyday coding |
-   | /model opus   | openai/gpt-5.6-terra       | 1.00 · 6.00 | cheapest model in the 70% class |
+   | /model opus   | moonshotai/kimi-k3         | 2.90 · 14.00 | hard problems, debugging |
 
    Swap in? [y/n]  ·  runner-up for opus: gpt-5.6-sol (72.7%, $5/$30) — pricier, only for the hardest work
    ```

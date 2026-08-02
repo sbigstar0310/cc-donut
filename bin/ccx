@@ -7,7 +7,7 @@
 #   ccx                    Current status, assigned models, and usage
 #   ccx -c                 Switch and resume the last conversation  <- emergency command
 #   ccx go                 Switch into a new session
-#   ccx -c --opus terra    Use terra for the opus slot for this run only
+#   ccx -c --opus kimi     Use kimi for the opus slot for this run only
 #   ccx pick               Choose models for the haiku/sonnet/opus slots (saved)
 #   ccx models             Model catalog (slugs to paste into /model in a session)
 #   ccx key                Enter the OpenRouter API key (no editor needed)
@@ -29,6 +29,7 @@ CCX_DIR="$HOME/.claude/ccx"
 RUN_STATE="$CCX_DIR/run-state.json"
 OUTAGE_STATE="$CCX_DIR/outage-state.json"   # Total for the quota outage, preserved across restarts.
 QUOTA_CACHE="$CCX_DIR/quota-cache.json"
+PRICE_CACHE="$CCX_DIR/price-cache.json"   # also carries per-slug provider context lengths
 mkdir -p "$CCX_DIR"
 [ "$DIR" = "$HOME/.claude/ccx/providers" ] && mkdir -p "$DIR"
 if [ "$DIR" = "$HOME/.claude/ccx/providers" ] && [ -f "$HOME/.claude/providers/openrouter.env" ] && [ ! -f "$CONF" ]; then
@@ -51,7 +52,7 @@ export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
 CCX_ROUTING="${CCX_ROUTING:-floor}"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek/deepseek-v4-flash"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="openai/gpt-5.6-luna"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="openai/gpt-5.6-terra"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="moonshotai/kimi-k3"
 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1"
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW="1000000"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="64000"
@@ -67,8 +68,9 @@ CCX_OPENROUTER_ENV
 # Format: key slug in/out-price description
 flash   deepseek/deepseek-v4-flash   0.11/0.22    Cheapest. For exploration/grep. No independent verification (caution)
 luna    openai/gpt-5.6-luna          0.10/0.60    Frontier. Default everyday coding model
-terra   openai/gpt-5.6-terra         1.00/6.00    Frontier. Hard problems and debugging
+kimi    moonshotai/kimi-k3           2.90/14.00   Frontier. Opus slot: hard problems and debugging
 sol     openai/gpt-5.6-sol           5.00/30.00   Frontier. Only for truly hard problems
+terra   openai/gpt-5.6-terra         1.00/6.00    Frontier. Previous opus default
 glm51   z-ai/glm-5.1                 0.98/4.30    Measured in Claude Code itself
 CCX_MODELS_CONF
     fi
@@ -79,6 +81,22 @@ CCX_MODELS_CONF
   fi
 }
 bootstrap_config
+
+# One-time migration for existing installs: switch the factory-default opus slot
+# from terra to kimi-k3. Only the exact old default line is rewritten, and only
+# when no `ccx pick` override (tiers.env) exists — custom choices always win.
+if [ -f "$CONF" ] && [ ! -f "$TIERS" ] && grep -q '^export ANTHROPIC_DEFAULT_OPUS_MODEL="openai/gpt-5.6-terra"$' "$CONF"; then
+  mig_tmp="$CONF.tmp.$$"
+  sed 's|^export ANTHROPIC_DEFAULT_OPUS_MODEL="openai/gpt-5.6-terra"$|export ANTHROPIC_DEFAULT_OPUS_MODEL="moonshotai/kimi-k3"|' "$CONF" > "$mig_tmp" && mv "$mig_tmp" "$CONF"
+  rm -f "$mig_tmp"
+fi
+# Catalogs that predate the kimi entry get it APPENDED — never overwritten.
+# A user-maintained catalog may carry custom models (or kimi under another key);
+# replacing it wholesale would silently destroy those choices.
+if [ -f "$SELF_DIR/../templates/models.conf" ] && [ -f "$CATALOG" ] \
+   && ! awk '$1=="kimi" {found=1} END{exit !found}' "$CATALOG"; then
+  awk '$1=="kimi" && NF>=3' "$SELF_DIR/../templates/models.conf" >> "$CATALOG"
+fi
 
 if [ -f "$SELF_DIR/../QUOTA-SOS.md" ] && { [ ! -f "$CCX_DIR/QUOTA-SOS.md" ] || ! cmp -s "$SELF_DIR/../QUOTA-SOS.md" "$CCX_DIR/QUOTA-SOS.md"; }; then
   cp "$SELF_DIR/../QUOTA-SOS.md" "$CCX_DIR/QUOTA-SOS.md"
@@ -202,11 +220,89 @@ with_routing() {
   case "$1" in *:*) printf '%s' "$1" ;; *) printf '%s:%s' "$1" "${CCX_ROUTING:-floor}" ;; esac
 }
 
+# Append Claude Code's local [1m] context hint whenever cached OpenRouter endpoint
+# data proves every default-pool provider for this slug serves MORE than the 200K
+# fallback window. Behind a gateway Claude Code budgets 200K unless the model ID
+# carries this hint; it strips the suffix before the request reaches the provider,
+# so the wire format stays "slug:floor". Unverified/stale/malformed cache -> no
+# hint, which keeps the safe 200K budget instead of risking silent failures.
+#
+# [1m] only opens the 1M budget; the EFFECTIVE window is then set by
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW (capped by Claude Code at the model window), which
+# apply_tiers derives from the smallest verified pool minimum — so a slug whose
+# cheapest provider serves 912K is budgeted ~839K, not 200K and not a fake 1M.
+with_context_hint() {
+  local m="$1" min_ctx
+  case "$m" in *'[1m]') printf '%s' "$m"; return 0 ;; esac   # idempotent
+  min_ctx=$(python3 - "$PRICE_CACHE" "${m%%:*}" 2>/dev/null <<'PY'
+import json, math, sys, time
+CACHE_TTL, FUTURE_GRACE = 86400, 300   # shared cache-freshness policy
+try:
+    entry = json.load(open(sys.argv[1])).get("models", {}).get(sys.argv[2]) or {}
+    v = entry.get("min_context_length")
+    # bool is a subclass of int — exclude it explicitly
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError
+    # Entries older than CACHE_TTL are unknown (the launch-time prefetch refreshes
+    # them); future-dated entries beyond FUTURE_GRACE are poisoned or clock-skewed.
+    age = time.time() - float(entry.get("fetched_at", 0))
+    if not math.isfinite(age) or age > CACHE_TTL or age < -FUTURE_GRACE:
+        raise ValueError
+    print(int(v))
+except Exception:
+    pass
+PY
+)
+  case "$min_ctx" in
+    ''|*[!0-9]*) printf '%s' "$m" ;;
+    *) [ "$min_ctx" -gt 200000 ] && printf '%s[1m]' "$m" || printf '%s' "$m" ;;
+  esac
+}
+
+# Effective auto-compact window for the hinted slots: the smallest verified pool
+# minimum, minus headroom for the response (MAX_OUTPUT_TOKENS=64000) and compaction
+# slop. Callers pass only slugs that just passed with_context_hint, so cache
+# freshness is prechecked here by construction.
+compact_window_for() {  # $1..$N = base slugs that received [1m]
+  python3 - "$PRICE_CACHE" "$@" 2>/dev/null <<'PY'
+import json, sys
+try:
+    models = json.load(open(sys.argv[1])).get("models", {})
+    mins = []
+    for slug in sys.argv[2:]:
+        v = (models.get(slug) or {}).get("min_context_length")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            mins.append(int(v))
+    if mins:
+        m = min(mins)
+        print(int(min(m * 0.92, m - 40000)))
+except Exception:
+    pass
+PY
+}
+
 # Resolve all three model slots into environment variables after applying one-time overrides.
 apply_tiers() {
-  ANTHROPIC_DEFAULT_HAIKU_MODEL=$(with_routing "$ANTHROPIC_DEFAULT_HAIKU_MODEL")
-  ANTHROPIC_DEFAULT_SONNET_MODEL=$(with_routing "$ANTHROPIC_DEFAULT_SONNET_MODEL")
-  ANTHROPIC_DEFAULT_OPUS_MODEL=$(with_routing "$ANTHROPIC_DEFAULT_OPUS_MODEL")
+  local hinted_slugs="" RESOLVED
+  # RESOLVED is intentionally written in the caller's scope (bash dynamic scoping):
+  # command substitution would lose the hinted_slugs append.
+  resolve_slot() { # $1 = raw slot value; $2 = hint|nohint; RESOLVED = routed (+ hinted) value
+    local v b
+    v=$(with_routing "$1")
+    [ "$2" = "hint" ] && v=$(with_context_hint "$v")
+    case "$v" in
+      *'[1m]') b="${v%\[1m\]}"; hinted_slugs="$hinted_slugs ${b%%:*}" ;;
+    esac
+    RESOLVED="$v"
+  }
+  # Only the conversation-driving slots (sonnet/opus) get [1m]. Claude Code has ONE
+  # global auto-compact window per process, sized below from the hinted slots'
+  # smallest verified pool — hinting a small chore model (flash pool min 262K)
+  # would crush that window to ~222K for EVERY model, kimi included. Unhinted, the
+  # haiku slot keeps the safe 200K budget, always below its real ceiling.
+  resolve_slot "$ANTHROPIC_DEFAULT_HAIKU_MODEL"  nohint; ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED"
+  resolve_slot "$ANTHROPIC_DEFAULT_SONNET_MODEL" hint;   ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED"
+  resolve_slot "$ANTHROPIC_DEFAULT_OPUS_MODEL"   hint;   ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED"
   ANTHROPIC_DEFAULT_FABLE_MODEL="$ANTHROPIC_DEFAULT_OPUS_MODEL"
   export ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
          ANTHROPIC_DEFAULT_OPUS_MODEL  ANTHROPIC_DEFAULT_FABLE_MODEL
@@ -214,15 +310,24 @@ apply_tiers() {
   export CLAUDE_CODE_SUBAGENT_MODEL="$ANTHROPIC_DEFAULT_SONNET_MODEL"
 
   # Fourth slot: always show the cheapest model at the bottom of the picker.
-  export ANTHROPIC_CUSTOM_MODEL_OPTION="$(with_routing "$(slug_of flash)")"
+  resolve_slot "$(slug_of flash)" nohint
+  export ANTHROPIC_CUSTOM_MODEL_OPTION="$RESOLVED"
   export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="cheapest (${CCX_ROUTING:-floor})"
+
+  # One global window per process: the smallest hinted ceiling (policy: see
+  # with_context_hint). Unhinted slots keep their own 200K boundary.
+  if [ -n "$hinted_slugs" ]; then
+    local cw
+    cw=$(compact_window_for $hinted_slugs)
+    [ -n "$cw" ] && export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$cw"
+  fi
 }
 
 show_models() {
   load_env
   printf '%sModel catalog%s  %s(price = input/output $ per 1M tokens)%s\n\n' "$b" "$r" "$d" "$r"
   awk '!/^#/ && NF>=4 {printf "  %-9s %-38s %-14s %s\n", $1, $2, $3, substr($0, index($0,$4))}' "$CATALOG"
-  printf '\n%sTo switch during a session, enter the slug directly:%s  %s/model openai/gpt-5.6-terra:%s%s\n' \
+  printf '\n%sTo switch during a session, enter the slug directly:%s  %s/model moonshotai/kimi-k3:%s%s\n' \
     "$d" "$r" "$b" "${CCX_ROUTING:-floor}" "$r"
   printf '%sTo persistently change the three slots:%s  %sccx pick%s\n' "$d" "$r" "$b" "$r"
 }
@@ -316,6 +421,8 @@ doctor() {
   load_env; require_key; apply_tiers
   local model="$ANTHROPIC_MODEL"
   [ $# -ge 1 ] && { model=$(slug_of "$1") || die "Unknown model key: $1"; model=$(with_routing "$model"); }
+  # The [1m] hint is Claude Code-local — never send it to the provider.
+  model="${model%\[1m\]}"
   printf '%s→ Validating %s / %s...%s\n' "$d" "$ANTHROPIC_BASE_URL" "$model" "$r"
   local code
   code=$(curl -sS -o /tmp/ccx-doctor.json -w '%{http_code}' \
@@ -334,6 +441,66 @@ doctor() {
              printf '  %sCheck the slug at openrouter.ai/models and update %s.%s\n' "$d" "$CATALOG" "$r" ;;
     *)   printf '%s✗ HTTP %s%s\n  Response: %s\n' "$red" "$code" "$r" "$(head -c 300 /tmp/ccx-doctor.json)" ;;
   esac
+
+  # Context budget per slot: refresh each slug's provider data, then report what
+  # apply_tiers will do. Rows show each model's own ceiling; the footer shows the
+  # one process-wide window Claude Code actually uses (smallest hinted ceiling).
+  printf '\n%sContext budget per slot%s %s([1m] on sonnet/opus; auto-compact = smallest verified pool − headroom)%s\n' "$b" "$d" "$r"
+  local slot sm base refreshed ceiling cw hinted_bases=""
+  for slot in HAIKU SONNET OPUS; do
+    case "$slot" in
+      HAIKU)  sm="$ANTHROPIC_DEFAULT_HAIKU_MODEL" ;;
+      SONNET) sm="$ANTHROPIC_DEFAULT_SONNET_MODEL" ;;
+      OPUS)   sm="$ANTHROPIC_DEFAULT_OPUS_MODEL" ;;
+    esac
+    base="${sm%\[1m\]}"; base="${base%%:*}"
+    [ -x "$SELF_DIR/ccx-price-fetch" ] && "$SELF_DIR/ccx-price-fetch" "$base" >/dev/null 2>&1
+    # Recompute the hint from the JUST-refreshed cache — the value wired at apply_tiers
+    # time is stale by one refresh, and the row must show what the next launch will do.
+    case "$slot" in
+      HAIKU)  refreshed="${sm%\[1m\]}" ;;                    # chore slot: never hinted
+      *)      refreshed=$(with_context_hint "${sm%\[1m\]}") ;;
+    esac
+    ceiling=""
+    case "$refreshed" in
+      *'[1m]') hinted_bases="$hinted_bases $base"; ceiling=$(compact_window_for "$base") ;;
+    esac
+    python3 - "$PRICE_CACHE" "$base" "$slot" "$refreshed" "$ceiling" <<'PY'
+import json, math, sys, time
+CACHE_TTL, FUTURE_GRACE = 86400, 300   # shared cache-freshness policy
+cache, base, slot, wired, ceiling = sys.argv[1:6]
+try:
+    entry = json.load(open(cache)).get("models", {}).get(base) or {}
+except Exception:
+    entry = {}
+lo, hi = entry.get("min_context_length"), entry.get("max_context_length")
+def num(v): return isinstance(v, (int, float)) and not isinstance(v, bool)
+fresh = False
+try:
+    age = time.time() - float(entry.get("fetched_at", 0))
+    fresh = math.isfinite(age) and age <= CACHE_TTL and age >= -FUTURE_GRACE
+except Exception:
+    fresh = False
+hint = "applied" if wired.endswith("[1m]") else "not applied"
+ctx = ""
+if num(lo) and fresh:
+    ctx = f"providers {int(lo):,}–{int(hi):,} ctx" if num(hi) and hi != lo else f"providers {int(lo):,} ctx"
+if wired.endswith("[1m]") and ceiling:
+    print(f"  {slot:<6} → {base:<34} {ctx} → ceiling ~{int(ceiling):,} ([1m] {hint})")
+else:
+    if not ctx:
+        why = "ctx unknown, stays"
+    elif num(lo) and lo > 200000:
+        why = f"{ctx}, but slot stays"                     # chore slot: deliberate
+    else:
+        why = f"pool min {int(lo):,} ≤ 200K, stays"
+    print(f"  {slot:<6} → {base:<34} {why} → 200K budget ([1m] {hint})")
+PY
+  done
+  if [ -n "$hinted_bases" ]; then
+    cw=$(compact_window_for $hinted_bases)
+    [ -n "$cw" ] && printf '  %ssession auto-compact window: %s (smallest hinted ceiling)%s\n' "$d" "$cw" "$r"
+  fi
 }
 
 # Read cumulative usage for the current OpenRouter key. Return empty on error so ccx can still start.
@@ -645,6 +812,43 @@ while [ $# -gt 0 ]; do
     *) args+=("$1"); shift ;;
   esac
 done
+
+# apply_tiers budgets from the cached provider data. On a cache miss/stale entry the
+# slot would launch at 200K even when the model serves far more — the exact failure
+# ccx exists to prevent — so refresh the three slots synchronously (bounded by
+# ccx-price-fetch's --max-time) BEFORE applying. ccx only works when OpenRouter is
+# reachable anyway; a failed fetch just keeps the safe 200K default for this run.
+if [ -x "$SELF_DIR/ccx-price-fetch" ]; then
+  stale_slugs=$(python3 - "$PRICE_CACHE" \
+      "${ANTHROPIC_DEFAULT_HAIKU_MODEL%%:*}" \
+      "${ANTHROPIC_DEFAULT_SONNET_MODEL%%:*}" \
+      "${ANTHROPIC_DEFAULT_OPUS_MODEL%%:*}" 2>/dev/null <<'PY'
+import json, math, sys, time
+CACHE_TTL, FUTURE_GRACE = 86400, 300   # shared cache-freshness policy
+try:
+    models = json.load(open(sys.argv[1])).get("models", {})
+except Exception:
+    models = {}
+now = time.time()
+for slug in dict.fromkeys(sys.argv[2:]):
+    entry = models.get(slug) or {}
+    try:
+        age = now - float(entry.get("fetched_at", 0))
+    except Exception:
+        age = 1e9
+    # A fresh entry WITHOUT the min_context_length key predates context tracking
+    # (price-fetch always writes the key now, null when unverified) — refetch it
+    # once on the first launch after upgrade instead of waiting out the TTL.
+    if not math.isfinite(age) or age > CACHE_TTL or age < -FUTURE_GRACE \
+            or "min_context_length" not in entry:
+        print(slug)
+PY
+)
+  if [ -n "$stale_slugs" ]; then
+    for s in $stale_slugs; do "$SELF_DIR/ccx-price-fetch" "$s" >/dev/null 2>&1 & done
+    wait
+  fi
+fi
 
 apply_tiers
 export CCX_ACTIVE=1

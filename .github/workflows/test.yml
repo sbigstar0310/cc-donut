@@ -1,0 +1,38 @@
+name: test
+
+# The README "tests" badge is scoped to main pushes (branch=main&event=push);
+# pull_request runs gate contributions without affecting the badge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Native smoke suite on the two developer platforms (no secrets, no network
+  # needed by the tests themselves — curl/node are stubbed).
+  smoke:
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: bash test/smoke.sh
+
+  # Same suite inside clean containers — catches GNU-vs-BSD and BusyBox issues.
+  # Image tags match what maintainers run locally (test/docker.sh defaults).
+  containers:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: bash test/docker.sh            # debian:stable-slim
+      - run: bash test/docker.sh alpine:3.20

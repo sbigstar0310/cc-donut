@@ -40,7 +40,7 @@ same; the models actually attached are:
 | --- | --- | --- |
 | `/model haiku` | deepseek-v4-flash | File scans, log grep, trivial edits |
 | `/model sonnet` | gpt-5.6-luna | Default. Everyday coding |
-| `/model opus` | gpt-5.6-terra | Design judgment, tricky debugging |
+| `/model opus` | kimi-k3 | Design judgment, tricky debugging |
 
 To use a model outside the three slots, **type its slug directly.** This also
 applies immediately mid-session.

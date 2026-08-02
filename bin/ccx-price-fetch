@@ -6,14 +6,19 @@
 set -euo pipefail
 
 slug="${1:?usage: ccx-price-fetch <author/model-slug>}"
+# Tolerate compound values from future callers: strip a terminal [1m] hint and
+# any routing suffix so the request URL and cache key are the bare slug.
+slug="${slug%\[1m\]}"
+slug="${slug%%:*}"
 CACHE_DIR="$HOME/.claude/ccx"
 CACHE="$CACHE_DIR/price-cache.json"
 mkdir -p "$CACHE_DIR"
 
-body=$(curl -fsS --max-time 8 "https://openrouter.ai/api/v1/models/${slug}/endpoints" 2>/dev/null) || exit 0
+# -g disables URL globbing (defensive — a terminal [1m] was already stripped above).
+body=$(curl -gfsS --max-time 8 "https://openrouter.ai/api/v1/models/${slug}/endpoints" 2>/dev/null) || exit 0
 
 CCX_PRICE_BODY="$body" python3 - "$CACHE" "$slug" <<'PY'
-import json, os, sys, time
+import fcntl, json, os, sys, time
 
 cache_path, slug = sys.argv[1], sys.argv[2]
 try:
@@ -21,13 +26,22 @@ try:
 except Exception:
     sys.exit(0)
 
-prompts, completions = [], []
+prompts, completions, contexts = [], [], []
+context_unknown = False
 for ep in data.get("endpoints") or []:
     # Tags containing '/' are service-tier variants such as flex/priority. They require explicit
     # selection, so exclude them from the default :floor pool (for example flex vs standard).
     tag = ep.get("tag") or ""
     if "/" in tag:
         continue
+    # Context eligibility is by pool membership alone: :floor keeps cheaper providers as
+    # fallbacks, so an endpoint missing context_length must make the pool UNVERIFIED —
+    # recording only the known endpoints would overstate the safe budget.
+    cl = ep.get("context_length")
+    if isinstance(cl, (int, float)) and not isinstance(cl, bool) and cl > 0:
+        contexts.append(int(cl))
+    else:
+        context_unknown = True
     p = ep.get("pricing") or {}
     try:
         prompts.append(float(p["prompt"]))
@@ -37,22 +51,39 @@ for ep in data.get("endpoints") or []:
 if not prompts or not completions:
     sys.exit(0)
 
-try:
-    cache = json.load(open(cache_path))
-except Exception:
-    cache = {}
-models = cache.setdefault("models", {})
 # Prices arrive as USD per token; store them per 1M tokens.
-models[slug] = {
+entry = {
     "floor_in_per_m": min(prompts) * 1_000_000,
     "floor_out_per_m": min(completions) * 1_000_000,
     "max_in_per_m": max(prompts) * 1_000_000,
     "max_out_per_m": max(completions) * 1_000_000,
     "fetched_at": int(time.time()),
 }
+# :floor picks by price within this pool, so the safe budget is the *minimum* across
+# the pool — and only when EVERY eligible endpoint reported its context length.
+# Always write the keys (null when unverified): a MISSING key marks a legacy
+# pre-context entry, which the launch path refetches once on upgrade — a null key
+# is a deliberate "checked, unverified" answer that must not be refetched early.
+verified = bool(contexts) and not context_unknown
+entry["min_context_length"] = min(contexts) if verified else None
+entry["max_context_length"] = max(contexts) if verified else None
 
-tmp = cache_path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(cache, f)
-os.replace(tmp, cache_path)
+# Launch starts one writer per slot concurrently. Serialize the read-modify-write on a
+# lockfile and merge into the freshest on-disk state, so writers never lose each other's
+# entries; a per-process tmp name keeps os.replace atomic without colliding.
+lock = open(cache_path + ".lock", "a")
+fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    try:
+        cache = json.load(open(cache_path))
+    except Exception:
+        cache = {}
+    cache.setdefault("models", {})[slug] = entry
+    tmp = f"{cache_path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.replace(tmp, cache_path)
+finally:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    lock.close()
 PY

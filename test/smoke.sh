@@ -8,6 +8,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAKE=$(mktemp -d)
 trap 'rm -rf "$FAKE"' EXIT
 export HOME="$FAKE"
+# The suite must behave identically when launched from inside a ccx session:
+# CCX_ACTIVE would suppress quota-guard warnings and flip the statusline branch.
+unset CCX_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+      ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
+      ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
+      CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL \
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW 2>/dev/null || true
 pass=0 fail=0
 
 ok()   { pass=$((pass+1)); printf '  ✓ %s\n' "$1"; }
@@ -101,6 +109,255 @@ perm=$(stat -c %a "$FAKE/.claude/ccx/providers/keys.env" 2>/dev/null || stat -f 
 # capture first: `| grep -q` closes the pipe early and pipefail would report SIGPIPE
 status=$(OPENROUTER_API_KEY=sk-or-v1-fromenv "$ROOT/bin/ccx" 2>/dev/null)
 case "$status" in *configured*) ok "env var override accepted" ;; *) bad "env var override" ;; esac
+
+head_ "8. opus slot is Kimi K3; [1m] hint for verified >200K pools + dynamic window"
+# A fake `claude` that prints the environment ccx assembled for it.
+cat > "$FAKE/fakebin/claude" <<'EOF'
+#!/bin/sh
+env | grep -E '^(ANTHROPIC_(DEFAULT_(HAIKU|SONNET|OPUS|FABLE)_MODEL|MODEL|CUSTOM_MODEL_OPTION)|CLAUDE_CODE_AUTO_COMPACT_WINDOW)=' | sort
+EOF
+chmod +x "$FAKE/fakebin/claude"
+# A fake `curl` from here on: ccx's launch-time prefetch must not race the seeded
+# caches with live network data. Append mode keeps every call's args for later checks.
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+echo 200
+EOF
+chmod +x "$FAKE/fakebin/curl"
+# Seed provider data with the REAL shapes: kimi pool min 912K (>200K but <1M — the
+# whole point of the dynamic rule), luna exactly 200K (no hint), flash 1M (fresh).
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY'
+import json, sys, time
+now = int(time.time())
+json.dump({"models": {
+    "moonshotai/kimi-k3":       {"min_context_length": 912384,  "max_context_length": 1048576, "fetched_at": now},
+    "openai/gpt-5.6-luna":      {"min_context_length": 200000,  "max_context_length": 200000,  "fetched_at": now},
+    "deepseek/deepseek-v4-flash": {"min_context_length": 1048576, "max_context_length": 1048576, "fetched_at": now},
+}}, open(sys.argv[1], "w"))
+PY
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3:floor[1m]' \
+  && ok "opus = kimi-k3:floor[1m] (verified 912K pool > 200K)" || bad "opus kimi + [1m]" "got: $(printf '%s\n' "$envout" | grep OPUS)"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_SONNET_MODEL=openai/gpt-5.6-luna:floor' \
+  && ok "sonnet 200K → no [1m]" || bad "sonnet without [1m]" "got: $(printf '%s\n' "$envout" | grep SONNET)"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek/deepseek-v4-flash:floor' \
+  && ok "haiku chore slot → never hinted (keeps safe 200K)" || bad "haiku unhinted" "got: $(printf '%s\n' "$envout" | grep HAIKU)"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_CUSTOM_MODEL_OPTION=deepseek/deepseek-v4-flash:floor' \
+  && ok "cheapest-picker option → also unhinted" || bad "custom option unhinted" "got: $(printf '%s\n' "$envout" | grep CUSTOM_MODEL_OPTION=)"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_FABLE_MODEL=moonshotai/kimi-k3:floor[1m]' \
+  && ok "fable inherits opus + [1m]" || bad "fable inherits opus" "got: $(printf '%s\n' "$envout" | grep FABLE)"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_MODEL=openai/gpt-5.6-luna:floor' \
+  && ok "ANTHROPIC_MODEL follows sonnet (no [1m])" || bad "ANTHROPIC_MODEL" "got: $(printf '%s\n' "$envout" | grep -w ANTHROPIC_MODEL)"
+# Effective window = smallest hinted pool (kimi 912384) × 0.92 = 839393, NOT a fake 1M.
+printf '%s\n' "$envout" | grep -qFx 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=839393' \
+  && ok "auto-compact window = 839393 (smallest hinted pool − headroom)" \
+  || bad "dynamic auto-compact window" "got: $(printf '%s\n' "$envout" | grep AUTO_COMPACT)"
+
+head_ "9. [1m] safety: missing/malformed/stale/future cache → 200K (no hint)"
+# The launch-path sync prefetch fires here — the stub's "200" is not JSON, so the
+# cache stays unusable and the safe 200K default must win.
+rm -f "$FAKE/.claude/ccx/price-cache.json"
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3:floor' \
+  && ok "missing cache → no [1m]" || bad "missing cache → no [1m]" "got: $(printf '%s\n' "$envout" | grep OPUS)"
+printf '%s\n' "$envout" | grep -qFx 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000' \
+  && ok "nothing verified → static 1000000 fallback kept" \
+  || bad "static window fallback" "got: $(printf '%s\n' "$envout" | grep AUTO_COMPACT)"
+echo 'not json' > "$FAKE/.claude/ccx/price-cache.json"
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+case "$envout" in *'[1m]'*) bad "malformed cache → no [1m]" "hint leaked" ;; *) ok "malformed cache → no [1m]" ;; esac
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY'
+import json, sys
+json.dump({"models": {"moonshotai/kimi-k3": {"min_context_length": 912384, "fetched_at": 1}}}, open(sys.argv[1], "w"))
+PY
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+case "$envout" in *'[1m]'*) bad "stale cache → no [1m]" "hint leaked" ;; *) ok "stale positive cache → no [1m]" ;; esac
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY'
+import json, sys, time
+json.dump({"models": {"moonshotai/kimi-k3": {"min_context_length": 912384, "fetched_at": int(time.time()) + 999999}}}, open(sys.argv[1], "w"))
+PY
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+case "$envout" in *'[1m]'*) bad "future-dated cache → no [1m]" "hint leaked" ;; *) ok "future-dated (poisoned) cache → no [1m]" ;; esac
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY'
+import json, sys
+json.dump({"models": {"moonshotai/kimi-k3": {"min_context_length": 912384, "fetched_at": float("nan")}}}, open(sys.argv[1], "w"))
+PY
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+case "$envout" in *'[1m]'*) bad "NaN cache timestamp → no [1m]" "hint leaked" ;; *) ok "NaN cache timestamp → no [1m]" ;; esac
+# Idempotence: an already-hinted value must not gain a second suffix.
+PRICE_CACHE="$FAKE/.claude/ccx/price-cache.json"
+eval "$(sed -n '/^with_context_hint()/,/^}/p' "$ROOT/bin/ccx")"
+[ "$(with_context_hint 'moonshotai/kimi-k3:floor[1m]')" = 'moonshotai/kimi-k3:floor[1m]' ] \
+  && ok "already-hinted input stays single-[1m]" || bad "idempotent [1m]"
+
+head_ "10. price-fetch: pool verification, writer races, suffix normalization"
+# Slug-dependent stub: luna's pool is the SMALLER one (800K), so the launch tests
+# prove the global window takes the minimum over BOTH hinted conversation slots —
+# a regression that ignored sonnet would compute kimi's 874000 instead of 736000.
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+case "$*" in
+  *gpt-5.6-luna*) ctx=800000 ;;
+  *)              ctx=950000 ;;
+esac
+cat <<JSON
+{"data":{"endpoints":[
+ {"tag":"cheap","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":$ctx},
+ {"tag":"dear","pricing":{"prompt":"0.000002","completion":"0.000003"},"context_length":$ctx}
+]}}
+JSON
+EOF
+chmod +x "$FAKE/fakebin/curl"
+rm -f "$FAKE/.claude/ccx/price-cache.json"
+# This is also the launch-path test: an empty cache must be synchronously populated
+# before apply_tiers, so the very first invocation receives the verified hint.
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3:floor[1m]' \
+  && ok "first launch prefetches before apply_tiers → [1m]" \
+  || bad "first-launch synchronous prefetch" "got: $(printf '%s\n' "$envout" | grep OPUS)"
+printf '%s\n' "$envout" | grep -qFx 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=736000' \
+  && ok "window = min over BOTH hinted slots (luna 800K → 736000)" \
+  || bad "two-hinted-slot window" "got: $(printf '%s\n' "$envout" | grep AUTO_COMPACT)"
+# A FRESH entry without the min key is a legacy pre-context record (what older ccx
+# wrote all day) — the launch path must refetch it once, not wait out the 24h TTL.
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY'
+import json, sys, time
+json.dump({"models": {"moonshotai/kimi-k3": {"floor_in_per_m": 2.9, "fetched_at": int(time.time())}}}, open(sys.argv[1], "w"))
+PY
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3:floor[1m]' \
+  && ok "legacy context-less entry healed on first launch after upgrade" \
+  || bad "legacy entry heal" "got: $(printf '%s\n' "$envout" | grep OPUS)"
+rm -f "$FAKE/.claude/ccx/price-cache.json"
+# Fixed-pool stub for the aggregation checks: two default-pool providers WITH
+# context plus a tier-tagged (flex) endpoint that must be excluded.
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+cat <<'JSON'
+{"data":{"endpoints":[
+ {"tag":"cheap","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":1000000},
+ {"tag":"dear","pricing":{"prompt":"0.000002","completion":"0.000003"},"context_length":800000},
+ {"tag":"acme/flex","pricing":{"prompt":"0.0000005","completion":"0.000001"},"context_length":50000}
+]}}
+JSON
+EOF
+chmod +x "$FAKE/fakebin/curl"
+"$ROOT/bin/ccx-price-fetch" "ok/model" >/dev/null 2>&1
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY' \
+  && ok "pool min/max recorded; tier-tagged (flex) endpoint excluded" \
+  || bad "pool context aggregation"
+import json, sys
+e = json.load(open(sys.argv[1]))["models"]["ok/model"]
+assert e["min_context_length"] == 800000, e       # 50K flex endpoint must not drag the min down
+assert e["max_context_length"] == 1000000, e
+PY
+# One default-pool endpoint WITHOUT context_length → the pool is UNVERIFIED:
+# recording only the known endpoints would overstate the safe budget (Codex P1).
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+cat <<'JSON'
+{"data":{"endpoints":[
+ {"tag":"cheap","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":1000000},
+ {"tag":"mystery","pricing":{"prompt":"0.000002","completion":"0.000003"}}
+]}}
+JSON
+EOF
+chmod +x "$FAKE/fakebin/curl"
+"$ROOT/bin/ccx-price-fetch" "unk/model" >/dev/null 2>&1
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY' \
+  && ok "endpoint missing context_length → pool unverified (min recorded as null)" \
+  || bad "unknown context must not verify"
+import json, sys
+e = json.load(open(sys.argv[1]))["models"]["unk/model"]
+assert "min_context_length" in e and e["min_context_length"] is None, e
+assert "floor_in_per_m" in e, e   # prices still cached
+PY
+[ "$(with_context_hint 'unk/model:floor')" = 'unk/model:floor' ] \
+  && ok "unverified pool → no [1m] from with_context_hint" || bad "unverified pool hint"
+# Compound input tolerance: slug:routing[1m] must query the BARE slug's URL.
+rm -f "$FAKE/.curl-args"
+"$ROOT/bin/ccx-price-fetch" "ok/model:floor[1m]" >/dev/null 2>&1
+grep -qF '/models/ok/model/endpoints' "$FAKE/.curl-args" \
+  && ok "price-fetch strips :floor[1m] before the request" \
+  || bad "price-fetch suffix normalization" "got: $(tail -1 "$FAKE/.curl-args")"
+# Writer race: launch starts one writer per slot. 4 concurrent writers on an empty
+# cache must ALL land (lockfile + merge), with the file left as valid JSON.
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+cat <<'JSON'
+{"data":{"endpoints":[{"tag":"p","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":1000000}]}}
+JSON
+EOF
+chmod +x "$FAKE/fakebin/curl"
+rm -f "$FAKE/.claude/ccx/price-cache.json"
+for s in race/m1 race/m2 race/m3 race/m4; do "$ROOT/bin/ccx-price-fetch" "$s" >/dev/null 2>&1 & done; wait
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY' \
+  && ok "4 concurrent writers → all 4 entries survive" \
+  || bad "concurrent writers lose entries"
+import json, sys
+m = json.load(open(sys.argv[1]))["models"]
+missing = [s for s in ("race/m1", "race/m2", "race/m3", "race/m4") if s not in m]
+assert not missing, f"lost: {missing}"
+PY
+# Restore the invalid-response stub for the remaining sections.
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+echo 200
+EOF
+chmod +x "$FAKE/fakebin/curl"
+
+head_ "11. statusline shows the effective context window"
+row=$(printf '%s' '{"model":{"id":"moonshotai/kimi-k3:floor[1m]"}}' | CLAUDE_CODE_AUTO_COMPACT_WINDOW=839393 CCX_ACTIVE=1 "$ROOT/bin/ccx-statusline" 2>/dev/null)
+case "$row" in *'kimi-k3:floor'*'· 839K'*) ok "effective window (839K) shown from CLAUDE_CODE_AUTO_COMPACT_WINDOW" ;; *) bad "statusline effective window" "got: ${row:0:100}" ;; esac
+case "$row" in *'[1m]'*) bad "raw [1m] leaks into display" "got: ${row:0:100}" ;; *) ok "no raw [1m] in display" ;; esac
+row=$(printf '%s' '{"model":{"id":"moonshotai/kimi-k3:floor[1m]"}}' | env -u CLAUDE_CODE_AUTO_COMPACT_WINDOW CCX_ACTIVE=1 "$ROOT/bin/ccx-statusline" 2>/dev/null)
+case "$row" in *'· 1M'*) ok "1M shown when the hint stands without a dynamic window" ;; *) bad "statusline 1M fallback" "got: ${row:0:100}" ;; esac
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCX_ACTIVE=1 "$ROOT/bin/ccx-statusline" 2>/dev/null)
+case "$row" in *'· 200K'*) ok "200K shown without the hint" ;; *) bad "statusline 200K" "got: ${row:0:100}" ;; esac
+
+head_ "12. doctor never sends [1m] to the provider"
+rm -f "$FAKE/.curl-args"   # assert on doctor's calls only
+# Restore a fresh 1M-positive cache so apply_tiers wires the hint.
+python3 - "$FAKE/.claude/ccx/price-cache.json" <<'PY'
+import json, sys, time
+now = int(time.time())
+json.dump({"models": {"openai/gpt-5.6-luna": {"min_context_length": 1000000, "fetched_at": now}}}, open(sys.argv[1], "w"))
+PY
+OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" doctor >/dev/null 2>&1
+if grep -qF '[1m]' "$FAKE/.curl-args" 2>/dev/null; then
+  bad "doctor strips [1m] before the probe" "got: $(grep -F '[1m]' "$FAKE/.curl-args" | head -1)"
+else
+  ok "doctor probe carries no [1m]"
+fi
+grep -qF '"model":"openai/gpt-5.6-luna:floor"' "$FAKE/.curl-args" 2>/dev/null \
+  && ok "doctor probes slug:floor" || bad "doctor probe model" "got: $(grep -F '"model"' "$FAKE/.curl-args" | head -1)"
+rm -f "$FAKE/fakebin/curl"
+
+head_ "13. migration: terra→kimi opus rewrite; catalog preserved, kimi appended"
+CONF="$FAKE/.claude/ccx/providers/openrouter.env"
+CATALOG_T="$FAKE/.claude/ccx/providers/models.conf"
+rm -f "$FAKE/.claude/ccx/providers/tiers.env"
+# Fabricate an old install: opus pinned to the previous factory default.
+sed -i.bak 's|moonshotai/kimi-k3|openai/gpt-5.6-terra|' "$CONF" && rm -f "$CONF.bak"
+# A user-maintained catalog with a custom entry and no kimi key.
+cat > "$CATALOG_T" <<'EOF'
+# my custom catalog
+# kimi moonshotai/kimi-k3 2.90/14.00 Old commented reference, not an active key
+flash   deepseek/deepseek-v4-flash   0.11/0.22    Cheap
+mymodel acme/super-model             1.00/2.00    My custom entry
+EOF
+OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccx" >/dev/null 2>&1
+grep -qFx 'export ANTHROPIC_DEFAULT_OPUS_MODEL="moonshotai/kimi-k3"' "$CONF" \
+  && ok "factory terra opus line migrated to kimi-k3" || bad "opus migration" "got: $(grep OPUS_MODEL "$CONF")"
+grep -q '^mymodel ' "$CATALOG_T" \
+  && ok "custom catalog entry preserved" || bad "custom catalog entry lost"
+grep -q '^kimi ' "$CATALOG_T" \
+  && ok "kimi catalog entry appended (not overwritten)" || bad "kimi catalog append"
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
