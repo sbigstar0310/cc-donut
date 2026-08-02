@@ -9,8 +9,8 @@
       "name": "ccx",
       "source": "./",
       "description": "Emergency OpenRouter backbone for Claude quota exhaustion",
-      "version": "0.1.13"
+      "version": "0.1.14"
     }
   ],
-  "version": "0.1.13"
+  "version": "0.1.14"
 }

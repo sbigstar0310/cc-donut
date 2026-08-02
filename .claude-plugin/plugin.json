@@ -2,18 +2,9 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ccx",
   "displayName": "ccx — backbone switcher",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Emergency OpenRouter backbone for Claude quota exhaustion",
   "author": {
     "name": "sbigstar"
-  },
-  "userConfig": {
-    "openrouter_api_key": {
-      "type": "string",
-      "sensitive": true,
-      "required": false,
-      "description": "OpenRouter API key (optional — set anytime: /plugin → ccx → Configure options). Used only as the ccx backbone credential.",
-      "title": "OpenRouter API key"
-    }
   }
 }

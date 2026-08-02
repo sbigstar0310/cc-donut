@@ -32,8 +32,8 @@ Run everything yourself and report tersely; never send the user to a terminal.
    say the version check was skipped, never guess.
 
 3. On failure, map the code to the fix and offer to do it now:
-   - 401/403 → key invalid/expired → offer the `key` skill paths (/plugin →
-     ccx → Configure options, or paste in chat with consent)
+   - 401/403 → key invalid/expired → offer the `key` skill paths (paste in
+     chat with consent, or native dialog/terminal)
    - 402 → OpenRouter balance empty → link openrouter.ai/credits
    - 400/404 → model slug stale → show the failing slug, check
      openrouter.ai/models, offer to fix the catalog after approval

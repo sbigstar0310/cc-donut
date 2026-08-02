@@ -44,12 +44,5 @@ Relay only the masked one-line result.
 On Linux without a dialog, `ccx key` in any terminal window prompts with hidden
 input.
 
-## C. Plugin config menu — only if the user's Claude Code supports it
-
-`/plugin` → **ccx → Configure options** (masked input, keychain; the quota-guard
-hook syncs it to keys.env on the next message). Known to be missing/broken on
-some Claude Code versions ("No configuration changes" with no input UI) — if the
-user reports that, fall back to A or B without retrying.
-
 Whatever the path: never repeat the full key in any output, and finish with
 `~/.local/bin/ccx doctor` so the user sees `✓ OK`.

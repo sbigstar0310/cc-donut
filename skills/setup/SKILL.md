@@ -18,9 +18,7 @@ Add one short introductory line, then relay the script's output to the user verb
 If the setup output says the OpenRouter key is not set, offer to finish right
 now by following the `key` skill in this plugin (skills/key/SKILL.md): the
 default path is pasting the key in chat with informed consent; macOS can use
-the `ccx key` native dialog; the `/plugin` Configure options menu only where
-that Claude Code version supports it. After the key
-lands, run `~/.local/bin/ccx doctor` and relay its one-line verdict.
+the `ccx key` native dialog. After the key lands, run `~/.local/bin/ccx doctor` and relay its one-line verdict.
 
 If the key was already configured, just run `~/.local/bin/ccx doctor` directly and
 relay the verdict — no question needed. Either way the user should finish setup,
