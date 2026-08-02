@@ -14,8 +14,10 @@ from the CLI — the user does not need the interactive `/plugin` menu.
 
 ```sh
 claude plugin marketplace update ccx
-claude plugin update ccx
+claude plugin update ccx@ccx
 ```
+
+(The `plugin@marketplace` form is required — a bare `ccx` reports "not found".)
 
 2. Verify what the terminal launcher now resolves to (it picks the newest
    installed version automatically — no rewiring needed):
