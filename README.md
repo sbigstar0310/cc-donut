@@ -99,7 +99,7 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | --- | --- |
 | `/ccx` | Readiness checkup and configuration by chat: verifies key/slots/routing, sets the key via native dialog, refreshes the model catalog with fresh benchmarks & prices on request ("refresh the ccx model picks") |
 | `/ccx:setup` | First-time wiring — launchers, statusline, legacy migration, then key + doctor without leaving the session |
-| `/ccx:key` | Set the OpenRouter key in-session — chat paste with consent, native dialog/terminal, or the plugin config menu where supported |
+| `/ccx:key` | Set the OpenRouter key — opens the key-creation page if you don't have one, then native masked input (macOS dialog / terminal prompt); the key never enters the chat |
 | `/ccx:doctor` | Diagnose the escape route: key, API, model slugs, wiring — with the fix offered on failure |
 | `/ccx:update` | One-step plugin update to the latest release |
 | `/ccx:uninstall` | Clean removal (keeps your key unless you ask to purge) |
@@ -132,7 +132,8 @@ Quota warnings and recovery detection need the optional [claude-dashboard](https
 <details>
 <summary><b>Security notes</b></summary>
 
-- The key lives only in `~/.claude/ccx/providers/keys.env` (mode 600), is displayed only as a masked tail, and is never bundled with or requested by the plugin at install.
+- The key lives only in `~/.claude/ccx/providers/keys.env` (mode 600), is displayed only as a masked tail, and is never bundled with or requested by the plugin at install. An exported `OPENROUTER_API_KEY` env var takes precedence over the file — the standard MCP/plugin convention.
+- Key capture is native input only (dialog or hidden terminal prompt, `gh auth login`-style). If you paste a key into the chat anyway, ccx saves it but recommends rotating it, since it persists in the conversation history.
 - Never put `ANTHROPIC_*` gateway variables in `settings.json`'s `env` block — they override shell exports and permanently pin every session (including background agents) to the external backbone.
 - Never `/logout` to switch back — it genuinely logs you out. Returning is just `/exit` then `claude --resume`.
 
