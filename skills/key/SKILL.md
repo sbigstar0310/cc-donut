@@ -1,12 +1,12 @@
 ---
 name: key
-description: Set the OpenRouter API key for ccx. Use for /ccx:key, "키 설정해줘" (set my key), "set my OpenRouter key", or when setup/doctor reports the key is empty.
+description: Set the OpenRouter API key for ccd. Use for /ccd:key, "키 설정해줘" (set my key), "set my OpenRouter key", or when setup/doctor reports the key is empty.
 ---
 
-# ccx key — key setup
+# ccd key — key setup
 
-All paths end with the key in `~/.claude/ccx/providers/keys.env` (mode 600),
-readable by both this plugin and the terminal-side `ccx -c`. An exported
+All paths end with the key in `~/.claude/ccd/providers/keys.env` (mode 600),
+readable by both this plugin and the terminal-side `ccd -c`. An exported
 `OPENROUTER_API_KEY` env var also works and takes precedence (the standard
 MCP/plugin convention).
 
@@ -26,12 +26,12 @@ on the key — then even a leaked key can only spend that much."
 
 ## Default path: native input — the key never enters this chat
 
-- **macOS, right from this session**: run `~/.local/bin/ccx key` — a native
+- **macOS, right from this session**: run `~/.local/bin/ccd key` — a native
   dialog opens; tell the user to paste there. Output shows only a masked tail.
-  Then run `~/.local/bin/ccx doctor` and relay the verdict.
-- **Linux / no dialog**: tell the user to run `ccx key` once in any terminal
+  Then run `~/.local/bin/ccd doctor` and relay the verdict.
+- **Linux / no dialog**: tell the user to run `ccd key` once in any terminal
   window (hidden input, like `gh auth login`'s paste-token prompt), then come
-  back; you run `~/.local/bin/ccx doctor` and relay the verdict.
+  back; you run `~/.local/bin/ccd doctor` and relay the verdict.
 
 Do not invite the user to paste the key into the chat — every surveyed tool
 treats that as an anti-pattern (the key persists in transcripts).
@@ -42,7 +42,7 @@ Accept it gracefully — don't scold, don't refuse:
 
 1. Save it via the piped path (never echo it back, never write it elsewhere):
    ```sh
-   printf '%s\n' 'PASTED_KEY' | ~/.local/bin/ccx key
+   printf '%s\n' 'PASTED_KEY' | ~/.local/bin/ccd key
    ```
 2. Relay the masked one-line result, then run doctor.
 3. Add one line: "Since the key touched this conversation, consider rotating it

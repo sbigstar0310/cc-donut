@@ -1,9 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
-  "name": "ccx",
-  "displayName": "ccx — backbone switcher",
-  "version": "0.1.21",
-  "description": "Emergency OpenRouter backbone for Claude quota exhaustion",
+  "name": "ccd",
+  "displayName": "ccd — the donut spare for Claude Code",
+  "version": "0.2.0",
+  "description": "The donut spare for Claude quota exhaustion: emergency OpenRouter backbone, same conversation",
   "author": {
     "name": "sbigstar"
   }

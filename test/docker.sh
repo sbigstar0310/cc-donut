@@ -14,9 +14,9 @@ case "$IMAGE" in
   *)       INSTALL='apt-get -qq update >/dev/null && apt-get -qq install -y python3 >/dev/null' ;;
 esac
 
-exec docker run --rm -v "$ROOT":/ccx:ro -w /ccx "$IMAGE" /bin/sh -c "
+exec docker run --rm -v "$ROOT":/ccd:ro -w /ccd "$IMAGE" /bin/sh -c "
   $INSTALL
   echo \"# \$(cat /etc/os-release 2>/dev/null | grep -m1 PRETTY_NAME || uname -a)\"
   bash --version | head -1
-  bash /ccx/test/smoke.sh
+  bash /ccd/test/smoke.sh
 "

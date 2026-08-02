@@ -5,20 +5,20 @@
 # When quota reaches zero Claude cannot respond, so hooks cannot give instructions.
 # The statusline is the only place rendered independently of Claude.
 #
-# While ccx is active, render one dedicated row below the dashboard.
-# ccx-price-fetch fills the cache in the background; rendering never waits for the network.
+# While ccd is active, render one dedicated row below the dashboard.
+# ccd-price-fetch fills the cache in the background; rendering never waits for the network.
 #
 # Preserve upstream output on any failure; the statusline must never break.
 set -uo pipefail
 
-CCX_DIR="$HOME/.claude/ccx"
-CACHE="$CCX_DIR/quota-cache.json"
-RUN_STATE="$CCX_DIR/run-state.json"
-OUTAGE_STATE="$CCX_DIR/outage-state.json"
-PRICE_CACHE="$CCX_DIR/price-cache.json"
-mkdir -p "$CCX_DIR"
+CCD_DIR="$HOME/.claude/ccd"
+CACHE="$CCD_DIR/quota-cache.json"
+RUN_STATE="$CCD_DIR/run-state.json"
+OUTAGE_STATE="$CCD_DIR/outage-state.json"
+PRICE_CACHE="$CCD_DIR/price-cache.json"
+mkdir -p "$CCD_DIR"
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PRICE_FETCH="$SELF_DIR/ccx-price-fetch"
+PRICE_FETCH="$SELF_DIR/ccd-price-fetch"
 # The statusline warning means "switch now." Use 95%; the hook's 85% delegation threshold differs.
 THRESHOLD=95
 
@@ -32,10 +32,10 @@ else
   base=""
 fi
 
-if [ -n "${CCX_ACTIVE:-}" ]; then
-  # Dedicated ccx row. stdout = row content; stderr line 1 = model slug whose price cache is missing/stale.
-  stale_file=$(mktemp "${TMPDIR:-/tmp}/ccx-stale.XXXXXX")
-  ccx_line=$(CCX_PAYLOAD="$payload" python3 - "$RUN_STATE" "$PRICE_CACHE" "$OUTAGE_STATE" 2>"$stale_file" <<'PY'
+if [ -n "${CCD_ACTIVE:-}" ]; then
+  # Dedicated ccd row. stdout = row content; stderr line 1 = model slug whose price cache is missing/stale.
+  stale_file=$(mktemp "${TMPDIR:-/tmp}/ccd-stale.XXXXXX")
+  ccd_line=$(CCD_PAYLOAD="$payload" python3 - "$RUN_STATE" "$PRICE_CACHE" "$OUTAGE_STATE" 2>"$stale_file" <<'PY'
 import json, math, os, sys, time
 
 def load(path):
@@ -47,7 +47,7 @@ def load(path):
 state = load(sys.argv[1])
 prices = load(sys.argv[2]).get("models", {})
 try:
-    payload = json.loads(os.environ.get("CCX_PAYLOAD", "") or "{}")
+    payload = json.loads(os.environ.get("CCD_PAYLOAD", "") or "{}")
 except Exception:
     payload = {}
 
@@ -55,7 +55,7 @@ except Exception:
 model_id = ((payload.get("model") or {}).get("id")) or ""
 # Normalize compound suffixes: a terminal [1m] is Claude Code's local hint that opens
 # the 1M budget (stripped before the provider), then a routing variant. The EFFECTIVE
-# window is the process's CLAUDE_CODE_AUTO_COMPACT_WINDOW when ccx sized it from
+# window is the process's CLAUDE_CODE_AUTO_COMPACT_WINDOW when ccd sized it from
 # verified provider data — show that, so a 912K-pool model reads ~839K, not a fake 1M.
 slug, routing = model_id, ""
 ctx_budget = "200K"
@@ -103,8 +103,8 @@ if entry:
 if slug and stale:
     print(slug, file=sys.stderr)
 
-# run = this ccx process's spend; total = whole quota-outage total (survives ccx restarts)
-run_cost = state.get("ccx_spend_usd")
+# run = this ccd process's spend; total = whole quota-outage total (survives ccd restarts)
+run_cost = state.get("ccd_spend_usd")
 outage = load(sys.argv[3])
 total_cost = outage.get("outage_spend_usd")
 if isinstance(run_cost, (int, float)):
@@ -133,7 +133,7 @@ if display_id:
     model_part += f" · {ctx_budget}"
 
 sep = " \033[2m│\033[0m "
-print(f"\033[1;35mccx\033[0m{sep}\033[36m{model_part}\033[0m{sep}\033[33m{price_part}\033[0m{sep}\033[33m{spend_part}\033[0m{recovery}", end="")
+print(f"\033[1;35mccd\033[0m{sep}\033[36m{model_part}\033[0m{sep}\033[33m{price_part}\033[0m{sep}\033[33m{spend_part}\033[0m{recovery}", end="")
 PY
 )
   stale_slug=$(head -n1 "$stale_file" 2>/dev/null || true)
@@ -142,10 +142,10 @@ PY
     # Fully detached so rendering never blocks — the cache lands by the next refresh
     ("$PRICE_FETCH" "$stale_slug" >/dev/null 2>&1 &) || true
   fi
-  if [ -n "$base" ] && [ -n "$ccx_line" ]; then
-    printf '%s\n%s' "$base" "$ccx_line"
+  if [ -n "$base" ] && [ -n "$ccd_line" ]; then
+    printf '%s\n%s' "$base" "$ccd_line"
   else
-    printf '%s%s' "$base" "$ccx_line"
+    printf '%s%s' "$base" "$ccd_line"
   fi
   exit 0
 fi
@@ -164,7 +164,7 @@ vals = [p for p in (c.get("fiveHourPercent"), c.get("sevenDayPercent"))
         if isinstance(p, (int, float))]
 if vals and max(vals) >= int(os.environ["THRESHOLD"]):
     # Red, bold — impossible to miss
-    print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → /exit then ccx -c\033[0m", end="")
+    print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → /exit then ccd -c\033[0m", end="")
 PY
 )
 fi

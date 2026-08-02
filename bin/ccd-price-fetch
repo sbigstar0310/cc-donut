@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# Fetch OpenRouter model pricing and cache it in ~/.claude/ccx/price-cache.json.
+# Fetch OpenRouter model pricing and cache it in ~/.claude/ccd/price-cache.json.
 # The statusline calls this in the background; only this script uses the network.
 #
 # This public API needs no key. :floor selects the cheapest provider, so cache the minimum price.
 set -euo pipefail
 
-slug="${1:?usage: ccx-price-fetch <author/model-slug>}"
+slug="${1:?usage: ccd-price-fetch <author/model-slug>}"
 # Tolerate compound values from future callers: strip a terminal [1m] hint and
 # any routing suffix so the request URL and cache key are the bare slug.
 slug="${slug%\[1m\]}"
 slug="${slug%%:*}"
-CACHE_DIR="$HOME/.claude/ccx"
+CACHE_DIR="$HOME/.claude/ccd"
 CACHE="$CACHE_DIR/price-cache.json"
 mkdir -p "$CACHE_DIR"
 
 # -g disables URL globbing (defensive — a terminal [1m] was already stripped above).
 body=$(curl -gfsS --max-time 8 "https://openrouter.ai/api/v1/models/${slug}/endpoints" 2>/dev/null) || exit 0
 
-CCX_PRICE_BODY="$body" python3 - "$CACHE" "$slug" <<'PY'
+CCD_PRICE_BODY="$body" python3 - "$CACHE" "$slug" <<'PY'
 import fcntl, json, os, sys, time
 
 cache_path, slug = sys.argv[1], sys.argv[2]
 try:
-    data = json.loads(os.environ["CCX_PRICE_BODY"]).get("data") or {}
+    data = json.loads(os.environ["CCD_PRICE_BODY"]).get("data") or {}
 except Exception:
     sys.exit(0)
 
@@ -61,9 +61,7 @@ entry = {
 }
 # :floor picks by price within this pool, so the safe budget is the *minimum* across
 # the pool — and only when EVERY eligible endpoint reported its context length.
-# Always write the keys (null when unverified): a MISSING key marks a legacy
-# pre-context entry, which the launch path refetches once on upgrade — a null key
-# is a deliberate "checked, unverified" answer that must not be refetched early.
+# Null means "checked, unverified": no hint, and no early refetch before the TTL.
 verified = bool(contexts) and not context_unknown
 entry["min_context_length"] = min(contexts) if verified else None
 entry["max_context_length"] = max(contexts) if verified else None

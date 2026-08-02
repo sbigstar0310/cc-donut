@@ -1,12 +1,12 @@
 # Quota Outage Emergency Manual (readable without Claude)
 
 Once the Claude subscription quota hits zero, you cannot ask Claude to "set this up."
-That is why `ccx` and this document were prepared **in advance**.
+That is why `ccd` and this document were prepared **in advance**.
 
 ## One-line summary
 
 ```sh
-ccx -c        # Resume the conversation you were in, swapping only the model to a cheap OpenRouter one
+ccd -c        # Resume the conversation you were in, swapping only the model to a cheap OpenRouter one
 ```
 
 The Claude Code shell (tools, hooks, skills, conversation history) stays intact.
@@ -15,17 +15,17 @@ Only the model answering inside it changes.
 **Always type this in a terminal app.** Running it via `!` inside Claude Code drops
 claude into headless mode (no interactive screen), and the "last conversation" that
 `-c` tries to resume is the very session that is still running, which conflicts.
-**Quit Claude Code first**, then type it in the terminal. (ccx detects this case,
+**Quit Claude Code first**, then type it in the terminal. (ccd detects this case,
 blocks it, and explains why — a mistyped attempt cannot cause damage.)
 
 ## One-time setup — do this while quota remains
 
 ```sh
-ccx key       # Paste your OpenRouter key and it is saved (create at openrouter.ai/keys)
-ccx doctor    # Must print ✓ OK
+ccd key       # Paste your OpenRouter key and it is saved (create at openrouter.ai/keys)
+ccd doctor    # Must print ✓ OK
 ```
 
-Skip this and you will be stuck at exactly the moment you need it. `ccx doctor`
+Skip this and you will be stuck at exactly the moment you need it. `ccd doctor`
 makes one API round trip before launching claude, validating the key, URL, and
 model names — so you don't burn emergency time debugging.
 
@@ -52,9 +52,9 @@ applies immediately mid-session.
 To change the slot assignments themselves:
 
 ```sh
-ccx models              # What models exist and what they cost
-ccx pick                # Interactively reassign the three slots (saved)
-ccx -c --opus pro       # Use a different model for the opus slot this run only
+ccd models              # What models exist and what they cost
+ccd pick                # Interactively reassign the three slots (saved)
+ccd -c --opus pro       # Use a different model for the opus slot this run only
 ```
 
 ## Cost policy
@@ -68,19 +68,19 @@ tokens on retries. If file edits or command runs keep misfiring, try this once
 and compare:
 
 ```sh
-ccx -c --routing exacto     # Providers with reliable tool calling (costs more)
+ccd -c --routing exacto     # Providers with reliable tool calling (costs more)
 ```
 
-To keep that permanently, edit `CCX_ROUTING` in `~/.claude/ccx/providers/openrouter.env`.
+To keep that permanently, edit `CCD_ROUTING` in `~/.claude/ccd/providers/openrouter.env`.
 
 ## Cost and recovery signals in the statusline
 
-After switching to `ccx`, the dashboard (if installed) still shows the Claude
-subscription quota/reset times, and **a dedicated ccx row is added below it**.
-The ccx row renders on its own even without the dashboard plugin.
+After switching to `ccd`, the dashboard (if installed) still shows the Claude
+subscription quota/reset times, and **a dedicated ccd row is added below it**.
+The ccd row renders on its own even without the dashboard plugin.
 
 ```text
-ccx │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run $0.0123 · total $0.4200
+ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run $0.0123 · total $0.4200
 ```
 
 - **model · effort** — the external model (+routing) actually attached right now
@@ -89,12 +89,12 @@ ccx │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
   the single cheapest-provider price; other routings show the provider min–max
   range. Sourced from the OpenRouter catalog, refreshed daily. The final source
   of truth for actual billing is the spend numbers.
-- **run $…** — pay-as-you-go spend accrued **in this ccx process only**, measured
-  against the OpenRouter key's cumulative usage at ccx launch. Updates when you
+- **run $…** — pay-as-you-go spend accrued **in this ccd process only**, measured
+  against the OpenRouter key's cumulative usage at ccd launch. Updates when you
   send a prompt or a tool runs; it does not refresh while idle. (Different from
   the lifetime total on the OpenRouter site.)
-- **total $…** — spend accrued across **the whole quota outage**, surviving ccx
-  restarts. Created by the first ccx of an outage and cleared automatically when
+- **total $…** — spend accrued across **the whole quota outage**, surviving ccd
+  restarts. Created by the first ccd of an outage and cleared automatically when
   a Claude quota reset is detected.
 - `✓ Claude recovered → /exit then claude --resume` — a Claude 5-hour or 7-day
   quota went from exhausted (100%) to reset (0%). If both windows reset at the
@@ -103,7 +103,7 @@ ccx │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 ## Returning to the subscription
 
 When the recovery signal appears (or whenever you want to go back), **end the
-current ccx session first.**
+current ccd session first.**
 
 ```text
 /exit
@@ -115,7 +115,7 @@ Then, in the same terminal:
 claude --resume
 ```
 
-`--resume` picks the conversation you were working on in ccx right back up.
+`--resume` picks the conversation you were working on in ccd right back up.
 (Verified by a real round-trip test — returns to the subscription with the
 conversation intact.)
 
@@ -125,7 +125,7 @@ login only within that process; the login itself stays saved. **Never run
 
 ## If it doesn't work
 
-`ccx doctor` reports the cause by HTTP status code.
+`ccd doctor` reports the cause by HTTP status code.
 
 - **401/403** — the OpenRouter key is wrong or expired
 - **402** — insufficient OpenRouter balance; top up
@@ -140,11 +140,11 @@ login only within that process; the login itself stays saved. **Never run
 
 - Anthropic does **not officially support** routing Claude Code to non-Claude
   models. Not an account-sanction issue — it means breakage is unsupported and a
-  Claude Code update may stop it working overnight. Hence `ccx doctor`.
+  Claude Code update may stop it working overnight. Hence `ccd doctor`.
 - On an external backbone, **Remote Control, voice input, and fast mode are disabled**.
 - Never put these variables in the `env` block of `~/.claude/settings.json`.
   There they override shell exports and pin **every session permanently** —
-  including background agents — to the external backbone. This is why `ccx`
+  including background agents — to the external backbone. This is why `ccd`
   uses the shell approach.
 
 ## This is an "unsupported path" — by both sides
@@ -157,7 +157,7 @@ Both parties have drawn the line explicitly. Not forbidden — just **not guaran
   examples use `~anthropic/` slugs.
 
 In practice it works through the `ANTHROPIC_DEFAULT_*_MODEL` slots, but a Claude
-Code update could break it any day. So always run `ccx doctor` before relying on it.
+Code update could break it any day. So always run `ccd doctor` before relying on it.
 
 One known unresolved issue: Claude Code sends the `thinking` field on some
 requests and omits it on others (subagent creation, structured output), which can
@@ -165,9 +165,9 @@ clash with provider expectations and produce 400s. Filed as Anthropic issue
 #69379 and **closed as "not planned."** No environment variable fixes it. If
 subagent-heavy work keeps producing 400s, suspect this.
 
-## When a flat-rate plan beats ccx
+## When a flat-rate plan beats ccd
 
-`ccx` is **pay-as-you-go**. If you must ride out several days until quota
+`ccd` is **pay-as-you-go**. If you must ride out several days until quota
 recovers, a flat-rate coding plan can win on total cost. All of the below offer
 their own **first-party Anthropic-compatible endpoints**, so they are better
 supported than the OpenRouter path.
@@ -195,4 +195,4 @@ simplest answer with zero breakage risk.
 Code exploration/implementation can be handed wholesale to the already-installed
 Codex (GPT subscription); the `quota-guard` hook recommends that mode
 automatically above 85%. But Claude still has to orchestrate, so **once quota is
-fully at zero that path is closed.** That is when you use `ccx`.
+fully at zero that path is closed.** That is when you use `ccd`.

@@ -1,18 +1,14 @@
 #!/bin/bash
 # Claude Code hook shared by UserPromptSubmit and PostToolUse.
 # Checks claude-dashboard usage through a ten-minute cache. In normal sessions it recommends
-# Codex delegation at 85%; in ccx sessions it tracks cost and Claude quota resets only.
+# Codex delegation at 85%; in ccd sessions it tracks cost and Claude quota resets only.
 EVENT="${1:-UserPromptSubmit}"
-CCX_DIR="$HOME/.claude/ccx"
-CACHE="$CCX_DIR/quota-cache.json"
-WARN_MARK="$CCX_DIR/last-warn"
-RUN_STATE="$CCX_DIR/run-state.json"
-OUTAGE_STATE="$CCX_DIR/outage-state.json"
-mkdir -p "$CCX_DIR"
-[ -f "$HOME/.claude/quota-guard-cache.json" ] && [ ! -f "$CACHE" ] && mv "$HOME/.claude/quota-guard-cache.json" "$CACHE" 2>/dev/null || true
-[ -f "$HOME/.claude/quota-guard-last-warn" ] && [ ! -f "$WARN_MARK" ] && mv "$HOME/.claude/quota-guard-last-warn" "$WARN_MARK" 2>/dev/null || true
-[ -f "$HOME/.claude/ccx-run-state.json" ] && [ ! -f "$RUN_STATE" ] && mv "$HOME/.claude/ccx-run-state.json" "$RUN_STATE" 2>/dev/null || true
-[ -f "$HOME/.claude/ccx-outage-state.json" ] && [ ! -f "$OUTAGE_STATE" ] && mv "$HOME/.claude/ccx-outage-state.json" "$OUTAGE_STATE" 2>/dev/null || true
+CCD_DIR="$HOME/.claude/ccd"
+CACHE="$CCD_DIR/quota-cache.json"
+WARN_MARK="$CCD_DIR/last-warn"
+RUN_STATE="$CCD_DIR/run-state.json"
+OUTAGE_STATE="$CCD_DIR/outage-state.json"
+mkdir -p "$CCD_DIR"
 TTL=600
 THRESHOLD=85
 
@@ -31,7 +27,7 @@ file_age() {
   echo $((now - mtime))
 }
 
-# Refresh the dashboard's Claude quota cache regardless of ccx state,
+# Refresh the dashboard's Claude quota cache regardless of ccd state,
 # so Claude resets are visible even while the external backbone is active.
 # Hooks run non-interactively, so a version-manager node (nvm/volta/fnm) is often
 # absent from PATH even though it works in the user's shell — that made the cache
@@ -59,19 +55,19 @@ if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   if [ -n "$script" ] && [ -n "$node_bin" ] && "$node_bin" "$script" --json > "$tmp" 2>/dev/null \
      && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$tmp" 2>/dev/null; then
     mv "$tmp" "$CACHE"
-    rm -f "$CCX_DIR/refresh-failed"
+    rm -f "$CCD_DIR/refresh-failed"
   else
     rm -f "$tmp"
-    # Leave a breadcrumb so `ccx doctor` can say quota data is stale instead of
+    # Leave a breadcrumb so `ccd doctor` can say quota data is stale instead of
     # the warnings just never appearing.
     { [ -n "$script" ] || echo "claude-dashboard not installed"
-      [ -n "$node_bin" ] || echo "node not found in hook PATH"; } > "$CCX_DIR/refresh-failed" 2>/dev/null
+      [ -n "$node_bin" ] || echo "node not found in hook PATH"; } > "$CCD_DIR/refresh-failed" 2>/dev/null
   fi
 fi
 
-# Update ccx run cost / recovery state at most once per hook cycle.
+# Update ccd run cost / recovery state at most once per hook cycle.
 # Never interpret an invalid quota response or OpenRouter error as recovery.
-update_ccx_state() {
+update_ccd_state() {
   [ -f "$RUN_STATE" ] || return 0
   local usage now
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -86,12 +82,12 @@ except Exception:
     pass
 ' 2>/dev/null)
 
-  CCX_CACHE="$CACHE" CCX_STATE="$RUN_STATE" CCX_OUTAGE="$OUTAGE_STATE" CCX_USAGE="$usage" CCX_NOW="$now" \
+  CCD_CACHE="$CACHE" CCD_STATE="$RUN_STATE" CCD_OUTAGE="$OUTAGE_STATE" CCD_USAGE="$usage" CCD_NOW="$now" \
     python3 - <<'PY'
 import json, os, tempfile
-cache_path = os.environ["CCX_CACHE"]
-state_path = os.environ["CCX_STATE"]
-outage_path = os.environ["CCX_OUTAGE"]
+cache_path = os.environ["CCD_CACHE"]
+state_path = os.environ["CCD_STATE"]
+outage_path = os.environ["CCD_OUTAGE"]
 claude = {}
 try:
     cache = json.load(open(cache_path)) if os.path.isfile(cache_path) else {}
@@ -108,11 +104,11 @@ except Exception:
     raise SystemExit(0)
 
 # Cost = successfully-read cumulative key usage minus the baseline.
-# run = this ccx process's spend; outage = total for the whole quota outage (survives restarts).
-# If the baseline fetch failed at ccx startup (async fill too), adopt the current
+# run = this ccd process's spend; outage = total for the whole quota outage (survives restarts).
+# If the baseline fetch failed at ccd startup (async fill too), adopt the current
 # value as baseline — costs from here on are accurate and "n/a" never sticks.
 def write_atomic(p, obj):
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".ccx-state.")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".ccd-state.")
     with os.fdopen(fd, "w") as f:
         json.dump(obj, f, ensure_ascii=False)
         f.write("\n")
@@ -120,13 +116,13 @@ def write_atomic(p, obj):
     os.chmod(p, 0o600)
 
 try:
-    usage = float(os.environ["CCX_USAGE"])
+    usage = float(os.environ["CCD_USAGE"])
     baseline = state.get("baseline_usage_usd")
     if not isinstance(baseline, (int, float)):
         state["baseline_usage_usd"] = usage
         baseline = usage
-    state["ccx_spend_usd"] = max(0.0, usage - baseline)
-    state["cost_updated_at"] = os.environ["CCX_NOW"]
+    state["ccd_spend_usd"] = max(0.0, usage - baseline)
+    state["cost_updated_at"] = os.environ["CCD_NOW"]
 
     try:
         outage = json.load(open(outage_path))
@@ -136,7 +132,7 @@ try:
         outage = {"started_at": state.get("started_at"),
                   "baseline_usage_usd": baseline, "outage_spend_usd": 0.0}
     outage["outage_spend_usd"] = max(0.0, usage - outage["baseline_usage_usd"])
-    outage["updated_at"] = os.environ["CCX_NOW"]
+    outage["updated_at"] = os.environ["CCD_NOW"]
     write_atomic(outage_path, outage)
 except (KeyError, ValueError, TypeError):
     pass
@@ -165,7 +161,7 @@ if valid:
             state["recovery_notified_window"] = name
             state["recovery_notified_reset"] = reset
             # Quota recovered: settle the outage total.
-            # The first ccx of the next outage recreates it with a fresh baseline.
+            # The first ccd of the next outage recreates it with a fresh baseline.
             try:
                 os.remove(outage_path)
             except OSError:
@@ -182,14 +178,14 @@ PY
 }
 
 # While on the external backbone, keep updating quota and cost but suppress quota/Codex warnings.
-if [ -n "${CCX_ACTIVE:-}" ]; then
-  update_ccx_state
+if [ -n "${CCD_ACTIVE:-}" ]; then
+  update_ccd_state
   [ -f "$RUN_STATE" ] || exit 0
 
-  OUT=$(CCX_STATE="$RUN_STATE" EVENT="$EVENT" python3 - <<'PY'
+  OUT=$(CCD_STATE="$RUN_STATE" EVENT="$EVENT" python3 - <<'PY'
 import json, os
 try:
-    s = json.load(open(os.environ["CCX_STATE"]))
+    s = json.load(open(os.environ["CCD_STATE"]))
 except Exception:
     raise SystemExit(0)
 window = s.get("recovery_notified_window")
@@ -202,15 +198,15 @@ if window and reset and s.get(f"last_{window}_reset") == reset:
     if s.get("recovery_context_delivered") != key:
         s["recovery_context_delivered"] = key
         import tempfile
-        p = os.environ["CCX_STATE"]
+        p = os.environ["CCD_STATE"]
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".run-state.")
         with os.fdopen(fd, "w") as f:
             json.dump(s, f, ensure_ascii=False); f.write("\n")
         os.replace(tmp, p); os.chmod(p, 0o600)
         label = "5-hour" if window == "five_hour" else "7-day"
-        msg = (f"[ccx] The Claude {label} quota window has reset — the subscription is usable again. The current session remains on the OpenRouter backbone. "
+        msg = (f"[ccd] The Claude {label} quota window has reset — the subscription is usable again. The current session remains on the OpenRouter backbone. "
                "To return to the subscription, finish the work, `/exit`, then run `claude --resume` in the same terminal. "
-               "Do not use `/logout` or `ccx -c`.")
+               "Do not use `/logout` or `ccd -c`.")
         print(json.dumps({"hookSpecificOutput": {"hookEventName": os.environ["EVENT"], "additionalContext": msg}}, ensure_ascii=False))
 PY
 )
@@ -249,11 +245,11 @@ if isinstance(codex_five, (int, float)):
 # so the backbone-switch path must be surfaced now, while Claude can still respond.
 if max(vals) >= 95:
     msg += (
-        " ★QUOTA NEARLY EXHAUSTED★ Tell the user now: (1) `ccx` is ready as an alternate backbone switcher, and "
-        "`ccx -c` resumes the last conversation on a low-cost OpenRouter model. "
-        "(2) If OPENROUTER_API_KEY in ~/.claude/ccx/providers/keys.env is empty, set it while quota remains and "
-        "validate with `ccx doctor`; setup is impossible after exhaustion. "
-        "(3) See ~/.claude/ccx/QUOTA-SOS.md for details."
+        " ★QUOTA NEARLY EXHAUSTED★ Tell the user now: (1) `ccd` is ready as an alternate backbone switcher, and "
+        "`ccd -c` resumes the last conversation on a low-cost OpenRouter model. "
+        "(2) If OPENROUTER_API_KEY in ~/.claude/ccd/providers/keys.env is empty, set it while quota remains and "
+        "validate with `ccd doctor`; setup is impossible after exhaustion. "
+        "(3) See ~/.claude/ccd/QUOTA-SOS.md for details."
     )
 print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": msg}}, ensure_ascii=False))
 EOF
