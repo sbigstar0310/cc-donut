@@ -140,9 +140,15 @@ vals = [p for p in (c.get("fiveHourPercent"), c.get("sevenDayPercent"))
         if isinstance(p, (int, float))]
 if vals and max(vals) >= int(os.environ["THRESHOLD"]):
     # Red, bold — impossible to miss
-    print("\033[1;31m ⚠ quota " + str(int(max(vals))) + "% → /exit then ccx -c\033[0m", end="")
+    print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → /exit then ccx -c\033[0m", end="")
 PY
 )
 fi
 
-printf '%s%s' "$base" "$suffix"
+# The warning gets its own row — appended to the dashboard's last line it is
+# cut off by terminal-width truncation.
+if [ -n "$base" ] && [ -n "$suffix" ]; then
+  printf '%s\n%s' "$base" "$suffix"
+else
+  printf '%s%s' "$base" "$suffix"
+fi
