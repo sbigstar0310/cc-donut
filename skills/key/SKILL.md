@@ -1,12 +1,14 @@
 ---
 name: key
-description: Set the OpenRouter API key for ccx without leaving the session. Use for /ccx:key, "키 설정해줘" (set my key), "set my OpenRouter key", or when setup/doctor reports the key is empty.
+description: Set the OpenRouter API key for ccx. Use for /ccx:key, "키 설정해줘" (set my key), "set my OpenRouter key", or when setup/doctor reports the key is empty.
 ---
 
-# ccx key — in-session key setup
+# ccx key — key setup
 
-Offer the user these paths, in this order. All paths end with the key in
-`~/.claude/ccx/providers/keys.env` (mode 600) for the terminal-side `ccx -c`.
+All paths end with the key in `~/.claude/ccx/providers/keys.env` (mode 600),
+readable by both this plugin and the terminal-side `ccx -c`. An exported
+`OPENROUTER_API_KEY` env var also works and takes precedence (the standard
+MCP/plugin convention).
 
 ## First: does the user have a key at all?
 
@@ -14,35 +16,36 @@ If they don't (or aren't sure), open the key-creation page for them right now �
 don't just paste a URL and hope:
 
 ```sh
-open  https://openrouter.ai/keys   # macOS
+open https://openrouter.ai/keys       # macOS
 xdg-open https://openrouter.ai/keys   # Linux with a desktop
 ```
 
-On a headless box (no DISPLAY), show the URL on its own line instead so it's
-one click/copy away. Either way add one tip: "While creating it, set a credit
-limit on the key — then even a leaked key can only spend that much."
+On a headless box (no DISPLAY), show the URL on its own line so it's one
+click/copy away. Either way add one tip: "While creating it, set a credit limit
+on the key — then even a leaked key can only spend that much."
 
-## A. Paste in chat — default (works everywhere, zero navigation)
+## Default path: native input — the key never enters this chat
 
-Say:
+- **macOS, right from this session**: run `~/.local/bin/ccx key` — a native
+  dialog opens; tell the user to paste there. Output shows only a masked tail.
+  Then run `~/.local/bin/ccx doctor` and relay the verdict.
+- **Linux / no dialog**: tell the user to run `ccx key` once in any terminal
+  window (hidden input, like `gh auth login`'s paste-token prompt), then come
+  back; you run `~/.local/bin/ccx doctor` and relay the verdict.
 
-> Paste the key here and I'll save + verify it now. Heads-up: it stays in this
-> conversation's local history — that's why the spend cap above is a good idea.
+Do not invite the user to paste the key into the chat — every surveyed tool
+treats that as an anti-pattern (the key persists in transcripts).
 
-When they paste it, save via the piped path (never echo it back, never write it
-anywhere else):
+## If the user pastes a key into chat anyway
 
-```sh
-printf '%s\n' 'PASTED_KEY' | ~/.local/bin/ccx key
-```
+Accept it gracefully — don't scold, don't refuse:
 
-Relay only the masked one-line result.
+1. Save it via the piped path (never echo it back, never write it elsewhere):
+   ```sh
+   printf '%s\n' 'PASTED_KEY' | ~/.local/bin/ccx key
+   ```
+2. Relay the masked one-line result, then run doctor.
+3. Add one line: "Since the key touched this conversation, consider rotating it
+   at openrouter.ai/keys when convenient — or rely on its credit limit."
 
-## B. Native input — macOS dialog or any terminal (zero trace)
-
-`~/.local/bin/ccx key` run from this session opens a native dialog on macOS.
-On Linux without a dialog, `ccx key` in any terminal window prompts with hidden
-input.
-
-Whatever the path: never repeat the full key in any output, and finish with
-`~/.local/bin/ccx doctor` so the user sees `✓ OK`.
+Never print the key file's contents; never repeat a full key in any output.

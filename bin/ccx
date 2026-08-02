@@ -105,8 +105,12 @@ price_of() { awk -v k="$1" '!/^#/ && NF>=3 && $1==k {print $3; exit}' "$CATALOG"
 key_of() { awk -v s="$1" '!/^#/ && NF>=2 && $2==s {print $1; exit}' "$CATALOG" 2>/dev/null; }
 
 load_env() {
+  # An already-exported OPENROUTER_API_KEY wins over keys.env — the standard
+  # env-var override convention used by MCP servers and official plugins.
+  local env_key="${OPENROUTER_API_KEY:-}"
   # shellcheck disable=SC1090
   [ -f "$KEYS" ] && { set -a; . "$KEYS"; set +a; }
+  [ -n "$env_key" ] && OPENROUTER_API_KEY="$env_key"
   # shellcheck disable=SC1090
   . "$CONF"
   # shellcheck disable=SC1090
