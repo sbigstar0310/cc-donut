@@ -58,7 +58,9 @@ But you're not limited to these. Any slug from [openrouter.ai/models](https://op
 /model z-ai/glm-5.2:floor
 ```
 
-Remap the aliases permanently with `ccx pick`, or per-run: `ccx -c --opus sol`.
+Remap the aliases permanently with `ccx pick` (an offline menu over the curated catalog), or per-run: `ccx -c --opus sol`.
+
+The catalog is a snapshot and goes stale. To refresh it with current benchmarks and prices, ask Claude (while you have quota): *"refresh the ccx model picks"* — the `/ccx` skill researches independent benchmarks and live OpenRouter pricing, recomputes the price/performance frontier, and proposes an updated catalog before writing anything.
 
 </details>
 

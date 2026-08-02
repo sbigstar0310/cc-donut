@@ -1,6 +1,6 @@
 ---
 name: ccx
-description: Prepare, check, and configure the ccx backbone fallback for Claude quota exhaustion. Use when the user asks things like "/ccx", "쿼타 떨어지면 어떡하지" (what if quota runs out), "폴백 준비" (prepare fallback), "백본 바꾸는 거 설정" (set up backbone switching), "OpenRouter 키 넣어줘" (add my OpenRouter key), or when the quota-guard hook reports the quota threshold was exceeded. The actual emergency switch is not this skill — the user runs `ccx -c` in a terminal.
+description: Prepare, check, and configure the ccx backbone fallback for Claude quota exhaustion. Use when the user asks things like "/ccx", "쿼타 떨어지면 어떡하지" (what if quota runs out), "폴백 준비" (prepare fallback), "백본 바꾸는 거 설정" (set up backbone switching), "OpenRouter 키 넣어줘" (add my OpenRouter key), "모델 추천 갱신" / "refresh the ccx model picks" / "are these still the best models?", or when the quota-guard hook reports the quota threshold was exceeded. The actual emergency switch is not this skill — the user runs `ccx -c` in a terminal.
 ---
 
 # ccx preparation & checkup
@@ -57,6 +57,33 @@ ccx pick       # Interactive reassignment — needs direct user input, so tell t
 `ccx pick` is interactive and doesn't work well inside Claude Code. If only the
 assignment needs changing, editing `~/.claude/ccx/providers/tiers.env` directly is
 faster. Slugs reference the keys in `models.conf`.
+
+### 5. Refresh the model recommendations (LLM research flow)
+
+`ccx pick` is deliberately a dumb offline menu — it must work in a terminal when
+Claude is dead. The research lives here instead. When the user asks to refresh or
+re-evaluate the model picks (the catalog is a frozen snapshot and goes stale as
+prices move and new models ship), do this:
+
+1. **Read the current catalog** at `~/.claude/ccx/providers/models.conf`
+   (format: `key slug in/out-price description`, `#` comments).
+2. **Research candidates with WebSearch.** Look for recent *independent*
+   coding-agent benchmarks (e.g. DeepSWE-style leaderboards, Terminal-Bench).
+   Distrust vendor self-reported SWE-bench numbers. Note which harness each
+   score was measured in — almost none are measured in Claude Code itself, so
+   treat scores as approximate.
+3. **Verify live pricing** from OpenRouter's public API (no key needed):
+   `GET https://openrouter.ai/api/v1/models/<slug>/endpoints` — take the
+   cheapest endpoint whose `tag` does NOT contain `/` (tags with `/` are
+   service-tier variants like `openai/flex`, not what `:floor` selects).
+4. **Compute the pareto frontier** on (benchmark score, blended cost). Flag
+   currently-cataloged models that are now dominated and candidates that
+   dominate them.
+5. **Propose before writing.** Show the user a table: current slots vs
+   proposed slots, with score/price rationale. Only after the user approves,
+   update `models.conf` (keep the file format and one-line rationale notes) and,
+   if slot assignments change, `tiers.env`. Then run `ccx doctor <key>` for each
+   newly added catalog key to confirm the slug is live.
 
 ## Always tell the user
 
