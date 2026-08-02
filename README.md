@@ -1,18 +1,20 @@
 # ccx
 
-**Claude Code quota just ran out mid-task? Get back into that exact conversation in 10 seconds — on any model you choose, for pennies.**
+**Keep 100% of your Claude Code — tools, hooks, skills, MCP servers, and the very conversation you're in. Swap only the model.**
+
+Built for the moment your Claude subscription quota dies mid-task: you're back in the same conversation in 10 seconds, on any OpenRouter model, for pennies — and back on your subscription the moment it recovers.
 
 ```text
-/exit  →  ccx -c              # quota died: same conversation, same tools, now on OpenRouter
+/exit  →  ccx -c              # quota died: same everything, now on OpenRouter
 /exit  →  claude --resume     # quota recovered: back on subscription, conversation intact
 ```
 
 ## What you get
 
-- 🔄 **Never lose the conversation** — switch out and back with it intact (round-trip tested)
-- 🧰 **Never lose your setup** — tools, hooks, skills, MCP servers all keep running; only the model changes
-- 🚨 **Told exactly what to type, exactly when** — statusline turns red near exhaustion, green on recovery, each with the command to run
+- 🧰 **Your whole Claude Code, untouched** — the entire scaffold (tools, hooks, skills, MCP servers, keybindings, history) keeps running; ccx swaps nothing but the model behind it
+- 🔄 **The conversation survives both directions** — `ccx -c` resumes it on OpenRouter, `claude --resume` brings it home (round-trip tested)
 - 🎛 **Any OpenRouter model, mid-session** — hundreds of models incl. dirt-cheap ones, one `/model` away, no restart
+- 🚨 **Told exactly what to type, exactly when** — statusline turns red near exhaustion, green on recovery, each with the command to run
 - 💸 **Cheapest provider by default, every cent visible** — `:floor` routing + live run/outage spend in the statusline
 - 🔒 **Zero auth risk** — your claude.ai login is never touched; key stored locally (600), never typed in chat
 
