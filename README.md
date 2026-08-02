@@ -24,18 +24,33 @@ ccx │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 
 ## Setup — 2 minutes, while you still have quota
 
-```text
-/plugin marketplace add sbigstar0310/ccx
-/plugin install ccx@ccx
-/ccx:setup                    # then restart Claude Code
-```
+**From a terminal** (safe to paste as one block):
 
 ```sh
-ccx key       # optional until you need it — hidden input, verified on save
-ccx doctor    # ✓ OK = your escape route works
+claude plugin marketplace add sbigstar0310/ccx
+claude plugin install ccx@ccx
 ```
 
-Key from [openrouter.ai/keys](https://openrouter.ai/keys). Set it up **before** quota hits zero — after that, Claude can't walk you through it.
+Then open Claude Code and run `/ccx:setup`, then restart Claude Code.
+
+<details>
+<summary>Prefer doing it inside Claude Code?</summary>
+
+Slash commands are parsed **one line at a time** — enter each separately (pasting the block as one message won't work):
+
+1. `/plugin marketplace add sbigstar0310/ccx`
+2. `/plugin install ccx@ccx`
+3. `/reload-plugins`
+4. `/ccx:setup` — then restart Claude Code
+
+</details>
+
+Optionally add your OpenRouter key (any time, but **before** quota hits zero — after that, Claude can't walk you through it). Key from [openrouter.ai/keys](https://openrouter.ai/keys):
+
+```sh
+ccx key       # hidden input, verified on save
+ccx doctor    # ✓ OK = your escape route works
+```
 
 That's everything you need. Details below when you want them.
 
