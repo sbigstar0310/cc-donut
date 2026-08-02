@@ -99,6 +99,8 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | --- | --- |
 | `/ccx` | Readiness checkup and configuration by chat: verifies key/slots/routing, sets the key via native dialog, refreshes the model catalog with fresh benchmarks & prices on request ("refresh the ccx model picks") |
 | `/ccx:setup` | First-time wiring — launchers, statusline, legacy migration, then key + doctor without leaving the session |
+| `/ccx:key` | Set the OpenRouter key in-session — plugin config menu (masked, keychain), chat paste with consent, or native dialog |
+| `/ccx:doctor` | Diagnose the escape route: key, API, model slugs, wiring — with the fix offered on failure |
 | `/ccx:update` | One-step plugin update to the latest release |
 | `/ccx:uninstall` | Clean removal (keeps your key unless you ask to purge) |
 
