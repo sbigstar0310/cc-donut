@@ -20,24 +20,52 @@ file_age() {
   local f="$1" now mtime
   now=$(date +%s)
   [ -f "$f" ] || { echo 999999; return; }
-  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)
-  [ -n "$mtime" ] && echo $((now - mtime)) || echo 999999
+  # GNU first, BSD second, and the fallback MUST be outside the command
+  # substitution: `$(stat -f %m || stat -c %Y)` captures both commands' stdout,
+  # and GNU `stat -f` prints a filesystem dump while failing — that poisoned
+  # mtime, made the arithmetic die, and silently froze the cache on Linux.
+  mtime=$(stat -c %Y "$f" 2>/dev/null) || mtime=$(stat -f %m "$f" 2>/dev/null)
+  case "$mtime" in
+    ''|*[!0-9]*) echo 999999; return ;;   # unusable → treat as ancient, never as fresh
+  esac
+  echo $((now - mtime))
 }
 
 # Refresh the dashboard's Claude quota cache regardless of ccx state,
 # so Claude resets are visible even while the external backbone is active.
+# Hooks run non-interactively, so a version-manager node (nvm/volta/fnm) is often
+# absent from PATH even though it works in the user's shell — that made the cache
+# refresh fail silently. Fall back to the usual install locations.
+find_node() {
+  command -v node 2>/dev/null && return 0
+  local c
+  for c in "$HOME/.volta/bin/node" "$HOME/.local/share/fnm/aliases/default/bin/node" \
+           /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node /snap/bin/node; do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  c=$(ls -d "$HOME/.nvm/versions/node"/*/bin/node 2>/dev/null | sort -V | tail -1)
+  [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  return 1
+}
+
 if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   script=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/check-usage.js 2>/dev/null | sort -V | tail -1)
+  node_bin=$(find_node) || node_bin=""
   # This hook fires on both UserPromptSubmit and PostToolUse, so instances run
   # concurrently. A shared tmp name lets one instance truncate/delete another's
   # in-flight write and the refresh silently fails forever under load — use a
   # per-process tmp and install it only when it parses as JSON.
   tmp="$CACHE.tmp.$$"
-  if [ -n "$script" ] && node "$script" --json > "$tmp" 2>/dev/null \
+  if [ -n "$script" ] && [ -n "$node_bin" ] && "$node_bin" "$script" --json > "$tmp" 2>/dev/null \
      && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$tmp" 2>/dev/null; then
     mv "$tmp" "$CACHE"
+    rm -f "$CCX_DIR/refresh-failed"
   else
     rm -f "$tmp"
+    # Leave a breadcrumb so `ccx doctor` can say quota data is stale instead of
+    # the warnings just never appearing.
+    { [ -n "$script" ] || echo "claude-dashboard not installed"
+      [ -n "$node_bin" ] || echo "node not found in hook PATH"; } > "$CCX_DIR/refresh-failed" 2>/dev/null
   fi
 fi
 

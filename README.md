@@ -120,6 +120,21 @@ Quota warnings and recovery detection need the optional [claude-dashboard](https
 </details>
 
 <details>
+<summary><b>Development & testing</b></summary>
+
+```sh
+test/smoke.sh                 # 17 checks against the real scripts in a throwaway HOME
+test/docker.sh                # same suite in a clean Debian container
+test/docker.sh alpine:3.20    # …and on musl/BusyBox
+```
+
+No network, no real key, no writes outside the temp HOME. Run the container
+tests before releasing: GNU/BSD differences (e.g. `stat`) pass silently on
+macOS and break Linux users.
+
+</details>
+
+<details>
 <summary><b>Caveats</b></summary>
 
 - **Officially unsupported path**: both Anthropic and OpenRouter state that Claude Code targeting non-Claude models isn't guaranteed. It works via the standard model-slot variables today, but a Claude Code update could break it — hence `ccx doctor`.
