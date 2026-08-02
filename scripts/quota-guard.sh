@@ -28,7 +28,17 @@ file_age() {
 # so Claude resets are visible even while the external backbone is active.
 if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   script=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/check-usage.js 2>/dev/null | sort -V | tail -1)
-  [ -n "$script" ] && node "$script" --json > "$CACHE.tmp" 2>/dev/null && mv "$CACHE.tmp" "$CACHE" || rm -f "$CACHE.tmp"
+  # This hook fires on both UserPromptSubmit and PostToolUse, so instances run
+  # concurrently. A shared tmp name lets one instance truncate/delete another's
+  # in-flight write and the refresh silently fails forever under load — use a
+  # per-process tmp and install it only when it parses as JSON.
+  tmp="$CACHE.tmp.$$"
+  if [ -n "$script" ] && node "$script" --json > "$tmp" 2>/dev/null \
+     && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$tmp" 2>/dev/null; then
+    mv "$tmp" "$CACHE"
+  else
+    rm -f "$tmp"
+  fi
 fi
 
 # Update ccx run cost / recovery state at most once per hook cycle.
