@@ -17,13 +17,19 @@ Run everything yourself and report tersely; never send the user to a terminal.
 
 2. If it printed `✓ OK`, also confirm the wiring in one shot and report at most
    4 short ✓ lines (key: configured/empty · doctor: ✓ OK · statusline: wired ·
-   plugin: v<version>):
+   plugin: v<installed> latest / v<latest> available):
 
    ```sh
    grep -c '^OPENROUTER_API_KEY="..*"' ~/.claude/ccx/providers/keys.env 2>/dev/null  # 1 = key set (never cat this file)
    grep -o 'statusline-launcher' ~/.claude/settings.json | head -1
-   ls -d ~/.claude/plugins/cache/*/ccx/* 2>/dev/null | sort -V | tail -1
+   installed=$(ls -d ~/.claude/plugins/cache/*/ccx/* 2>/dev/null | sort -V | tail -1); installed=${installed##*/}
+   latest=$(curl -fsS --max-time 5 https://raw.githubusercontent.com/sbigstar0310/ccx/main/.claude-plugin/plugin.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null)
+   echo "installed=$installed latest=${latest:-unknown}"
    ```
+
+   If `latest` is newer than `installed`, report it as
+   `⬆ v<latest> available — run /ccx:update`; if the fetch failed (offline),
+   say the version check was skipped, never guess.
 
 3. On failure, map the code to the fix and offer to do it now:
    - 401/403 → key invalid/expired → offer the `key` skill paths (/plugin →
