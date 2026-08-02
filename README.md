@@ -90,9 +90,17 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | `ccx` | Status: key, slots, routing, escape procedure |
 | `ccx models` / `ccx pick` | Browse the catalog / remap the three aliases |
 | `ccx go` | Switch into a fresh session instead of resuming |
-| `ccx uninstall` / `/ccx:uninstall` | Clean removal (keeps your key unless `--purge`) |
 | `ccx -c --routing exacto` | If a cheap provider fumbles tool calls |
 | `ccx off` | Run claude on the subscription again |
+
+**Skills inside Claude Code** (type `/` to find them):
+
+| Skill | What it does |
+| --- | --- |
+| `/ccx` | Readiness checkup and configuration by chat: verifies key/slots/routing, sets the key via native dialog, refreshes the model catalog with fresh benchmarks & prices on request ("refresh the ccx model picks") |
+| `/ccx:setup` | First-time wiring — launchers, statusline, legacy migration, then key + doctor without leaving the session |
+| `/ccx:update` | One-step plugin update to the latest release |
+| `/ccx:uninstall` | Clean removal (keeps your key unless you ask to purge) |
 
 Complete emergency runbook (readable without Claude, kept offline at `~/.claude/ccx/QUOTA-SOS.md`): [QUOTA-SOS.md](QUOTA-SOS.md)
 
