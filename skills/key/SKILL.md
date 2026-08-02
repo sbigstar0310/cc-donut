@@ -5,23 +5,12 @@ description: Set the OpenRouter API key for ccx without leaving the session. Use
 
 # ccx key — in-session key setup
 
-Offer the user these paths, in this order. All three end with the key in
+Offer the user these paths, in this order. All paths end with the key in
 `~/.claude/ccx/providers/keys.env` (mode 600) for the terminal-side `ccx -c`.
 
-## A. Plugin config menu — recommended (secure, works everywhere incl. headless Linux)
+## A. Paste in chat — default (works everywhere, zero navigation)
 
-Tell the user:
-
-> Type `/plugin`, pick **ccx → Configure options**, and paste your key there.
-> The input is masked and stored in the system keychain — it never appears in
-> this chat. Then send me any message and I'll verify it.
-
-On their next message the quota-guard hook automatically syncs the key into
-`keys.env`. Then run `~/.local/bin/ccx doctor` and relay the one-line verdict.
-
-## B. Paste in chat — fastest, with informed consent
-
-If the user prefers zero menu navigation, say:
+Say:
 
 > Paste the key here and I'll save + verify it now. Heads-up: it stays in this
 > conversation's local history — consider a spend-capped key
@@ -36,11 +25,18 @@ printf '%s\n' 'PASTED_KEY' | ~/.local/bin/ccx key
 
 Relay only the masked one-line result.
 
-## C. Native input — macOS dialog or any terminal
+## B. Native input — macOS dialog or any terminal (zero trace)
 
 `~/.local/bin/ccx key` run from this session opens a native dialog on macOS.
 On Linux without a dialog, `ccx key` in any terminal window prompts with hidden
 input.
+
+## C. Plugin config menu — only if the user's Claude Code supports it
+
+`/plugin` → **ccx → Configure options** (masked input, keychain; the quota-guard
+hook syncs it to keys.env on the next message). Known to be missing/broken on
+some Claude Code versions ("No configuration changes" with no input UI) — if the
+user reports that, fall back to A or B without retrying.
 
 Whatever the path: never repeat the full key in any output, and finish with
 `~/.local/bin/ccx doctor` so the user sees `✓ OK`.
