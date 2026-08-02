@@ -27,5 +27,7 @@ relay the verdict — no question needed. Either way the user should finish setu
 key, and validation without leaving the session; only the final "restart Claude
 Code" remains.
 
-Never ask for or type an API key in the chat. Never edit files directly; the
-script owns all writes. If the script fails, show the error and stop.
+Key handling follows the `key` skill: chat paste only with the consent notice,
+never echo a full key back, never write it anywhere but through `ccx key`.
+Never edit files directly; the script owns all writes. If the script fails,
+show the error and stop.
