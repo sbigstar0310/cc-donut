@@ -79,11 +79,33 @@ prices move and new models ship), do this:
 4. **Compute the pareto frontier** on (benchmark score, blended cost). Flag
    currently-cataloged models that are now dominated and candidates that
    dominate them.
-5. **Propose before writing.** Show the user a table: current slots vs
-   proposed slots, with score/price rationale. Only after the user approves,
-   update `models.conf` (keep the file format and one-line rationale notes) and,
-   if slot assignments change, `tiers.env`. Then run `ccx doctor <key>` for each
-   newly added catalog key to confirm the slug is live.
+5. **Answer the question the user actually asked: what goes in the three
+   slots?** The deliverable is one table with exactly three rows — one per
+   alias — and nothing above it but a one-line verdict:
+
+   ```
+   Catalog is current — no slot changes worth making. (flash price drifted +24%, updating that line.)
+
+   | slot     | recommended                | $/M in·out   | why |
+   | /model haiku  | deepseek/deepseek-v4-flash | 0.11 · 0.22 | cheapest usable; scans & grep |
+   | /model sonnet | openai/gpt-5.6-luna        | 0.10 · 0.60 | best value at everyday coding |
+   | /model opus   | openai/gpt-5.6-terra       | 1.00 · 6.00 | cheapest model in the 70% class |
+
+   Swap in? [y/n]  ·  runner-up for opus: gpt-5.6-sol (72.7%, $5/$30) — pricier, only for the hardest work
+   ```
+
+   Rules for that report:
+   - Three rows. Extra catalog entries (reference/experimental models) get at
+     most one trailing "runner-up" line, never their own table.
+   - `why` is one clause. No methodology, no benchmark-provenance paragraphs,
+     no verification plans — the user asked which models to use, not how you
+     decided. Offer details only if they ask.
+   - If nothing should change, say so in the first line and stop there; don't
+     manufacture a diff to look busy.
+6. **Write only after approval.** Update `models.conf` (keep the file format
+   and one-line rationale notes) and, if slot assignments change, `tiers.env`.
+   Then run `ccx doctor <key>` once per changed slot and report the verdicts as
+   one line each.
 
 ## Always tell the user
 
