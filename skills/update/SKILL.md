@@ -26,12 +26,19 @@ claude plugin update ccx@ccx
 ls -d "$HOME/.claude/plugins/cache"/*/ccx/*/bin/ccx | sort -V | tail -1
 ```
 
-3. Report the old → new version to the user (the update command prints it;
-   `claude plugin list` shows the installed version if needed).
+3. Report the result in at most 3 short lines (old → new version; launcher OK).
 
-4. Tell the user to run `/reload-plugins` (or restart Claude Code) to apply the
-   updated hooks and skills to the current session. The statusline and terminal
-   `ccx` command are already on the new version via the dynamic launchers.
+4. **The last line of your reply must be exactly this call to action, alone,
+   with nothing after it** — Claude cannot run slash commands, so the user must:
+
+   ```
+   → Type /reload-plugins now — until then, this session still runs the OLD version's skills and hooks.
+   ```
+
+   (Skip that line only when the plugin was already at the latest version and
+   nothing changed.) The statusline and terminal `ccx` command are already on
+   the new version via the dynamic launchers; the reload is the only remaining
+   step, so never bury it in prose.
 
 ## Notes
 

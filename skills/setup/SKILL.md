@@ -19,10 +19,13 @@ If the setup output says the OpenRouter key is not set, offer to finish right no
 (one short question, e.g. "Set the key now? A native dialog will open — your key
 never appears in this chat."). If the user agrees:
 
-1. On macOS, run `~/.local/bin/ccx key` — with no TTY it opens a **native input
-   dialog**; tell the user to paste the key there. The command output only shows
-   a masked tail. On Linux/no-osascript this step needs a real terminal — only
-   then tell the user to run `ccx key` there.
+1. Run `~/.local/bin/ccx key`. With no TTY it falls back automatically: the
+   controlling terminal if one exists (hidden inline input — works on headless
+   Linux), else a **native macOS dialog**. Tell the user where to paste (the
+   command prints it); output only ever shows a masked tail.
+   If it exits with "No terminal available here", tell the user to type
+   `! ccx key` directly in the Claude Code prompt — that runs it with their
+   terminal attached, input hidden, still in-session.
 2. Then run `~/.local/bin/ccx doctor` and relay its one-line verdict.
 
 If the key was already configured, just run `~/.local/bin/ccx doctor` directly and

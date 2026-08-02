@@ -145,11 +145,20 @@ set_key() {
     printf '  Create one: %shttps://openrouter.ai/keys%s\n> ' "$cyn" "$r"
     stty -echo 2>/dev/null; read -r k; stty echo 2>/dev/null; printf '\n'
   else
-    # No terminal: use piped input if available, otherwise open a dialog.
+    # No stdin terminal: try piped input, then the controlling terminal
+    # (covers Claude Code `!` commands and other embedded shells — works headless
+    # on Linux), then the macOS dialog as a last resort.
     read -t 1 -r k 2>/dev/null || k=""
+    if [ -z "$k" ] && (exec < /dev/tty) 2>/dev/null; then
+      printf 'Paste the OpenRouter key and press Enter %s(input is hidden)%s\n> ' "$d" "$r" > /dev/tty
+      stty -echo < /dev/tty 2>/dev/null
+      IFS= read -r k < /dev/tty
+      stty echo < /dev/tty 2>/dev/null
+      printf '\n' > /dev/tty
+    fi
     if [ -z "$k" ]; then
       command -v osascript >/dev/null 2>&1 \
-        || die "No terminal or piped input. Run 'ccx key' in a real terminal."
+        || die "No terminal available here. In Claude Code, type '! ccx key' (runs with your terminal, input hidden) — or run 'ccx key' in any terminal."
       printf '%sA dialog is open. Paste the key there.%s\n' "$d" "$r"
       k=$(key_from_dialog)
       [ -n "$k" ] || die "Canceled or empty input. Nothing changed."
