@@ -6,6 +6,8 @@
 
 **The donut spare for Claude Code. Max 50 mph, gets you home.**
 
+[한국어](README.ko.md) · English
+
 [![License: MIT](https://img.shields.io/github/license/sbigstar0310/cc-donut)](LICENSE)
 [![tests](https://github.com/sbigstar0310/cc-donut/actions/workflows/test.yml/badge.svg?branch=main&event=push)](https://github.com/sbigstar0310/cc-donut/actions/workflows/test.yml?query=branch%3Amain+event%3Apush)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-blueviolet)](#install)
