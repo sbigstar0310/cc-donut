@@ -66,10 +66,12 @@ if slug.endswith("[1m]"):
         ctx_budget = f"{int(cw) // 1000}K"
     else:
         ctx_budget = "1M"
-for r in (":floor", ":exacto", ":nitro"):
-    if slug.endswith(r):
-        routing, slug = r, slug[: -len(r)]
-        break
+# A routing suffix is local gateway syntax after the OpenRouter slug. Keep it for
+# a suggested native command, but use only the bare slug for cache lookup/fetch.
+if ":" in slug:
+    possible_slug, possible_routing = slug.rsplit(":", 1)
+    if possible_slug and possible_routing and "/" not in possible_routing:
+        slug, routing = possible_slug, ":" + possible_routing
 
 effort = os.environ.get("CLAUDE_CODE_EFFORT_LEVEL")
 if effort not in {"low", "medium", "high", "max"}:
@@ -103,6 +105,31 @@ if entry:
 if slug and stale:
     print(slug, file=sys.stderr)
 
+# `/model` changes the active ID, but statusline is display-only: it cannot modify
+# Claude Code's already-running global compact window. Make the next safe action
+# explicit instead of pretending the suffix or provider capacity was auto-applied.
+context_guidance = ""
+def finite_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+def safe_ceiling(v):
+    return int(min(v * 0.92, v - 40000))
+if model_id:
+    if stale:
+        context_guidance = "checking provider context…"
+    elif not finite_number((entry or {}).get("min_context_length")):
+        context_guidance = "provider context unverified · safe 200K"
+    elif int(entry["min_context_length"]) <= 200000:
+        context_guidance = "provider pool ≤200K · safe 200K"
+    elif not model_id.endswith("[1m]"):
+        candidate_ceiling = safe_ceiling(float(entry["min_context_length"]))
+        current_window = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+        # No configured window means Claude Code's ordinary extended budget; do not
+        # recommend an arbitrary direct switch as though ccd had verified it.
+        if current_window.isdigit() and int(current_window) <= candidate_ceiling:
+            context_guidance = f"verified context → /model {slug}{routing or ':floor'}[1m]"
+        else:
+            context_guidance = f"restart for safe context → /exit; ccd -c --model {slug}"
+
 # run = this ccd process's spend; total = whole quota-outage total (survives ccd restarts)
 run_cost = state.get("ccd_spend_usd")
 outage = load(sys.argv[3])
@@ -133,7 +160,8 @@ if display_id:
     model_part += f" · {ctx_budget}"
 
 sep = " \033[2m│\033[0m "
-print(f"\033[1;35mccd\033[0m{sep}\033[36m{model_part}\033[0m{sep}\033[33m{price_part}\033[0m{sep}\033[33m{spend_part}\033[0m{recovery}", end="")
+guidance_part = f"{sep}\033[33m{context_guidance}\033[0m" if context_guidance else ""
+print(f"\033[1;35mccd\033[0m{sep}\033[36m{model_part}\033[0m{sep}\033[33m{price_part}\033[0m{sep}\033[33m{spend_part}\033[0m{guidance_part}{recovery}", end="")
 PY
 )
   stale_slug=$(head -n1 "$stale_file" 2>/dev/null || true)

@@ -112,7 +112,14 @@ prices move and new models ship), do this:
 - The emergency switch is one command in a terminal: **`ccd -c`**. It resumes the
   conversation they were in.
 - After switching, models change in-session via `/model haiku|sonnet|opus`, or a
-  direct `/model <slug>`. No restart needed.
+  direct `/model <slug>`. Selection needs no restart. A direct model is outside
+  ccd's launch-time context budget until the statusline evaluates fresh provider
+  metadata: obey `checking provider context…`, the exact safe `[1m]` command, or
+  `restart for safe context → /exit; ccd -c --model provider/model` as shown.
+  Never claim ccd can resize an already-running Claude Code process.
+- `[1m]` is a local Claude Code hint, stripped before OpenRouter; it does not
+  expand upstream capacity. ccd's conservative provider-pool metadata policy is
+  implementation-specific and can become stale, so it is not a provider guarantee.
 - After switching, the statusline gains a row:
   `ccd │ <model> · <effort> │ in $x/M · out $y/M │ run $a · total $b`.
   in/out is the current model's per-1M-token price (cheapest provider under

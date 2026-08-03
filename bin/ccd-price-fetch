@@ -15,7 +15,7 @@ CACHE="$CACHE_DIR/price-cache.json"
 mkdir -p "$CACHE_DIR"
 
 # -g disables URL globbing (defensive — a terminal [1m] was already stripped above).
-body=$(curl -gfsS --max-time 8 "https://openrouter.ai/api/v1/models/${slug}/endpoints" 2>/dev/null) || exit 0
+body=$(curl -gfsS --max-time 8 "https://openrouter.ai/api/v1/models/${slug}/endpoints" 2>/dev/null) || exit 1
 
 CCD_PRICE_BODY="$body" python3 - "$CACHE" "$slug" <<'PY'
 import fcntl, json, os, sys, time
@@ -24,7 +24,7 @@ cache_path, slug = sys.argv[1], sys.argv[2]
 try:
     data = json.loads(os.environ["CCD_PRICE_BODY"]).get("data") or {}
 except Exception:
-    sys.exit(0)
+    sys.exit(1)
 
 prompts, completions, contexts = [], [], []
 context_unknown = False
@@ -49,7 +49,7 @@ for ep in data.get("endpoints") or []:
     except (KeyError, TypeError, ValueError):
         continue
 if not prompts or not completions:
-    sys.exit(0)
+    sys.exit(1)
 
 # Prices arrive as USD per token; store them per 1M tokens.
 entry = {

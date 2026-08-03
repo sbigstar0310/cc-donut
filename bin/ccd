@@ -8,6 +8,7 @@
 #   ccd -c                 Switch and resume the last conversation  <- emergency command
 #   ccd go                 Switch into a new session
 #   ccd -c --opus kimi     Use kimi for the opus slot for this run only
+#   ccd -c --model provider/model  Resume with this model as the sonnet/current slot
 #   ccd pick               Choose models for the haiku/sonnet/opus slots (saved)
 #   ccd models             Model catalog (slugs to paste into /model in a session)
 #   ccd key                Enter the OpenRouter API key (no editor needed)
@@ -96,6 +97,26 @@ slug_of() {
 note_of() { awk -v k="$1" '!/^#/ && NF>=2 && $1==k {$1="";$2="";$3="";sub(/^ +/,"");print;exit}' "$CATALOG" 2>/dev/null; }
 price_of() { awk -v k="$1" '!/^#/ && NF>=3 && $1==k {print $3; exit}' "$CATALOG" 2>/dev/null; }
 key_of() { awk -v s="$1" '!/^#/ && NF>=2 && $2==s {print $1; exit}' "$CATALOG" 2>/dev/null; }
+
+# The bounded metadata warm set lives in models.conf by key, not in this script.
+# Ignore missing/retired keys so an older user catalog remains usable.
+prewarm_catalog_slugs() {
+  local keys k s
+  keys=$(awk '/^# ccd-prewarm:/ {for (i=3; i<=NF; i++) printf "%s ", $i; exit}' "$CATALOG" 2>/dev/null)
+  for k in $keys; do
+    s=$(slug_of "$k") && printf '%s\n' "$s"
+  done
+}
+
+valid_bare_slug() {
+  case "$1" in
+    ''|-*|*'['*|*']'*|*:*|*'?'*|*'#'*|*'://'*|*' '*|*$'\t'*|*$'\n'*|*/*/*|/*|*/)
+      return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+  esac
+  [[ "$1" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]
+}
 
 load_env() {
   # An already-exported OPENROUTER_API_KEY wins over keys.env — the standard
@@ -256,6 +277,61 @@ except Exception:
 PY
 }
 
+# Forget a context entry after a forced refresh fails. A direct --model launch
+# promises fresh selected-model verification; retaining an older successful entry
+# would let it apply [1m] and a compact window the provider no longer supports.
+invalidate_context_slug() {  # $1 = bare slug
+  python3 - "$PRICE_CACHE" "$1" <<'PY'
+import fcntl, json, os, sys, tempfile
+path, slug = sys.argv[1], sys.argv[2]
+lock = open(path + ".lock", "a")
+fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    try:
+        cache = json.load(open(path))
+    except Exception:
+        cache = {}
+    models = cache.get("models")
+    if not isinstance(models, dict) or slug not in models:
+        raise SystemExit(0)
+    del models[slug]
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".price-cache.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+finally:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    lock.close()
+PY
+}
+
+# Print unique slugs whose provider metadata is absent, malformed, stale, or
+# future-dated. This is deliberately the same fail-closed freshness rule used by
+# with_context_hint; callers decide whether to wait or warm in the background.
+stale_context_slugs() {
+  python3 - "$PRICE_CACHE" "$@" 2>/dev/null <<'PY'
+import json, math, sys, time
+CACHE_TTL, FUTURE_GRACE = 86400, 300
+try:
+    models = json.load(open(sys.argv[1])).get("models", {})
+except Exception:
+    models = {}
+now = time.time()
+for slug in dict.fromkeys(sys.argv[2:]):
+    entry = models.get(slug) or {}
+    try:
+        age = now - float(entry.get("fetched_at", 0))
+    except Exception:
+        age = float("inf")
+    if not math.isfinite(age) or age > CACHE_TTL or age < -FUTURE_GRACE:
+        print(slug)
+PY
+}
+
 # Resolve all three model slots into environment variables after applying one-time overrides.
 apply_tiers() {
   local hinted_slugs="" RESOLVED
@@ -304,6 +380,8 @@ show_models() {
   awk '!/^#/ && NF>=4 {printf "  %-9s %-38s %-14s %s\n", $1, $2, $3, substr($0, index($0,$4))}' "$CATALOG"
   printf '\n%sTo switch during a session, enter the slug directly:%s  %s/model moonshotai/kimi-k3:%s%s\n' \
     "$d" "$r" "$b" "${CCD_ROUTING:-floor}" "$r"
+  printf '%sFor a verified extended pool, follow the statusline’s exact [1m] command; it is a local Claude Code hint, not provider capacity.%s\n' "$d" "$r"
+  printf '%sTo restart/resume a different model with a launch-time context budget:%s  %sccd -c --model provider/model%s\n' "$d" "$r" "$b" "$r"
   printf '%sTo persistently change the three slots:%s  %sccd pick%s\n' "$d" "$r" "$b" "$r"
 }
 
@@ -755,25 +833,38 @@ esac
 
 load_env; require_key
 
-# One-time override: --haiku/--sonnet/--opus <key|slug>
+# One-time override: --haiku/--sonnet/--opus <key|slug>. --model is intentionally
+# stricter: it is the restart/resume escape hatch, so it accepts only a bare
+# provider/model slug and must never leak to claude as an unknown flag or prompt.
 args=()
+selected_model=""
+seen_sonnet=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --model)
+      [ $# -ge 2 ] || die "--model requires a bare provider/model slug"
+      [ -z "$selected_model" ] || die "--model may be specified once"
+      valid_bare_slug "$2" || die "--model must be a bare provider/model slug (no routing or [1m])"
+      selected_model="$2"
+      shift 2 ;;
     --haiku|--sonnet|--opus)
       [ $# -ge 2 ] || die "$1 requires a model key (see ccd models)"
       s=$(slug_of "$2") || die "Unknown model key: $2"
       case "$1" in
         --haiku)  ANTHROPIC_DEFAULT_HAIKU_MODEL="$s" ;;
-        --sonnet) ANTHROPIC_DEFAULT_SONNET_MODEL="$s" ;;
+        --sonnet) ANTHROPIC_DEFAULT_SONNET_MODEL="$s"; seen_sonnet=1 ;;
         --opus)   ANTHROPIC_DEFAULT_OPUS_MODEL="$s" ;;
       esac
       shift 2 ;;
     --routing)
       [ $# -ge 2 ] || die "--routing requires floor or exacto"
-      CCD_ROUTING="$2"; shift 2 ;;
+      case "$2" in floor|exacto|nitro) CCD_ROUTING="$2" ;; *) die "--routing requires floor, exacto, or nitro" ;; esac
+      shift 2 ;;
     *) args+=("$1"); shift ;;
   esac
 done
+[ -z "$selected_model" ] || [ "$seen_sonnet" -eq 0 ] || die "--model and --sonnet are ambiguous; use one"
+[ -z "$selected_model" ] || ANTHROPIC_DEFAULT_SONNET_MODEL="$selected_model"
 
 # Without an interactive screen (Claude Code ! command, script, or pipe), claude
 # falls into headless mode and reports a misleading "provide a prompt" error.
@@ -803,31 +894,28 @@ printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
 # ccd-price-fetch's --max-time) BEFORE applying. ccd only works when OpenRouter is
 # reachable anyway; a failed fetch just keeps the safe 200K default for this run.
 if [ -x "$SELF_DIR/ccd-price-fetch" ]; then
-  stale_slugs=$(python3 - "$PRICE_CACHE" \
-      "${ANTHROPIC_DEFAULT_HAIKU_MODEL%%:*}" \
-      "${ANTHROPIC_DEFAULT_SONNET_MODEL%%:*}" \
-      "${ANTHROPIC_DEFAULT_OPUS_MODEL%%:*}" 2>/dev/null <<'PY'
-import json, math, sys, time
-CACHE_TTL, FUTURE_GRACE = 86400, 300   # shared cache-freshness policy
-try:
-    models = json.load(open(sys.argv[1])).get("models", {})
-except Exception:
-    models = {}
-now = time.time()
-for slug in dict.fromkeys(sys.argv[2:]):
-    entry = models.get(slug) or {}
-    try:
-        age = now - float(entry.get("fetched_at", 0))
-    except Exception:
-        age = 1e9
-    if not math.isfinite(age) or age > CACHE_TTL or age < -FUTURE_GRACE:
-        print(slug)
-PY
-)
+  slot_slugs=("${ANTHROPIC_DEFAULT_HAIKU_MODEL%%:*}" "${ANTHROPIC_DEFAULT_SONNET_MODEL%%:*}" "${ANTHROPIC_DEFAULT_OPUS_MODEL%%:*}")
+  # An explicit restart model must be freshly verified even when its cache entry
+  # is younger than the TTL: that option promises a selected-model launch budget.
+  stale_slugs=$(stale_context_slugs "${slot_slugs[@]}")
+  # Force-refresh the explicit selected model even when it is cached: this launch
+  # path commits its global compact budget to that exact provider pool.
+  if [ -n "$selected_model" ]; then
+    stale_slugs=$(printf '%s\n%s\n' "$stale_slugs" "$selected_model" | awk 'NF && !seen[$0]++')
+  fi
   if [ -n "$stale_slugs" ]; then
     printf '   %s⏳ refreshing provider data (first run or stale cache)%s\n' "$d" "$r"
-    for s in $stale_slugs; do "$SELF_DIR/ccd-price-fetch" "$s" >/dev/null 2>&1 & done
-    wait
+    refresh_pids=""
+    for s in $stale_slugs; do
+      "$SELF_DIR/ccd-price-fetch" "$s" >/dev/null 2>&1 &
+      refresh_pids="$refresh_pids $!:$s"
+    done
+    for pair in $refresh_pids; do
+      pid=${pair%%:*}; slug=${pair#*:}
+      if ! wait "$pid" && [ "$slug" = "$selected_model" ]; then
+        invalidate_context_slug "$slug"
+      fi
+    done
   fi
 fi
 
@@ -839,6 +927,27 @@ printf '   haiku %s / sonnet %s / opus %s\n' \
 printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
 printf '%s   Statusline adds: model·effort │ price per 1M │ run cost. Updates on prompts/tools.%s\n' "$d" "$r"
 printf '%s   To return to the subscription, /exit then run claude in the same terminal. Never /logout.%s\n' "$d" "$r"
+
+# Warm the curated Pareto/default set only after visible launch feedback. These
+# detached writers share ccd-price-fetch's lock/atomic merge path with statusline
+# refreshes, and never delay the dashboard or the selected-slot safety gate.
+if [ -x "$SELF_DIR/ccd-price-fetch" ]; then
+  prewarm_slugs=$(prewarm_catalog_slugs | awk '!seen[$0]++')
+  prewarm_stale=$(stale_context_slugs $prewarm_slugs)
+  if [ -n "$prewarm_stale" ]; then
+    prewarm_count=$(printf '%s\n' "$prewarm_stale" | wc -l | tr -d ' ')
+    printf '   %s⏳ warming %s catalog candidates in background%s\n' "$d" "$prewarm_count" "$r"
+    (
+      running=0
+      for s in $prewarm_stale; do
+        "$SELF_DIR/ccd-price-fetch" "$s" >/dev/null 2>&1 &
+        running=$((running + 1))
+        if [ "$running" -ge 3 ]; then wait; running=0; fi
+      done
+      wait
+    ) >/dev/null 2>&1 &
+  fi
+fi
 
 init_run_state
 fill_baseline_async

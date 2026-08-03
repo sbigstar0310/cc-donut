@@ -49,12 +49,28 @@ applies immediately mid-session.
 /model z-ai/glm-5.2:floor
 ```
 
+For a direct model, ccd observes the active ID in the statusline and checks its
+cached OpenRouter provider-pool metadata without blocking the UI:
+
+- `checking provider context…` — metadata is absent/stale; wait for the next refresh.
+- `verified context → /model provider/model:floor[1m]` — run that exact second
+  `/model` command only when shown. The current global compact window is already
+  conservative for that pool.
+- `restart for safe context → /exit; ccd -c --model provider/model` — use this
+  when the active process window is too large for the newly selected pool. The
+  restart preserves the conversation and sizes its budget from that model at launch.
+
+`[1m]` is a local Claude Code hint stripped before OpenRouter; it does not create
+or increase upstream provider context. ccd cannot mutate a running process's
+global compact window after `/model`.
+
 To change the slot assignments themselves:
 
 ```sh
 ccd models              # What models exist and what they cost
 ccd pick                # Interactively reassign the three slots (saved)
 ccd -c --opus pro       # Use a different model for the opus slot this run only
+ccd -c --model provider/model  # Resume with this direct model as the current/sonnet slot
 ```
 
 ## Cost policy
