@@ -10,6 +10,10 @@
 [![tests](https://github.com/sbigstar0310/cc-donut/actions/workflows/test.yml/badge.svg?branch=main&event=push)](https://github.com/sbigstar0310/cc-donut/actions/workflows/test.yml?query=branch%3Amain+event%3Apush)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-blueviolet)](#install)
 
+<p align="center">
+  <img src="assets/loop.gif" alt="Tire goes flat → donut spare on → drive home → real tire back" width="480">
+</p>
+
 ## Install
 
 ```sh
