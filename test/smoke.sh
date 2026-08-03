@@ -6,7 +6,7 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAKE=$(mktemp -d)
-trap 'rm -rf "$FAKE"' EXIT
+trap 'rm -rf "$FAKE" 2>/dev/null || true' EXIT
 export HOME="$FAKE"
 # The suite must behave identically when launched from inside a ccd session:
 # CCD_ACTIVE would suppress quota-guard warnings and flip the statusline branch.
@@ -115,7 +115,7 @@ head_ "8. opus slot is Kimi K3; [1m] hint for verified >200K pools + dynamic win
 cat > "$FAKE/fakebin/claude" <<'EOF'
 #!/bin/sh
 echo "ARGS:$*"
-env | grep -E '^(ANTHROPIC_(DEFAULT_(HAIKU|SONNET|OPUS|FABLE)_MODEL|MODEL|CUSTOM_MODEL_OPTION)|CLAUDE_CODE_AUTO_COMPACT_WINDOW)=' | sort
+env | grep -E '^(ANTHROPIC_(DEFAULT_(HAIKU|SONNET|OPUS|FABLE)_MODEL|MODEL|CUSTOM_MODEL_OPTION)|CLAUDE_CODE_(SUBAGENT_MODEL|AUTO_COMPACT_WINDOW))=' | sort
 EOF
 chmod +x "$FAKE/fakebin/claude"
 # A fake `curl` from here on: ccd's launch-time prefetch must not race the seeded
@@ -170,17 +170,17 @@ else
   ok "headless refusal skips endpoint fetch"
 fi
 # Launch UX: the banner must be the FIRST output line (instant feedback before any
-# network work), and a fresh cache must produce ZERO provider API calls at launch.
+# network work). A fresh selected-slot cache is never part of the synchronous
+# fetch; only the allowed detached catalog warmers may add endpoint calls.
 printf '%s\n' "$envout" | head -1 | grep -qF 'Switching backbone: OpenRouter' \
   && ok "banner prints first (no silent network wait)" \
   || bad "banner ordering" "first line: $(printf '%s\n' "$envout" | head -1)"
 rm -f "$FAKE/.curl-args"
 envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
-if [ -f "$FAKE/.curl-args" ] && grep -q 'models/.*/endpoints' "$FAKE/.curl-args"; then
-  bad "redundant launch fetch" "endpoint calls: $(grep -c endpoints "$FAKE/.curl-args")"
-else
-  ok "fresh cache → zero provider endpoint calls at launch"
-fi
+case "$envout" in *'refreshing provider data'*) bad "fresh selected slots avoid synchronous refresh" ;; *) ok "fresh selected slots avoid synchronous refresh" ;; esac
+case "$envout" in *'warming 3 catalog candidates in background'*) ok "stale Pareto candidates warm after launch feedback" ;; *) bad "catalog background warm notice" "got: ${envout:0:180}" ;; esac
+# The detached catalog warm set is intentionally allowed to fetch extra metadata;
+# selected slots remain the only synchronous launch gate.
 
 head_ "9. [1m] safety: missing/malformed/stale/future cache → 200K (no hint)"
 # The launch-path sync prefetch fires here — the stub's "200" is not JSON, so the
@@ -260,8 +260,8 @@ printf '%s\n' "$first_two" | tail -1 | grep -qF 'refreshing provider data' \
   && ok "stale launch shows refresh progress" \
   || bad "stale refresh progress" "got: $first_two"
 endpoint_calls=$(grep -c 'models/.*/endpoints' "$FAKE/.curl-args" 2>/dev/null || true)
-[ "$endpoint_calls" -eq 3 ] && ok "stale launch refreshes three slot endpoints" \
-  || bad "stale endpoint refresh count" "got: $endpoint_calls"
+[ "$endpoint_calls" -ge 3 ] && ok "stale launch refreshes three selected slot endpoints" \
+  || bad "stale selected-slot refresh count" "got: $endpoint_calls"
 printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3:floor[1m]' \
   && ok "stale refresh applies verified [1m] before launch" \
   || bad "stale refresh wiring" "got: $(printf '%s\n' "$envout" | grep OPUS)"
@@ -354,14 +354,82 @@ row=$(printf '%s' '{"model":{"id":"moonshotai/kimi-k3:floor[1m]"}}' | env -u CLA
 case "$row" in *'· 1M'*) ok "1M shown when the hint stands without a dynamic window" ;; *) bad "statusline 1M fallback" "got: ${row:0:100}" ;; esac
 row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
 case "$row" in *'· 200K'*) ok "200K shown without the hint" ;; *) bad "statusline 200K" "got: ${row:0:100}" ;; esac
+# A fresh provider-pool entry lets native /model receive an exact manual [1m]
+# command only when the inherited process-wide compact window is conservative.
+python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
+import json, sys, time
+now = time.time()
+json.dump({"models": {"openai/gpt-5.6-terra": {"min_context_length": 1000000, "max_context_length": 1000000, "fetched_at": now}}}, open(sys.argv[1], "w"))
+PY
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-terra:floor"}}' | CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000 CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in *'/model openai/gpt-5.6-terra:floor[1m]'*) ok "safe native switch recommends exact [1m] command" ;; *) bad "safe native [1m] guidance" "got: ${row:0:180}" ;; esac
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-terra:floor"}}' | CLAUDE_CODE_AUTO_COMPACT_WINDOW=990000 CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in *'ccd -c --model openai/gpt-5.6-terra'*) ok "oversized window recommends restart, not [1m]" ;; *) bad "restart guidance" "got: ${row:0:180}" ;; esac
+row=$(printf '%s' '{"model":{"id":"new/provider:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in *'checking provider context'*) ok "unknown native model shows non-blocking context check" ;; *) bad "pending context guidance" "got: ${row:0:180}" ;; esac
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-terra:floor[1m]"}}' | CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000 CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in *'/model '*|*'ccd -c --model'*) bad "already-hinted model repeats guidance" "got: ${row:0:180}" ;; *) ok "already-hinted model suppresses duplicate guidance" ;; esac
 
-head_ "12. doctor never sends [1m] to the provider"
+head_ "12. ccd -c --model selects a verified launch-time context budget"
+rm -f "$FAKE/.curl-args"
+# Seed the selected slug as stale/future: --model must nevertheless synchronously
+# refresh it and consume neither flag nor value as a Claude prompt.
+python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
+import json, sys, time
+json.dump({"models": {"openai/gpt-5.6-terra": {"min_context_length": 1000000, "fetched_at": time.time() + 999999}}}, open(sys.argv[1], "w"))
+PY
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+cat <<'JSON'
+{"data":{"endpoints":[{"tag":"p","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":1000000}]}}
+JSON
+EOF
+chmod +x "$FAKE/fakebin/curl"
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -c --model openai/gpt-5.6-terra -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qF 'ARGS:-c -p hi' \
+  && ok "--model is consumed rather than forwarded to claude" || bad "--model argument forwarding" "got: $(printf '%s\n' "$envout" | head -1)"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_MODEL=openai/gpt-5.6-terra:floor[1m]' \
+  && ok "--model drives current sonnet model with [1m]" || bad "selected current model" "got: $(printf '%s\n' "$envout" | grep ANTHROPIC_MODEL)"
+printf '%s\n' "$envout" | grep -qFx 'CLAUDE_CODE_SUBAGENT_MODEL=openai/gpt-5.6-terra:floor[1m]' \
+  && ok "--model drives subagent model" || bad "selected subagent model" "got: $(printf '%s\n' "$envout" | grep SUBAGENT)"
+# A direct --model launch promises fresh verification. If its forced refresh fails,
+# discard even a fresh positive cache entry rather than reusing an old [1m] budget.
+python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
+import json, sys, time
+json.dump({"models": {"openai/gpt-5.6-terra": {"min_context_length": 1000000, "max_context_length": 1000000, "fetched_at": time.time()}}}, open(sys.argv[1], "w"))
+PY
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "$HOME/.curl-args"
+exit 1
+EOF
+chmod +x "$FAKE/fakebin/curl"
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" --model openai/gpt-5.6-terra -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_MODEL=openai/gpt-5.6-terra:floor' \
+  && ok "failed direct refresh discards old [1m] context" || bad "failed direct refresh stays safe" "got: $(printf '%s\n' "$envout" | grep ANTHROPIC_MODEL)"
+rm -f "$FAKE/.curl-args"
+bad_model=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" --model 'openai/gpt-5.6-terra:floor' -p hi 2>&1 || true)
+case "$bad_model" in *'bare provider/model slug'*) ok "--model rejects routing suffix before network" ;; *) bad "--model validation" "got: ${bad_model:0:160}" ;; esac
+[ -e "$FAKE/.curl-args" ] && bad "invalid --model makes a provider call" || ok "invalid --model skips provider calls"
+conflict=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" --model openai/gpt-5.6-terra --sonnet luna -p hi 2>&1 || true)
+case "$conflict" in *'ambiguous'*) ok "--model and --sonnet reject ambiguity" ;; *) bad "--model conflict" "got: ${conflict:0:160}" ;; esac
+
+head_ "13. doctor never sends [1m] to the provider"
 rm -f "$FAKE/.curl-args"   # assert on doctor's calls only
-# Restore a fresh 1M-positive cache so apply_tiers wires the hint.
+# Restore a fresh positive cache for every selected slot so detached catalog warming
+# cannot add calls while this assertion isolates the doctor's actual wire request.
 python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
 import json, sys, time
 now = int(time.time())
-json.dump({"models": {"openai/gpt-5.6-luna": {"min_context_length": 1000000, "fetched_at": now}}}, open(sys.argv[1], "w"))
+json.dump({"models": {
+    "openai/gpt-5.6-luna": {"min_context_length": 1000000, "fetched_at": now},
+    "moonshotai/kimi-k3": {"min_context_length": 1000000, "fetched_at": now},
+    "deepseek/deepseek-v4-flash": {"min_context_length": 1000000, "fetched_at": now},
+    "openai/gpt-5.6-sol": {"min_context_length": 1000000, "fetched_at": now},
+    "openai/gpt-5.6-terra": {"min_context_length": 1000000, "fetched_at": now},
+    "z-ai/glm-5.1": {"min_context_length": 1000000, "fetched_at": now},
+}}, open(sys.argv[1], "w"))
 PY
 OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" doctor >/dev/null 2>&1
 if grep -qF '[1m]' "$FAKE/.curl-args" 2>/dev/null; then
@@ -373,7 +441,7 @@ grep -qF '"model":"openai/gpt-5.6-luna:floor"' "$FAKE/.curl-args" 2>/dev/null \
   && ok "doctor probes slug:floor" || bad "doctor probe model" "got: $(grep -F '"model"' "$FAKE/.curl-args" | head -1)"
 rm -f "$FAKE/fakebin/curl"
 
-head_ "13. rename surface: manifests, README coords, launcher resolution, uninstall text"
+head_ "14. rename surface: manifests, README coords, launcher resolution, uninstall text"
 python3 - "$ROOT" <<'PY' \
   && ok "manifest identities: ccd / cc-donut, one version" || bad "manifest identity"
 import json, sys
@@ -406,7 +474,7 @@ case "$out" in
   *) bad "uninstall command text" "got: ${out:0:120}" ;;
 esac
 
-head_ "14. recovery: quota reset → flag recorded + green statusline"
+head_ "15. recovery: quota reset → flag recorded + green statusline"
 # The round-trip claim: hook notices a reset transition and the statusline shows it.
 mkdir -p "$FAKE/.claude/ccd"   # section 13's uninstall --purge removed it
 # Fresh quota data with a NEW 7-day reset id and low percent (the stub node serves it).

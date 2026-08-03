@@ -94,7 +94,17 @@ But you're not limited to these. Any slug from [openrouter.ai/models](https://op
 /model z-ai/glm-5.2:floor
 ```
 
-Remap the aliases permanently with `ccd pick` (an offline menu over the curated catalog), or per-run: `ccd -c --opus sol`.
+For a direct model whose OpenRouter provider pool is verified above 200K, the ccd statusline checks the cached pool metadata and gives one of these next actions:
+
+```text
+checking provider context…
+verified context → /model provider/model:floor[1m]
+restart for safe context → /exit; ccd -c --model provider/model
+```
+
+The statusline cannot change a running Claude Code process itself. Follow its exact `[1m]` command only when it says the inherited compact window is safe; otherwise use the restart/resume route so ccd can verify the selected pool before launch. `[1m]` is stripped before the OpenRouter request and does **not** increase provider capacity.
+
+Remap the aliases permanently with `ccd pick` (an offline menu over the curated catalog), per-run with `ccd -c --opus sol`, or resume a direct model with its launch-time context budget via `ccd -c --model provider/model`.
 
 The catalog is a snapshot and goes stale. To refresh it with current benchmarks and prices, ask Claude (while you have quota): *"refresh the ccd model picks"* — the `/ccd` skill researches independent benchmarks and live OpenRouter pricing, recomputes the price/performance frontier, and proposes an updated catalog before writing anything.
 
@@ -112,6 +122,7 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | `ccd models` / `ccd pick` | Browse the catalog / remap the three aliases |
 | `ccd go` | Switch into a fresh session instead of resuming |
 | `ccd -c --routing exacto` | If a cheap provider fumbles tool calls |
+| `ccd -c --model provider/model` | Resume with a direct model; verify and budget its pool at launch |
 | `ccd off` | Run claude on the subscription again |
 
 **Skills inside Claude Code** (type `/` to find them):
@@ -159,7 +170,7 @@ macOS and break Linux users. CI runs all three on every push.
 <summary><b>Caveats</b></summary>
 
 - **Officially unsupported path**: both Anthropic and OpenRouter state that Claude Code targeting non-Claude models isn't guaranteed. It works via the standard model-slot variables today, but a Claude Code update could break it — hence `ccd doctor`.
-- Behind a gateway, Claude Code budgets 200K context unless the model ID carries the `[1m]` hint. ccd applies `[1m]` automatically when cached OpenRouter endpoint data confirms every provider in the routing pool serves >200K for that slug (unverified models stay at the safe 200K budget; check with `ccd doctor`). `[1m]` goes only on the conversation slots (sonnet/opus) — the haiku chore slot keeps the safe 200K budget, because Claude Code has one global auto-compact window per process and hinting a small chore-model pool would crush it for every model. The **effective window** is the smallest verified pool minimum among hinted slots with headroom (`min × 0.92`, capped at `min − 40K`), so auto-compaction fires at the model's real context ceiling (e.g. ~839K for a 912K-pool model), never at a fake 1M. `[1m]` does not enlarge the upstream model.
+- Behind a gateway, Claude Code budgets 200K context unless the model ID carries the `[1m]` hint. ccd applies `[1m]` automatically at launch when fresh cached OpenRouter endpoint data confirms every eligible default-pool provider serves >200K for that slug (unverified models stay at the safe 200K budget; check with `ccd doctor`). `[1m]` goes only on the conversation slots (sonnet/opus) — the haiku chore slot keeps the safe 200K budget, because Claude Code has one global auto-compact window per process and hinting a small chore-model pool would crush it for every model. The **effective window** is the smallest verified pool minimum among hinted slots with headroom (`min × 0.92`, capped at `min − 40K`), so auto-compaction fires at the model's real context ceiling (e.g. ~839K for a 912K-pool model), never at a fake 1M. Catalog Pareto/default candidates warm their metadata in the background after launch; this never delays the selected-slot gate. A later native `/model <slug>` cannot resize the already-running global window: ccd can only show whether a manual `[1m]` reselect is safe or whether restart/resume is required. `[1m]` does not enlarge the upstream model.
 - Remote Control, voice input, and fast mode are off while on the external backbone.
 - macOS-focused (the key dialog uses osascript); the core flow is plain bash + python3 + curl.
 
