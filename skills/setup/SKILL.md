@@ -21,9 +21,10 @@ default path is pasting the key in chat with informed consent; macOS can use
 the `ccd key` native dialog. After the key lands, run `~/.local/bin/ccd doctor` and relay its one-line verdict.
 
 If the key was already configured, just run `~/.local/bin/ccd doctor` directly and
-relay the verdict — no question needed. Either way the user should finish setup,
-key, and validation without leaving the session; only the final "restart Claude
-Code" remains.
+relay the verdict — no question needed. Either way the user finishes setup, key,
+and validation without leaving the session, and no restart is needed: Claude Code
+reloads settings automatically (statusline appears on the next interaction) and
+`/reload-plugins` activates the hooks in the current session.
 
 Key handling follows the `key` skill: chat paste only with the consent notice,
 never echo a full key back, never write it anywhere but through `ccd key`.

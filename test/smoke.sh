@@ -114,6 +114,7 @@ head_ "8. opus slot is Kimi K3; [1m] hint for verified >200K pools + dynamic win
 # A fake `claude` that prints the environment ccd assembled for it.
 cat > "$FAKE/fakebin/claude" <<'EOF'
 #!/bin/sh
+echo "ARGS:$*"
 env | grep -E '^(ANTHROPIC_(DEFAULT_(HAIKU|SONNET|OPUS|FABLE)_MODEL|MODEL|CUSTOM_MODEL_OPTION)|CLAUDE_CODE_AUTO_COMPACT_WINDOW)=' | sort
 EOF
 chmod +x "$FAKE/fakebin/claude"
@@ -153,6 +154,11 @@ printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_MODEL=openai/gpt-5.6-luna:floor' 
 printf '%s\n' "$envout" | grep -qFx 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=839393' \
   && ok "auto-compact window = 839393 (smallest hinted pool − headroom)" \
   || bad "dynamic auto-compact window" "got: $(printf '%s\n' "$envout" | grep AUTO_COMPACT)"
+# The round trip's ccd half: -c must reach claude as --continue.
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -c -p hi 2>/dev/null)
+printf '%s\n' "$envout" | grep -qF 'ARGS:-c -p hi' \
+  && ok "ccd -c forwards --continue to claude (resume path)" \
+  || bad "-c forwarding" "got: $(printf '%s\n' "$envout" | head -1)"
 
 head_ "9. [1m] safety: missing/malformed/stale/future cache → 200K (no hint)"
 # The launch-path sync prefetch fires here — the stub's "200" is not JSON, so the
@@ -330,14 +336,15 @@ rm -f "$FAKE/fakebin/curl"
 
 head_ "13. rename surface: manifests, README coords, launcher resolution, uninstall text"
 python3 - "$ROOT" <<'PY' \
-  && ok "manifests are ccd / cc-donut / 0.2.0" || bad "manifest identity"
+  && ok "manifest identities: ccd / cc-donut, one version" || bad "manifest identity"
 import json, sys
 root = sys.argv[1]
 p = json.load(open(f"{root}/.claude-plugin/plugin.json"))
 m = json.load(open(f"{root}/.claude-plugin/marketplace.json"))
-assert p["name"] == "ccd" and p["version"] == "0.2.0", p
-assert m["name"] == "cc-donut" and m["version"] == "0.2.0", m
-assert m["plugins"][0]["name"] == "ccd" and m["plugins"][0]["version"] == "0.2.0", m
+assert p["name"] == "ccd", p
+assert m["name"] == "cc-donut" and m["plugins"][0]["name"] == "ccd", m
+# one version, written in three places — they must agree (release bumps touch all)
+assert p["version"] == m["version"] == m["plugins"][0]["version"], (p, m)
 PY
 grep -qF 'claude plugin marketplace add sbigstar0310/cc-donut' "$ROOT/README.md" \
   && ok "README marketplace coordinate" || bad "README marketplace coordinate"
@@ -359,6 +366,37 @@ case "$out" in
   *'ccd@cc-donut'*'cc-donut'*) ok "uninstall prints ccd@cc-donut removal commands" ;;
   *) bad "uninstall command text" "got: ${out:0:120}" ;;
 esac
+
+head_ "14. recovery: quota reset → flag recorded + green statusline"
+# The round-trip claim: hook notices a reset transition and the statusline shows it.
+mkdir -p "$FAKE/.claude/ccd"   # section 13's uninstall --purge removed it
+# Fresh quota data with a NEW 7-day reset id and low percent (the stub node serves it).
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"fiveHourReset":"R1","sevenDayPercent":3,"sevenDayReset":"D2"}}\n' > "$FAKE/.stub-usage.json"
+# Prior observation: 97% under the OLD reset id — the transition must be detected.
+cat > "$FAKE/.claude/ccd/run-state.json" <<'EOF'
+{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5,"last_seven_day_percent":97,"last_seven_day_reset":"D1"}
+EOF
+rm -f "$FAKE/.claude/ccd/quota-cache.json"   # force a refresh from the stub
+# Block the cost path's real curl; recovery tracking must not depend on it.
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+echo 200
+EOF
+chmod +x "$FAKE/fakebin/curl"
+CCD_ACTIVE=1 "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+python3 - "$FAKE/.claude/ccd/run-state.json" <<'PY' \
+  && ok "reset transition records the recovery flag" || bad "recovery flag"
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s.get("recovery_notified_window") == "seven_day", s
+assert s.get("recovery_notified_reset") == "D2", s
+PY
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in
+  *"Claude recovered"*) ok "statusline shows the green recovery banner" ;;
+  *) bad "recovery banner" "got: ${row:0:120}" ;;
+esac
+rm -f "$FAKE/fakebin/curl"
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

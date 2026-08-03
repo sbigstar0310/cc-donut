@@ -20,4 +20,4 @@ claude plugin uninstall ccd@cc-donut
 claude plugin marketplace remove cc-donut
 ```
 
-Relay the script output and CLI results verbatim, then tell the user to restart Claude Code. Never echo the key and never delete anything the script does not.
+Relay the script output and CLI results verbatim, then tell the user to run `/reload-plugins` — that unloads the hooks in the running session, so no restart is needed. Never echo the key and never delete anything the script does not.

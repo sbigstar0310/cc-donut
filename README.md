@@ -17,20 +17,32 @@ claude plugin marketplace add sbigstar0310/cc-donut
 claude plugin install ccd@cc-donut
 ```
 
-Then open Claude Code and run `/ccd:setup`, then restart Claude Code.
+Then open Claude Code and run `/ccd:setup`. No restart needed — Claude Code reloads settings automatically, so the statusline appears on your next interaction, and `/reload-plugins` activates the hooks in an already-open session.
+
+<details>
+<summary>Prefer installing inside Claude Code?</summary>
+
+Slash commands are parsed **one line at a time** — enter each separately (pasting the block as one message won't work):
+
+1. `/plugin marketplace add sbigstar0310/cc-donut`
+2. `/plugin install ccd@cc-donut`
+3. `/reload-plugins`
+4. `/ccd:setup` — the statusline appears on your next interaction; no restart needed
+
+</details>
 
 ## What it does
 
-When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. Not your forever ride. Just enough donut to get home.
+When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset (it re-checks on each interaction) and hands you the exact command to switch back. Not your forever ride. Just enough donut to get home.
 
 ## Before / After
 
 ```text
 BEFORE   quota dies mid-task → stuck, restart, lose the thread
 
-AFTER    /exit → ccd -c              same conversation, spare on, back to work
-         quota returns → /exit → claude --resume
-         same conversation, back on your subscription
+AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
+         quota resets  → we flag it for you   /exit → claude --resume
+         same conversation, back on your subscription — round trip, zero thread lost
 ```
 
 Set it up **while you still have quota** — after zero, Claude can't walk you through it:
@@ -48,27 +60,16 @@ That's everything you need. Details below when you want them.
 <summary><b>What you get</b></summary>
 
 - 🧰 **Your whole Claude Code, untouched** — the entire scaffold (tools, hooks, skills, MCP servers, keybindings, history) keeps running; ccd swaps nothing but the model behind it
-- 🔄 **The conversation survives both directions** — `ccd -c` resumes it on OpenRouter, `claude --resume` brings it home (round-trip tested)
+- 🔄 **The conversation survives both directions** — `ccd -c` resumes it on OpenRouter, `claude --resume` brings it home; same conversation store either way
 - 🎛 **Any OpenRouter model, mid-session** — hundreds of models incl. dirt-cheap ones, one `/model` away, no restart
-- 🚨 **Told exactly what to type, exactly when** — statusline turns red near exhaustion, green on recovery, each with the command to run
+- 🚨 **We watch the tank so you don't have to** — red near exhaustion, green when the reset is detected (re-checked on each interaction, ≤10 min fresh, on the 5-hour and 7-day windows), each with the exact command to run
+- 🏠 **A spare, not a second car** — recovery detection means you never ride the donut a mile longer than needed; back on your subscription as soon as the reset shows up
 - 💸 **Cheapest provider by default, every cent visible** — `:floor` routing + live run/outage spend in the statusline
 - 🔒 **Zero auth risk** — your claude.ai login is never touched; key stored locally (600), never typed in chat
 
 ```text
 ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run $0.0123 · total $0.4200
 ```
-
-</details>
-
-<details>
-<summary><b>Prefer installing inside Claude Code?</b></summary>
-
-Slash commands are parsed **one line at a time** — enter each separately (pasting the block as one message won't work):
-
-1. `/plugin marketplace add sbigstar0310/cc-donut`
-2. `/plugin install ccd@cc-donut`
-3. `/reload-plugins`
-4. `/ccd:setup` — then restart Claude Code
 
 </details>
 

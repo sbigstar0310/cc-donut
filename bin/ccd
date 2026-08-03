@@ -646,7 +646,7 @@ PY
 
   printf '✓ ccd command installed (~/.local/bin/ccd)\n'
   printf '✓ statusline wired — dashboard output preserved\n'
-  printf '→ Restart Claude Code to activate hooks + statusline\n'
+  printf '→ No restart needed: /reload-plugins activates the hooks; the statusline appears on your next interaction\n'
   case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) printf '→ Add to PATH: export PATH="$HOME/.local/bin:$PATH"\n' ;; esac
   if python3 - "$KEYS" <<'PY' >/dev/null 2>&1
 import re, sys
@@ -730,7 +730,7 @@ PY
     printf '✓ key & state kept (~/.claude/ccd/) — remove everything with: ccd uninstall --purge\n'
   fi
   printf '→ Finish in a terminal: claude plugin uninstall ccd@cc-donut && claude plugin marketplace remove cc-donut\n'
-  printf '→ Then restart Claude Code\n'
+  printf '→ In a running session: /reload-plugins unloads the hooks — no restart needed\n'
 }
 
 case "${1:-}" in
