@@ -159,6 +159,28 @@ envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -c -p hi 2>/dev/n
 printf '%s\n' "$envout" | grep -qF 'ARGS:-c -p hi' \
   && ok "ccd -c forwards --continue to claude (resume path)" \
   || bad "-c forwarding" "got: $(printf '%s\n' "$envout" | head -1)"
+# A non-interactive `ccd -c` must refuse before banner/prefetch. This is the real
+# headless path (the suite itself has no TTY), not the explicit -p exception above.
+rm -f "$FAKE/.curl-args"
+headless_out=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -c 2>&1 || true)
+case "$headless_out" in *'Exit Claude Code first.'*) ok "headless ccd -c refuses before launch" ;; *) bad "headless refusal" "got: ${headless_out:0:120}" ;; esac
+if [ -f "$FAKE/.curl-args" ] && grep -q 'models/.*/endpoints' "$FAKE/.curl-args"; then
+  bad "headless refusal skips endpoint fetch" "endpoint calls: $(grep -c endpoints "$FAKE/.curl-args")"
+else
+  ok "headless refusal skips endpoint fetch"
+fi
+# Launch UX: the banner must be the FIRST output line (instant feedback before any
+# network work), and a fresh cache must produce ZERO provider API calls at launch.
+printf '%s\n' "$envout" | head -1 | grep -qF 'Switching backbone: OpenRouter' \
+  && ok "banner prints first (no silent network wait)" \
+  || bad "banner ordering" "first line: $(printf '%s\n' "$envout" | head -1)"
+rm -f "$FAKE/.curl-args"
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
+if [ -f "$FAKE/.curl-args" ] && grep -q 'models/.*/endpoints' "$FAKE/.curl-args"; then
+  bad "redundant launch fetch" "endpoint calls: $(grep -c endpoints "$FAKE/.curl-args")"
+else
+  ok "fresh cache → zero provider endpoint calls at launch"
+fi
 
 head_ "9. [1m] safety: missing/malformed/stale/future cache → 200K (no hint)"
 # The launch-path sync prefetch fires here — the stub's "200" is not JSON, so the
@@ -226,6 +248,23 @@ printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kim
 printf '%s\n' "$envout" | grep -qFx 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=736000' \
   && ok "window = min over BOTH hinted slots (luna 800K → 736000)" \
   || bad "two-hinted-slot window" "got: $(printf '%s\n' "$envout" | grep AUTO_COMPACT)"
+# The stale-cache success path also prints progress before its synchronous fetch.
+# Avoid timing assertions: ordered output + verified wiring make this portable in CI.
+rm -f "$FAKE/.claude/ccd/price-cache.json" "$FAKE/.curl-args"
+envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
+first_two=$(printf '%s\n' "$envout" | head -2)
+printf '%s\n' "$first_two" | head -1 | grep -qF 'Switching backbone: OpenRouter' \
+  && ok "stale launch banner prints before refresh" \
+  || bad "stale banner ordering" "got: $first_two"
+printf '%s\n' "$first_two" | tail -1 | grep -qF 'refreshing provider data' \
+  && ok "stale launch shows refresh progress" \
+  || bad "stale refresh progress" "got: $first_two"
+endpoint_calls=$(grep -c 'models/.*/endpoints' "$FAKE/.curl-args" 2>/dev/null || true)
+[ "$endpoint_calls" -eq 3 ] && ok "stale launch refreshes three slot endpoints" \
+  || bad "stale endpoint refresh count" "got: $endpoint_calls"
+printf '%s\n' "$envout" | grep -qFx 'ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3:floor[1m]' \
+  && ok "stale refresh applies verified [1m] before launch" \
+  || bad "stale refresh wiring" "got: $(printf '%s\n' "$envout" | grep OPUS)"
 rm -f "$FAKE/.claude/ccd/price-cache.json"
 # Fixed-pool stub for the aggregation checks: two default-pool providers WITH
 # context plus a tier-tagged (flex) endpoint that must be excluded.

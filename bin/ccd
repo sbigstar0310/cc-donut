@@ -775,6 +775,28 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Without an interactive screen (Claude Code ! command, script, or pipe), claude
+# falls into headless mode and reports a misleading "provide a prompt" error.
+# Allow it only when headless mode was explicitly requested with -p/--print.
+# Checked BEFORE any network work: a refused launch must not pay the prefetch cost.
+headless=0
+for a in ${args+"${args[@]}"}; do
+  case "$a" in -p|--print) headless=1 ;; esac
+done
+if [ "$headless" -eq 0 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+  printf '\n%s✋ Exit Claude Code first.%s\n\n' "$red" "$r" >&2
+  printf '  %s1.%s  %s/exit%s      %s← end the current session%s\n' "$b" "$r" "$b" "$r" "$d" "$r" >&2
+  printf '  %s2.%s  %sccd -c%s     %s← in the same terminal; restores that conversation%s\n\n' \
+    "$b" "$r" "$b" "$r" "$d" "$r" >&2
+  printf '  %sReason: the backbone is chosen when claude starts and cannot change inside a running session.%s\n' "$d" "$r" >&2
+  printf '  %sThe "last conversation" requested by -c is this active session, which creates a conflict.%s\n\n' "$d" "$r" >&2
+  exit 1
+fi
+
+# Instant feedback before anything that can block (the prefetch below can take
+# seconds on a stale cache) — never leave the terminal silent after `ccd -c`.
+printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
+
 # apply_tiers budgets from the cached provider data. On a cache miss/stale entry the
 # slot would launch at 200K even when the model serves far more — the exact failure
 # ccd exists to prevent — so refresh the three slots synchronously (bounded by
@@ -803,6 +825,7 @@ for slug in dict.fromkeys(sys.argv[2:]):
 PY
 )
   if [ -n "$stale_slugs" ]; then
+    printf '   %s⏳ refreshing provider data (first run or stale cache)%s\n' "$d" "$r"
     for s in $stale_slugs; do "$SELF_DIR/ccd-price-fetch" "$s" >/dev/null 2>&1 & done
     wait
   fi
@@ -811,24 +834,6 @@ fi
 apply_tiers
 export CCD_ACTIVE=1
 
-# Without an interactive screen (Claude Code ! command, script, or pipe), claude
-# falls into headless mode and reports a misleading "provide a prompt" error.
-# Allow it only when headless mode was explicitly requested with -p/--print.
-headless=0
-for a in ${args+"${args[@]}"}; do
-  case "$a" in -p|--print) headless=1 ;; esac
-done
-if [ "$headless" -eq 0 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
-  printf '\n%s✋ Exit Claude Code first.%s\n\n' "$red" "$r" >&2
-  printf '  %s1.%s  %s/exit%s      %s← end the current session%s\n' "$b" "$r" "$b" "$r" "$d" "$r" >&2
-  printf '  %s2.%s  %sccd -c%s     %s← in the same terminal; restores that conversation%s\n\n' \
-    "$b" "$r" "$b" "$r" "$d" "$r" >&2
-  printf '  %sReason: the backbone is chosen when claude starts and cannot change inside a running session.%s\n' "$d" "$r" >&2
-  printf '  %sThe "last conversation" requested by -c is this active session, which creates a conflict.%s\n\n' "$d" "$r" >&2
-  exit 1
-fi
-
-printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
 printf '   haiku %s / sonnet %s / opus %s\n' \
   "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"
 printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
@@ -837,11 +842,7 @@ printf '%s   To return to the subscription, /exit then run claude in the same te
 
 init_run_state
 fill_baseline_async
-# Pre-cache prices for all three models so the first statusline does not show "pricing…".
-# Ignore failures; the statusline retries on its next refresh.
-if [ -x "$SELF_DIR/ccd-price-fetch" ]; then
-  for m in "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"; do
-    ("$SELF_DIR/ccd-price-fetch" "${m%%:*}" >/dev/null 2>&1 &)
-  done
-fi
+# No detached price re-fetch here: the sync prefetch above already refreshed stale
+# entries, fresh entries are good for a day, and the statusline fetches anything
+# else lazily on its own. Three extra API hits per launch bought nothing.
 exec claude ${args+"${args[@]}"}
