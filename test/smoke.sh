@@ -128,13 +128,14 @@ EOF
 chmod +x "$FAKE/fakebin/curl"
 # Seed provider data with the REAL shapes: kimi pool min 912K (>200K but <1M — the
 # whole point of the dynamic rule), luna exactly 200K (no hint), flash 1M (fresh).
+# Use routing-aware cache keys (:floor suffix).
 python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
 import json, sys, time
 now = int(time.time())
 json.dump({"models": {
-    "moonshotai/kimi-k3":       {"min_context_length": 912384,  "max_context_length": 1048576, "fetched_at": now},
-    "openai/gpt-5.6-luna":      {"min_context_length": 200000,  "max_context_length": 200000,  "fetched_at": now},
-    "deepseek/deepseek-v4-flash": {"min_context_length": 1048576, "max_context_length": 1048576, "fetched_at": now},
+    "moonshotai/kimi-k3:floor":       {"min_context_length": 912384,  "max_context_length": 1048576, "floor_in_per_m": 2.9, "floor_out_per_m": 14.0, "max_in_per_m": 3.0, "max_out_per_m": 15.0, "fetched_at": now},
+    "openai/gpt-5.6-luna:floor":      {"min_context_length": 200000,  "max_context_length": 200000,  "floor_in_per_m": 0.1, "floor_out_per_m": 0.6, "max_in_per_m": 1.0, "max_out_per_m": 6.0, "fetched_at": now},
+    "deepseek/deepseek-v4-flash:floor": {"min_context_length": 1048576, "max_context_length": 1048576, "floor_in_per_m": 0.11, "floor_out_per_m": 0.22, "max_in_per_m": 0.14, "max_out_per_m": 0.28, "fetched_at": now},
 }}, open(sys.argv[1], "w"))
 PY
 envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
@@ -215,6 +216,7 @@ envout=$(OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null
 case "$envout" in *'[1m]'*) bad "NaN cache timestamp → no [1m]" "hint leaked" ;; *) ok "NaN cache timestamp → no [1m]" ;; esac
 # Idempotence: an already-hinted value must not gain a second suffix.
 PRICE_CACHE="$FAKE/.claude/ccd/price-cache.json"
+eval "$(sed -n '/^cache_key_for()/,/^}/p' "$ROOT/bin/ccd")"
 eval "$(sed -n '/^with_context_hint()/,/^}/p' "$ROOT/bin/ccd")"
 [ "$(with_context_hint 'moonshotai/kimi-k3:floor[1m]')" = 'moonshotai/kimi-k3:floor[1m]' ] \
   && ok "already-hinted input stays single-[1m]" || bad "idempotent [1m]"
@@ -359,7 +361,7 @@ case "$row" in *'· 200K'*) ok "200K shown without the hint" ;; *) bad "statusli
 python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
 import json, sys, time
 now = time.time()
-json.dump({"models": {"openai/gpt-5.6-terra": {"min_context_length": 1000000, "max_context_length": 1000000, "fetched_at": now}}}, open(sys.argv[1], "w"))
+json.dump({"models": {"openai/gpt-5.6-terra:floor": {"min_context_length": 1000000, "max_context_length": 1000000, "floor_in_per_m": 1.0, "floor_out_per_m": 6.0, "max_in_per_m": 2.5, "max_out_per_m": 15.0, "fetched_at": now}}}, open(sys.argv[1], "w"))
 PY
 row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-terra:floor"}}' | CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000 CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
 case "$row" in *'/model openai/gpt-5.6-terra:floor[1m]'*) ok "safe native switch recommends exact [1m] command" ;; *) bad "safe native [1m] guidance" "got: ${row:0:180}" ;; esac
@@ -376,7 +378,7 @@ rm -f "$FAKE/.curl-args"
 # refresh it and consume neither flag nor value as a Claude prompt.
 python3 - "$FAKE/.claude/ccd/price-cache.json" <<'PY'
 import json, sys, time
-json.dump({"models": {"openai/gpt-5.6-terra": {"min_context_length": 1000000, "fetched_at": time.time() + 999999}}}, open(sys.argv[1], "w"))
+json.dump({"models": {"openai/gpt-5.6-terra:floor": {"min_context_length": 1000000, "floor_in_per_m": 1.0, "floor_out_per_m": 6.0, "max_in_per_m": 2.5, "max_out_per_m": 15.0, "fetched_at": time.time() + 999999}}}, open(sys.argv[1], "w"))
 PY
 cat > "$FAKE/fakebin/curl" <<'EOF'
 #!/bin/sh

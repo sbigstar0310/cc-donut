@@ -66,12 +66,14 @@ if slug.endswith("[1m]"):
         ctx_budget = f"{int(cw) // 1000}K"
     else:
         ctx_budget = "1M"
-# A routing suffix is local gateway syntax after the OpenRouter slug. Keep it for
-# a suggested native command, but use only the bare slug for cache lookup/fetch.
-if ":" in slug:
-    possible_slug, possible_routing = slug.rsplit(":", 1)
-    if possible_slug and possible_routing and "/" not in possible_routing:
-        slug, routing = possible_slug, ":" + possible_routing
+# Extract known routing suffix for cache lookup.
+# Known routings: :free, :floor, :nitro, :exacto
+known_routings = (":free", ":floor", ":nitro", ":exacto")
+for r in known_routings:
+    if slug.endswith(r):
+        routing = r
+        slug = slug[:-len(r)]
+        break
 
 effort = os.environ.get("CLAUDE_CODE_EFFORT_LEVEL")
 if effort not in {"low", "medium", "high", "max"}:
@@ -80,11 +82,16 @@ if effort not in {"low", "medium", "high", "max"}:
     effort = None
 
 def fmt(v):
+    if v == 0:
+        return "$0"
     return f"${v:.2f}" if v >= 0.1 else f"${v:.3f}"
 
-# Pricing: :floor pins the cheapest provider (single value); other routings show the provider range
+# Cache key includes routing for routing-specific pricing/context.
+cache_key = slug + routing
+# Pricing: :floor pins the cheapest standard provider (single value);
+# :free is zero; other routings show the provider range.
 price_part = "pricing…"
-entry = prices.get(slug)
+entry = prices.get(cache_key)
 if entry:
     lo_i, lo_o = entry.get("floor_in_per_m"), entry.get("floor_out_per_m")
     hi_i, hi_o = entry.get("max_in_per_m"), entry.get("max_out_per_m")
@@ -102,8 +109,9 @@ if entry:
         stale = not math.isfinite(age) or age > CACHE_TTL or age < -FUTURE_GRACE
     except Exception:
         stale = True
+# Request refresh with the routing-specific cache key.
 if slug and stale:
-    print(slug, file=sys.stderr)
+    print(cache_key, file=sys.stderr)
 
 # `/model` changes the active ID, but statusline is display-only: it cannot modify
 # Claude Code's already-running global compact window. Make the next safe action
