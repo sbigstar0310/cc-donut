@@ -160,7 +160,12 @@ window = state.get("recovery_notified_window")
 reset = state.get("recovery_notified_reset")
 # Keep showing while inside the recovered window (reset id unchanged); percent may be >0.
 if window and reset and state.get(f"last_{window}_reset") == reset:
-    recovery = "  \033[1;32m✓ Claude recovered → /exit then claude --resume\033[0m"
+    # Under automatic handoff the launcher performs the return itself, so naming
+    # the manual commands would be telling the user to do something twice.
+    if os.environ.get("CCD_HANDOFF"):
+        recovery = "  \033[1;32m✓ Claude recovered → 종료하면 구독으로 자동 복귀\033[0m"
+    else:
+        recovery = "  \033[1;32m✓ Claude recovered → /exit then claude --resume\033[0m"
 
 display_id = model_id[:-4] if model_id.endswith("[1m]") else model_id
 model_part = display_id or "model unknown"

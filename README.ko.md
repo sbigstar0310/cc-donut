@@ -49,6 +49,9 @@ BEFORE   quota dies mid-task → stuck, restart, lose the thread
 AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
          quota resets  → we flag it for you   /exit → claude --resume
          same conversation, back on your subscription — round trip, zero thread lost
+
+AUTO     quota dies    → 🍩 도넛이 알아서 장착        (ccd setup --auto)
+         quota resets  → 구독으로 알아서 복귀          칠 것 없음
 ```
 
 quota가 남아 있을 때 **미리** 설정하세요. 0이 된 뒤에는 Claude가 설정 과정을 안내할 수 없습니다.
@@ -59,6 +62,49 @@ ccd doctor    # ✓ OK = your spare is inflated and ready
 ```
 
 여기까지가 필요한 전부입니다. 세부 내용은 필요할 때 아래에서 확인하세요.
+
+<a name="자동-전환"></a>
+
+<details>
+<summary><b>자동 전환 — 아무 명령도 필요 없음</b></summary>
+
+한 번만 켜두면 왕복에 손이 가지 않습니다.
+
+```sh
+ccd setup --auto
+```
+
+그다음부터는 지금까지 하던 대로 `claude`로 시작하면 됩니다. quota가 소진되면
+대화가 알아서 OpenRouter로 넘어가고, window가 reset되면 같은 방식으로 구독으로
+돌아옵니다. 지금 어느 backbone이 답하고 있고 비용이 얼마인지는 statusline의 ccd
+행에 그대로 표시됩니다.
+
+동작 방식: `ccd setup --auto`는 `~/.local/bin/claude`에 작은 launcher를 둡니다.
+이 launcher가 진짜 claude를 실행하고 종료 코드를 지켜봅니다. `StopFailure` hook이
+`rate_limit` 오류를 보고 quota 관측치와 대조한 뒤 SIGHUP으로 세션을 끝내면, Claude
+Code는 flush를 마치고 정상 종료(코드 129)하며, launcher가 같은 대화를 반대편
+backbone에서 다시 엽니다.
+
+하지 않는 것들:
+
+- **launcher가 받을 준비가 돼 있지 않으면 아무 신호도 보내지 않습니다.** hook은
+  launcher가 내보내는 표시를 확인하며, 없으면 절대 시그널을 보내지 않습니다.
+- **rate_limit 하나만으로는 부족합니다.** quota 관측치가 함께 맞아야 하므로
+  일시적인 throttling으로는 전환되지 않습니다. 관측치가 없으면 전환도 없습니다.
+- **key가 없으면 신호도 없습니다.** 갈 곳 없이 세션을 끝내는 것은 그냥 두는 것보다
+  나쁩니다.
+- **진행 중이던 turn은 사라집니다.** 실패한 turn 뒤에 전환되므로 마지막 프롬프트는
+  다시 보내야 합니다.
+- **비대화형 실행은 재시작하지 않습니다.** `claude -p ...` 는 물론 출력을 redirect한
+  경우도 마찬가지입니다. 돌아갈 터미널도, 다시 보낼 프롬프트도 없기 때문에, 대신
+  이어가는 방법을 알려줍니다.
+- **구독 자격증명은 건드리지 않습니다.** ccd는 process를 교체할 뿐, login을 proxy하거나
+  중계하지 않습니다.
+
+끄려면 `ccd setup --no-auto`, `ccd uninstall`로도 제거됩니다. 우리가 만들지 않은
+`~/.local/bin/claude`는 언제나 그대로 둡니다.
+
+</details>
 
 ---
 
@@ -126,6 +172,8 @@ catalog는 snapshot이므로 시간이 지나면 오래됩니다. 최신 benchma
 | `ccd -c --routing exacto` | 저렴한 provider가 tool call을 제대로 처리하지 못할 때 |
 | `ccd -c --model provider/model` | direct model로 재개하고 시작 시 pool을 검증·budget 설정 |
 | `ccd off` | 구독 기반 claude 실행으로 복귀 |
+| `ccd setup --auto` | 자동 전환 켜기 — `/exit`도 명령도 필요 없음 ([아래](#자동-전환)) |
+| `ccd setup --no-auto` | 자동 전환 끄기 |
 
 **Claude Code 안의 skills**(`/`를 입력해 찾을 수 있음):
 

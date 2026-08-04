@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# Automatic quota handoff — runs the real claude and relaunches it on the other
+# backbone when the quota-guard hook asks for it.
+#
+# Installed indirectly: `ccd setup --auto` writes a small resolver at
+# ~/.local/bin/claude that execs the newest copy of THIS file, so a plugin
+# update takes effect without re-running setup.
+#
+# Contract with scripts/quota-guard.sh:
+#   - we export CCD_HANDOFF (a per-launch random token) and CCD_HANDOFF_STATE
+#     (the state path that token implies). The hook signals only when BOTH are
+#     present and consistent, so a session is never ended with nothing to catch it
+#   - the hook writes that state file and SIGHUPs claude
+#   - claude exits 129 (128+SIGHUP) after running its SessionEnd hooks
+#   - we read the file and relaunch the same conversation on the other backbone
+#
+# Every exit code other than 129 is passed through untouched, so this is
+# invisible until a handoff actually happens.
+set -u
+
+MAX_HOPS=3          # consecutive rapid relaunches before giving up
+# A session that lasted at least this long was doing real work, so the relaunch
+# counter resets. Tunable only so the test suite can exercise both sides.
+HOP_RESET_SECONDS=${CCD_HOP_RESET_SECONDS:-60}
+
+# Resolve the real claude WITHOUT `command -v`, which would find the resolver
+# that invoked us. Skip by identity rather than by directory name: comparing
+# resolved paths stays correct when claude is legitimately installed in the same
+# directory, and when $HOME differs from what it was at install time.
+real_claude() {
+  local d c self="${CCD_SHIM_PATH:-}"
+  local IFS=:
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    c="$d/claude"
+    { [ -x "$c" ] && [ ! -d "$c" ]; } || continue
+    if [ -n "$self" ] && [ "$(cd "$d" 2>/dev/null && pwd)/claude" = "$self" ]; then
+      continue
+    fi
+    # Belt and braces: skip anything carrying the shim's signature even when
+    # CCD_SHIM_PATH is unset (a stale shim in another PATH directory, or this
+    # script invoked directly). Running a shim here would nest launchers.
+    # Whole-line match, so a real claude that merely mentions ccd is not skipped.
+    # Keep this literal identical to CCD_SHIM_SIG in bin/ccd.
+    head -c 4096 "$c" 2>/dev/null \
+      | grep -qxF '# ccd-auto-handoff-shim v1 (managed by: ccd setup --auto)' && continue
+    printf '%s' "$c"
+    return 0
+  done
+  return 1
+}
+
+# Read one field from the handoff file. Empty when absent, unreadable, or of an
+# unexpected type — every caller treats empty as "no handoff".
+hf() {
+  [ -f "$CCD_STATE" ] || return 0
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    if not isinstance(d, dict):
+        raise ValueError
+except Exception:
+    raise SystemExit(0)
+v = d.get(sys.argv[2])
+print(v if isinstance(v, str) else ("true" if v is True else ""))
+' "$CCD_STATE" "$1" 2>/dev/null
+}
+
+ccd_bin() {
+  ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd 2>/dev/null | sort -V | tail -1
+}
+
+# Does a transcript exist for this session? A session that ended before its first
+# exchange has none, and `--resume` on it fails with "No conversation found",
+# which would leave the user staring at an error instead of a working session.
+# Claude Code stores transcripts as ~/.claude/projects/<slug>/<session-id>.jsonl,
+# where the slug is the cwd with non-alphanumerics replaced by '-'.
+has_transcript() {
+  local sid="$1" base="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+  [ -d "$base" ] || return 1
+  ls "$base"/*/"$sid".jsonl >/dev/null 2>&1
+}
+
+REAL=$(real_claude) || { echo "ccd: real claude not found on PATH" >&2; exit 127; }
+
+# A per-launch token, not a constant. It is the hook's interlock (only a launcher
+# sets it) AND the owner tag on the handoff state. Without it, two concurrent
+# sessions share one file: the second to exit 129 — for any reason — would
+# consume the first's handoff, resume the WRONG conversation, and leave the
+# session that was actually signalled with nothing to bring it back.
+# Inheriting a token would make a nested launcher share the outer one's state,
+# so a fresh one is minted per launch. An override exists for the test suite,
+# which needs to know the state path — but it goes into a FILENAME that this
+# script later deletes, so anything but the exact generated shape is refused:
+# a value containing `/../` would otherwise escape ~/.claude/ccd entirely.
+# Clear any inherited token first. A nested launcher must not reuse its parent's
+# — they would share one state file and each would delete it on exit.
+CCD_HANDOFF=""
+# Exactly the generated shape: 32 lowercase hex. Anything else is refused, since
+# the value becomes a filename this script later deletes. Length matters as much
+# as the character set: an over-long name makes the state write fail, and a
+# signal sent against state that was never written strands the session.
+valid_token() {
+  case "$1" in
+    *[!0-9a-f]*|'') return 1 ;;
+    *) [ "${#1}" -eq 32 ] ;;
+  esac
+}
+if [ -n "${CCD_HANDOFF_TOKEN:-}" ]; then
+  if valid_token "$CCD_HANDOFF_TOKEN"; then
+    CCD_HANDOFF="$CCD_HANDOFF_TOKEN"
+  else
+    echo "ccd: invalid CCD_HANDOFF_TOKEN — ignoring" >&2
+  fi
+fi
+if [ -z "$CCD_HANDOFF" ]; then
+  # Fail closed rather than fall back to something predictable: a guessable
+  # token is a state file another process can plant or consume.
+  CCD_HANDOFF=$(
+    python3 -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null \
+    || od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n'
+  )
+  if ! valid_token "$CCD_HANDOFF"; then
+    echo "ccd: no secure random source — automatic handoff disabled" >&2
+    exec "$REAL" "$@"
+  fi
+fi
+export CCD_HANDOFF
+# State is per-launcher too, so a stale file from another session is never even
+# opened. The token is validated hex, so it is safe in a filename.
+CCD_STATE="$HOME/.claude/ccd/handoff-$CCD_HANDOFF.json"
+trap 'rm -f "$CCD_STATE" 2>/dev/null' EXIT
+export CCD_HANDOFF_STATE="$CCD_STATE"
+
+# The cap exists to stop a relaunch LOOP, not to limit how many times a long
+# session may legitimately change backbone. Quota dying, recovering, and dying
+# again over a workday is normal, so a lifetime counter would strand the user on
+# the third ordinary transition. Count only relaunches that arrive in quick
+# succession, and forget them once a session has run for a useful stretch.
+# One loop, one backbone per iteration. Both legs go through the SAME checks:
+# an unrelated SIGHUP (closing terminal, user kill) on either backbone must exit
+# rather than silently switch, and exit 129 alone never implies intent.
+hops=0
+backbone=subscription          # which binary this iteration runs
+args=("$@")                    # arguments for it
+
+# A headless run is not relaunchable: the relaunch carries `--resume <id>` but no
+# prompt, so there is nothing to answer, and ccd refuses a launch with no terminal
+# anyway — the user would get "exit Claude Code first" where they expected output.
+# There is also nobody sitting at a prompt to benefit.
+#
+# `-p`/`--print` is only one way in. Claude Code also goes non-interactive when
+# its output is not a terminal (`claude "prompt" > out.txt`), so use the same
+# predicate ccd itself uses, captured now — stdio is still the caller's here.
+headless=0
+{ [ -t 0 ] && [ -t 1 ]; } || headless=1
+for a in ${1+"$@"}; do
+  case "$a" in -p|--print) headless=1 ;; esac
+done
+while :; do
+  session_start=$(date +%s 2>/dev/null || echo 0)
+  if [ "$backbone" = "fallback" ]; then
+    t=$(ccd_bin)
+    if [ -z "$t" ]; then
+      printf 'ccd: plugin not found — resume with: claude --resume %s\n' "${sid:-<session>}" >&2
+      exit 1
+    fi
+    "$t" ${args+"${args[@]}"}
+  else
+    "$REAL" ${args+"${args[@]}"}
+  fi
+  rc=$?
+  [ "$rc" -eq 129 ] || exit "$rc"
+
+  # A session that ran a while was working, not thrashing. The cap counts
+  # consecutive RAPID relaunches, never legitimate transitions spread over time.
+  now=$(date +%s 2>/dev/null || echo 0)
+  [ "$((now - session_start))" -ge "$HOP_RESET_SECONDS" ] && hops=0
+
+  # 129 without armed state belonging to THIS launcher means something else sent
+  # SIGHUP. Pass it through rather than inventing a relaunch.
+  [ "$(hf armed)" = "true" ] || exit "$rc"
+  [ "$(hf token)" = "$CCD_HANDOFF" ] || exit "$rc"
+  sid=$(hf session_id)
+  if [ "$headless" -eq 1 ]; then
+    printf 'ccd: quota exhausted during a non-interactive run — not relaunching.\n     Continue in a terminal with: ccd --resume %s\n' "$sid" >&2
+    exit "$rc"
+  fi
+  dir=$(hf direction)
+  [ -n "$sid" ] || exit "$rc"
+
+  # Resuming a session that never got a transcript fails outright. That happens
+  # when a session ends before its first exchange — there is no conversation to
+  # carry over, so start a fresh one on the new backbone instead of erroring.
+  # `ccd` with no arguments prints status rather than launching, and bare
+  # `claude` is the right way to start fresh, so the two differ here.
+  resumed=1
+  if ! has_transcript "$sid"; then resumed=0; fi
+
+  # Disarm BEFORE relaunching: if the far side dies immediately, the next 129
+  # finds no armed state and exits instead of looping.
+  rm -f "$CCD_STATE" 2>/dev/null || true
+
+  hops=$((hops + 1))
+  if [ "$hops" -ge "$MAX_HOPS" ]; then
+    printf 'ccd: too many consecutive handoffs — stopping.\n     Resume with: claude --resume %s\n' "$sid" >&2
+    exit "$rc"
+  fi
+
+  case "$dir" in
+    to_fallback)
+      if [ "$resumed" -eq 1 ]; then
+        printf '\n\033[33m▶ 🍩 도넛 장착 — 같은 대화를 OpenRouter에서 이어갑니다\033[0m\n'
+        args=(--resume "$sid")
+      else
+        printf '\n\033[33m▶ 🍩 도넛 장착 — OpenRouter로 전환합니다\033[0m\n'
+        args=(go)
+      fi
+      backbone=fallback
+      ;;
+    to_subscription)
+      # Returning to the subscription means returning to it completely. ccd runs
+      # as our child so its exports cannot reach us, but clear them anyway: a
+      # session that says "구독으로 복귀" while still pointed at OpenRouter is the
+      # single worst outcome this feature can produce, and the cost of being
+      # certain is one unset.
+      unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
+            ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+            ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
+            ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
+            CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS \
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_OUTPUT_TOKENS \
+            CCD_ACTIVE 2>/dev/null || true
+      if [ "$resumed" -eq 1 ]; then
+        printf '\n\033[32m▶ ✓ 구독으로 복귀 — 같은 대화를 이어갑니다\033[0m\n'
+        args=(--resume "$sid")
+      else
+        printf '\n\033[32m▶ ✓ 구독으로 복귀합니다\033[0m\n'
+        args=()
+      fi
+      backbone=subscription
+      ;;
+    *)
+      # Unrecognized direction: fail closed rather than guessing a backbone.
+      printf 'ccd: unrecognized handoff direction — resume with: claude --resume %s\n' "$sid" >&2
+      exit "$rc"
+      ;;
+  esac
+done

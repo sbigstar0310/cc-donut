@@ -16,6 +16,14 @@ unset CCD_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
       ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
       CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL \
       CLAUDE_CODE_AUTO_COMPACT_WINDOW 2>/dev/null || true
+
+# The handoff tests exercise code whose whole job is to SIGHUP a claude process.
+# Run from inside a real Claude Code session — which is exactly how a developer
+# runs this suite — an unset or stale CLAUDE_PID lets the ancestor walk find the
+# SESSION RUNNING THE TESTS and kill it. Sever the link to any real session:
+# the tests always pass an explicit CLAUDE_PID for their own stand-in process.
+unset CLAUDE_PID CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
+
 pass=0 fail=0
 
 ok()   { pass=$((pass+1)); printf '  ✓ %s\n' "$1"; }
@@ -588,6 +596,713 @@ case "$row" in
   *) bad "recovery banner" "got: ${row:0:120}" ;;
 esac
 rm -f "$FAKE/fakebin/curl"
+
+head_ "16. automatic handoff: arming predicate + hook stdin"
+mkdir -p "$FAKE/.claude/ccd/providers"
+hf_reset() { rm -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json"; }
+hf_get() { python3 -c "
+import json,os,sys
+p='$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json'
+print(json.load(open(p)).get(sys.argv[1],'') if os.path.exists(p) else '')" "$1" 2>/dev/null; }
+# Quota cache the hook reads to corroborate a rate_limit error.
+quota() { printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" > "$FAKE/.claude/ccd/quota-cache.json"; }
+# StopFailure payload as Claude Code delivers it.
+stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error_type":"%s"}' "$1" "$2"; }
+
+# Arming requires the full readiness set, so these run as a supervised session
+# would: a launcher marker, a key, and a resolvable claude process. Section 19
+# covers what happens when each of those is missing.
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+# Stand-in for the claude process. Nothing resolves as "claude" on every
+# platform at once — a symlink shows the target on Linux, a script shows the
+# interpreter on macOS, and copied system binaries fail code-signing there. On
+# Linux /proc names the script correctly; on macOS the harness puts a fake `ps`
+# on PATH that reports this pid as claude. Production has neither, so the code
+# under test carries no test-only branch.
+mkdir -p "$FAKE/sigbin"
+printf '#!/bin/sh\nsleep "${1:-60}"\n' > "$FAKE/sigbin/claude"
+chmod +x "$FAKE/sigbin/claude"
+# macOS path: ps must answer "claude" for the stand-in and the truth otherwise.
+if [ ! -d /proc ]; then
+  cat > "$FAKE/fakebin/ps" <<'PSEOF'
+#!/bin/sh
+# Test double: name $CCD_STANDIN_PID "claude"; defer everything else to real ps.
+for a in "$@"; do case "$a" in -p) next=1 ;; *) [ "${next:-}" = 1 ] && { want=$a; next=0; } ;; esac; done
+if [ -n "${CCD_STANDIN_PID:-}" ] && [ "${want:-}" = "$CCD_STANDIN_PID" ]; then
+  case "$*" in *comm=*) echo claude; exit 0 ;; esac
+fi
+exec /bin/ps "$@"
+PSEOF
+  chmod +x "$FAKE/fakebin/ps"
+fi
+set +m 2>/dev/null
+"$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
+sleep 0.3
+# Signalling is section 17's subject; here we only care what gets armed, so aim
+# CLAUDE_PID at a live stand-in and let it be killed.
+arm_run() { stopfail "$1" "$2" | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
+
+# rate_limit ALONE is not enough — it can be transient throttling. The dashboard
+# reading has to agree, and a missing reading must never arm.
+hf_reset; quota 58 96
+arm_run sess-a rate_limit
+[ "$(hf_get armed)" = "True" ] && ok "rate_limit + 96% arms the handoff" \
+  || bad "arming on corroborated rate_limit" "armed=$(hf_get armed)"
+[ "$(hf_get direction)" = "to_fallback" ] && ok "armed toward the OpenRouter backbone" \
+  || bad "handoff direction" "got: $(hf_get direction)"
+[ "$(hf_get session_id)" = "sess-a" ] && ok "session id recorded for --resume" \
+  || bad "session id" "got: $(hf_get session_id)"
+kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
+
+"$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
+sleep 0.3
+hf_reset; quota 20 40
+arm_run sess-b rate_limit
+[ -z "$(hf_get armed)" ] && ok "rate_limit at 40% does not arm (transient throttle)" \
+  || bad "must not arm below threshold" "armed=$(hf_get armed)"
+
+hf_reset; quota 58 96
+arm_run sess-c overloaded
+[ -z "$(hf_get armed)" ] && ok "overloaded does not arm (not a quota problem)" \
+  || bad "must not arm on non-rate_limit" "armed=$(hf_get armed)"
+
+hf_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json"
+arm_run sess-d rate_limit
+[ -z "$(hf_get armed)" ] && ok "no quota reading does not arm (fails closed)" \
+  || bad "must not arm without corroboration" "armed=$(hf_get armed)"
+kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
+
+# The discarded prototype used `timeout 0.5 cat` to read stdin. macOS has no
+# timeout(1), so under `set -e` every hook died silently — taking the quota
+# warnings with it. Assert the no-stdin path still works.
+quota 58 96; rm -f "$FAKE/.claude/ccd/last-warn"
+out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
+case "$out" in
+  *"QUOTA NEARLY EXHAUSTED"*) ok "hook still warns when stdin is absent" ;;
+  *) bad "no-stdin regression" "got: ${out:0:100}" ;;
+esac
+# Malformed stdin must be ignored, not fatal.
+rm -f "$FAKE/.claude/ccd/last-warn"
+out=$(printf 'not json at all' | "$ROOT/scripts/quota-guard.sh" UserPromptSubmit 2>/dev/null)
+case "$out" in
+  *"QUOTA NEARLY EXHAUSTED"*) ok "malformed hook stdin degrades gracefully" ;;
+  *) bad "malformed stdin" "got: ${out:0:100}" ;;
+esac
+
+head_ "17. automatic handoff: the SIGHUP interlock"
+# THE safety property: never signal unless a relaunch loop is there to catch it.
+# Otherwise the session just dies with nothing bringing it back.
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+# Stand-in for the claude process. Nothing resolves as "claude" on every
+# platform at once — a symlink shows the target on Linux, a script shows the
+# interpreter on macOS, and copied system binaries fail code-signing there. On
+# Linux /proc names the script correctly; on macOS the harness puts a fake `ps`
+# on PATH that reports this pid as claude. Production has neither, so the code
+# under test carries no test-only branch.
+mkdir -p "$FAKE/sigbin"
+printf '#!/bin/sh\nsleep "${1:-60}"\n' > "$FAKE/sigbin/claude"
+chmod +x "$FAKE/sigbin/claude"
+# macOS path: ps must answer "claude" for the stand-in and the truth otherwise.
+if [ ! -d /proc ]; then
+  cat > "$FAKE/fakebin/ps" <<'PSEOF'
+#!/bin/sh
+# Test double: name $CCD_STANDIN_PID "claude"; defer everything else to real ps.
+for a in "$@"; do case "$a" in -p) next=1 ;; *) [ "${next:-}" = 1 ] && { want=$a; next=0; } ;; esac; done
+if [ -n "${CCD_STANDIN_PID:-}" ] && [ "${want:-}" = "$CCD_STANDIN_PID" ]; then
+  case "$*" in *comm=*) echo claude; exit 0 ;; esac
+fi
+exec /bin/ps "$@"
+PSEOF
+  chmod +x "$FAKE/fakebin/ps"
+fi
+quota 58 96
+
+"$FAKE/sigbin/claude" 8 & TARGET=$!
+sleep 0.3
+hf_reset
+stopfail sess-e rate_limit | CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+sleep 0.4
+if kill -0 "$TARGET" 2>/dev/null; then ok "no CCD_HANDOFF → session is never signalled"
+else bad "interlock breached" "target died without a relaunch loop"; fi
+kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
+
+# The signal is the point of this test, so the shell's "Hangup" job notice is
+# expected — silence it rather than letting it look like a failure.
+set +m 2>/dev/null
+"$FAKE/sigbin/claude" 8 2>/dev/null & TARGET=$!
+sleep 0.3
+hf_reset
+stopfail sess-f rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+sleep 0.6
+if kill -0 "$TARGET" 2>/dev/null; then bad "handoff signal" "target survived CCD_HANDOFF=1"; else ok "CCD_HANDOFF=1 → SIGHUP delivered to the claude process"; fi
+kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
+
+# An armed handoff with no key would end the session with nowhere to go.
+: > "$FAKE/.claude/ccd/providers/keys.env"
+"$FAKE/sigbin/claude" 8 & TARGET=$!
+sleep 0.3
+hf_reset
+stopfail sess-g rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+sleep 0.4
+if kill -0 "$TARGET" 2>/dev/null; then ok "missing OpenRouter key → no signal (fails closed)"
+else bad "signalled without a key" "target died with no fallback available"; fi
+kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+
+head_ "18. automatic handoff: launcher shim"
+# The shim must be invisible until a handoff happens: every exit code other
+# than 129 passes through untouched.
+HB="$FAKE/.claude/plugins/cache/cc-donut/ccd/0.2.0/bin"
+mkdir -p "$HB" "$FAKE/realbin"
+cp "$ROOT/bin/ccd-handoff" "$HB/ccd-handoff"; chmod +x "$HB/ccd-handoff"
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+echo "CCD-RESUMED:$*"
+EOF
+chmod +x "$HB/ccd"
+"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+[ -x "$FAKE/.local/bin/claude" ] && ok "setup --auto installs the claude shim" \
+  || bad "shim install" "not executable"
+"$ROOT/bin/ccd" setup >/dev/null 2>&1
+[ -x "$FAKE/.local/bin/claude" ] && ok "bare setup leaves the shim alone" || bad "bare setup removed the shim"
+
+# The launcher decides whether a relaunch is possible from its terminal state:
+# production always has one, and a session with no terminal must not be relaunched
+# into ccd's "exit Claude Code first" refusal. Command substitution takes that
+# terminal away, so drive the shim through a pty and capture what it wrote.
+# Exit status is forwarded exactly — several tests assert on it. Reading stops as
+# soon as the child is reaped, so a detached grandchild holding the pty open (real
+# ccd warms its price cache in the background) cannot wedge the suite.
+cat > "$FAKE/ptyrun.py" <<'PYRUN'
+import os, pty, select, sys
+
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        os.execvp(sys.argv[1], sys.argv[1:])
+    except OSError:
+        os._exit(127)
+
+def drain(timeout):
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return True
+    try:
+        b = os.read(fd, 65536)
+    except OSError:
+        return False
+    if not b:
+        return False
+    # A pty turns every \n into \r\n; assertions compare against plain text.
+    sys.stdout.buffer.write(b.replace(b"\r\n", b"\n"))
+    return True
+
+status = None
+while True:
+    alive = drain(0.1)
+    done, st = os.waitpid(pid, os.WNOHANG)
+    if done == pid:
+        status = st
+        while drain(0.05):
+            pass
+        break
+    if not alive:
+        _, status = os.waitpid(pid, 0)
+        break
+sys.stdout.buffer.flush()
+sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+PYRUN
+shim_run() { python3 "$FAKE/ptyrun.py" "$@"; }
+
+SHIMPATH="$FAKE/.local/bin:$FAKE/realbin:$PATH"
+# Pin the launcher token so these tests know where its state file lives; a real
+# launch mints a random one. HSTATE is that path.
+export CCD_HANDOFF_TOKEN=00000000000000000000000000000001
+HSTATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000001.json"
+fake_real() { printf '%s\n' "$1" > "$FAKE/realbin/claude"; chmod +x "$FAKE/realbin/claude"; }
+
+fake_real '#!/bin/sh
+echo "REAL:$*"'
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" --flag 2>/dev/null)
+[ "$out" = "REAL:--flag" ] && ok "shim forwards argv to the real claude" || bad "argv forwarding" "got: $out"
+
+fake_real '#!/bin/sh
+exit 3'
+PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+[ "$?" -eq 3 ] && ok "non-129 exit codes pass through unchanged" || bad "exit passthrough" "got: $?"
+
+# 129 can also mean a closing terminal. Without an armed handoff, don't invent one.
+fake_real '#!/bin/sh
+exit 129'
+hf_reset
+PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+[ "$?" -eq 129 ] && ok "129 without an armed handoff does not relaunch" || bad "unarmed 129" "got: $?"
+
+# --resume only happens when the session actually has a transcript.
+mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-x.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-x","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+case "$out" in
+  *"CCD-RESUMED:--resume sess-x"*) ok "armed 129 relaunches the conversation on ccd" ;;
+  *) bad "handoff relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
+esac
+[ ! -f "$HSTATE" ] && ok "handoff is disarmed before relaunching" \
+  || bad "stale handoff left armed"
+
+# to_subscription goes back to the real binary, not to ccd.
+fake_real '#!/bin/sh
+[ "$1" = --resume ] && { echo "REAL-RESUMED:$*"; exit 0; }
+exit 129'
+: > "$FAKE/.claude/projects/-tmp/sess-y.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-y","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+case "$out" in
+  *"REAL-RESUMED:--resume sess-y"*) ok "recovery relaunches on the subscription" ;;
+  *) bad "subscription relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
+esac
+
+# Worst case: something keeps re-arming the handoff while every launch exits 129.
+# Disarm alone cannot stop that, so MAX_HOPS is the backstop being tested here —
+# the fake claude re-arms on every run, exactly as a stuck quota signal would.
+rm -f "$FAKE/.hops"
+fake_real '#!/bin/sh
+printf "%s\n" x >> "$HOME/.hops"
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_fallback\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129'
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "%s\n" x >> "$HOME/.hops"
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_fallback\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129
+EOF
+chmod +x "$HB/ccd"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+hops=$(wc -l < "$FAKE/.hops" 2>/dev/null | tr -d ' ')
+# Exactly MAX_HOPS=3 launches: the third increment hits the cap and stops. An
+# exact count matters — a loose range would also pass if the loop stopped early
+# for an unrelated reason (a token mismatch, say) and never exercised the cap.
+[ "${hops:-0}" -eq 3 ] \
+  && ok "relaunch loop stops at the hop cap even when re-armed (ran $hops times)" \
+  || bad "hop cap" "expected 3 launches, ran ${hops:-0}"
+rm -f "$HSTATE"
+
+# The cap must not count LEGITIMATE transitions. Quota dying, recovering, and
+# dying again over a workday is ordinary; a lifetime counter would strand the
+# user on the third one. Sessions that ran a while reset the counter.
+rm -f "$FAKE/.hops2"
+fake_real '#!/bin/sh
+printf "%s\n" x >> "$HOME/.hops2"
+sleep 2
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_fallback\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129'
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_subscription\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129
+EOF
+chmod +x "$HB/ccd"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+# A 1s window makes each 2s session count as "long"; run briefly and count.
+( PATH="$SHIMPATH" CCD_HOP_RESET_SECONDS=1 shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1 ) &
+LOOPPID=$!
+sleep 11
+kill -9 $LOOPPID 2>/dev/null; wait $LOOPPID 2>/dev/null
+longruns=$(wc -l < "$FAKE/.hops2" 2>/dev/null | tr -d ' ')
+[ "${longruns:-0}" -gt 3 ] \
+  && ok "long-running sessions reset the relaunch counter (ran $longruns)" \
+  || bad "lifetime hop cap" "stopped after ${longruns:-0} legitimate transitions"
+rm -f "$HSTATE" "$FAKE/.hops2"
+
+# Never strand the user: if the plugin is gone, fall through to the real claude.
+mv "$FAKE/.claude/plugins/cache/cc-donut" "$FAKE/plugin-away"
+fake_real '#!/bin/sh
+echo "REAL-FALLBACK:$*"'
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" --z 2>/dev/null)
+case "$out" in
+  *"REAL-FALLBACK:--z"*) ok "missing plugin falls through to the real claude" ;;
+  *) bad "plugin-missing fallback" "got: $out" ;;
+esac
+mv "$FAKE/plugin-away" "$FAKE/.claude/plugins/cache/cc-donut"
+
+"$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ ! -e "$FAKE/.local/bin/claude" ] && ok "setup --no-auto removes the shim" || bad "--no-auto left the shim"
+# A claude the user installed themselves must survive uninstall.
+printf '#!/bin/sh\necho mine\n' > "$FAKE/.local/bin/claude"; chmod +x "$FAKE/.local/bin/claude"
+out=$("$ROOT/bin/ccd" uninstall 2>&1)
+case "$out" in
+  *"not a ccd shim"*) ok "a foreign ~/.local/bin/claude is left alone" ;;
+  *) bad "foreign claude warning" "got: $(printf '%s' "$out" | grep -i claude | head -1)" ;;
+esac
+[ -e "$FAKE/.local/bin/claude" ] && ok "foreign claude survives uninstall" || bad "deleted a foreign claude"
+# Install must protect what uninstall protects — otherwise `setup --auto` deletes
+# exactly the file we refuse to remove.
+out=$("$ROOT/bin/ccd" setup --auto 2>&1)
+case "$out" in
+  *"not a ccd shim"*) ok "setup --auto refuses to clobber a foreign claude" ;;
+  *) bad "install-side protection" "got: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
+esac
+[ "$(cat "$FAKE/.local/bin/claude")" = "$(printf '#!/bin/sh\necho mine')" ] \
+  && ok "the foreign claude is byte-identical after a refused install" \
+  || bad "foreign claude was modified"
+
+# Ownership decides whether we overwrite and delete. A wrapper that merely
+# mentions ccd in a comment is still the user's file, so the check has to match
+# the whole signature line rather than a substring of it.
+printf '#!/bin/sh\n# my wrapper, sits in front of the ccd launcher\nexec /usr/bin/claude "$@"\n' \
+  > "$FAKE/.local/bin/claude"; chmod +x "$FAKE/.local/bin/claude"
+before=$(cat "$FAKE/.local/bin/claude")
+"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+[ "$(cat "$FAKE/.local/bin/claude")" = "$before" ] \
+  && ok "a wrapper that merely mentions ccd is not claimed as ours" \
+  || bad "ownership marker" "overwrote a foreign wrapper that mentioned ccd"
+"$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ -e "$FAKE/.local/bin/claude" ] && ok "...and --no-auto does not delete it either" \
+  || bad "ownership marker" "deleted a foreign wrapper that mentioned ccd"
+rm -f "$FAKE/.local/bin/claude"
+
+head_ "19. automatic handoff: readiness gates"
+# Each of these ends a session, so each must fail closed. A key ccd would later
+# reject is the same as no key: the session would end with nowhere to go.
+eval "$(sed -n '/^have_key()/,/^}/p' "$ROOT/scripts/quota-guard.sh")"
+CCD_DIR="$FAKE/.claude/ccd"
+keyfile="$CCD_DIR/providers/keys.env"
+mkdir -p "$CCD_DIR/providers"
+keycase() { printf '%s\n' "$2" > "$keyfile"
+  if env -u OPENROUTER_API_KEY bash -c "CCD_DIR='$CCD_DIR'; $(declare -f have_key); have_key" 2>/dev/null
+  then got=usable; else got=unusable; fi
+  [ "$got" = "$3" ] && ok "key: $1 → $3" || bad "key: $1" "got $got, want $3"; }
+keycase 'empty double quotes'  'OPENROUTER_API_KEY=""'                     unusable
+keycase 'empty single quotes'  "OPENROUTER_API_KEY=''"                     unusable
+keycase 'commented out'        '# OPENROUTER_API_KEY="sk-or-v1-real"'      unusable
+keycase 'whitespace only'      'OPENROUTER_API_KEY="   "'                  unusable
+keycase 'bare assignment'      'OPENROUTER_API_KEY='                       unusable
+keycase 'real key'             'OPENROUTER_API_KEY="sk-or-v1-real"'        usable
+keycase 'export prefix'        'export OPENROUTER_API_KEY="sk-or-v1-real"' usable
+keycase 'unquoted'             'OPENROUTER_API_KEY=sk-or-v1-real'          usable
+
+# Arming must not outlive the conditions that justified it: a file left behind by
+# an unsupervised session would be consumed by a later launcher.
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
+quota 58 96
+hf_reset
+stopfail sess-h rate_limit | "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
+  && ok "an unsupervised session never leaves armed state behind" \
+  || bad "stale armed handoff" "written without CCD_HANDOFF"
+
+: > "$keyfile"
+hf_reset
+stopfail sess-i rate_limit | CCD_HANDOFF=1 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
+  && ok "no key → nothing is armed either" \
+  || bad "armed without a key" "would end the session with nowhere to go"
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
+
+# The headline promise: on recovery the session must actually END, or the return
+# trip waits for an unrelated exit that may never come.
+cat > "$FAKE/.claude/ccd/run-state.json" <<'EOF'
+{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5,"last_seven_day_percent":97,"last_seven_day_reset":"D1"}
+EOF
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"fiveHourReset":"R1","sevenDayPercent":3,"sevenDayReset":"D2"}}\n' > "$FAKE/.claude/ccd/quota-cache.json"
+cat > "$FAKE/fakebin/curl" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$FAKE/fakebin/curl"
+set +m 2>/dev/null
+"$FAKE/sigbin/claude" 8 2>/dev/null & TARGET=$!
+sleep 0.3
+hf_reset
+printf '{"session_id":"sess-r","cwd":"/tmp/w","hook_event_name":"UserPromptSubmit"}' \
+  | CCD_ACTIVE=1 CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+sleep 0.6
+if kill -0 "$TARGET" 2>/dev/null; then bad "automatic return" "recovery armed but never ended the session"; kill -9 "$TARGET" 2>/dev/null
+else ok "quota recovery ends the session so the launcher can return"; fi
+wait "$TARGET" 2>/dev/null
+[ "$(hf_get direction)" = "to_subscription" ] && ok "recovery arms the return trip" \
+  || bad "return direction" "got: $(hf_get direction)"
+rm -f "$FAKE/fakebin/curl" "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json"
+
+# A session that ended before its first exchange has no transcript, and
+# `--resume` on it fails with "No conversation found". Found by driving the real
+# thing under a pty: the handoff worked but landed the user on an error.
+"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+# Exit 129 the first time so the shim performs a handoff, then 0 so the loop
+# ends — without the second launch the relaunch would spin to the hop cap.
+fake_real '#!/bin/sh
+printf "REAL:%s\n" "$*"
+[ -f "$HOME/.been-here" ] && exit 0
+: > "$HOME/.been-here"
+exit 129'
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "CCD:%s\n" "$*"
+EOF
+chmod +x "$HB/ccd"
+rm -rf "$FAKE/.claude/projects" "$FAKE/.been-here" "$HSTATE"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-new","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+case "$out" in
+  *"CCD:go"*) ok "a session with no transcript starts fresh instead of failing" ;;
+  *) bad "no-transcript handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+# With a transcript present it must still resume rather than start over.
+mkdir -p "$FAKE/.claude/projects/-tmp"
+: > "$FAKE/.claude/projects/-tmp/sess-old.jsonl"
+rm -f "$FAKE/.been-here"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-old","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+case "$out" in
+  *"CCD:--resume sess-old"*) ok "an existing transcript is resumed, not discarded" ;;
+  *) bad "transcript resume" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+rm -rf "$FAKE/.claude/projects" "$HSTATE"
+
+# The launcher's token goes into a filename it later deletes, so a traversing
+# value must be refused rather than reaching rm. Exit 0 here: a refused token
+# still mints a random one, and a 129 would pair with whatever ccd stub the
+# previous test left behind into a relaunch loop.
+fake_real '#!/bin/sh
+echo "REAL-RAN"
+exit 0'
+out=$(PATH="$SHIMPATH" CCD_HANDOFF_TOKEN='../../escape' shim_run "$FAKE/.local/bin/claude" 2>&1)
+case "$out" in
+  *"invalid CCD_HANDOFF_TOKEN"*) ok "a path-traversing token is refused" ;;
+  *) bad "token validation" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+case "$out" in
+  *"REAL-RAN"*) ok "a refused token still launches claude normally" ;;
+  *) bad "token refusal strands the user" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+[ ! -e "$FAKE/.claude/handoff-.json" ] && [ ! -e "$FAKE/handoff-.json" ] \
+  && ok "no state file is created outside the ccd directory" \
+  || bad "token traversal" "a file escaped ~/.claude/ccd"
+
+# An over-long token passes a character-class check but names a file the write
+# cannot create. Signalling against state that was never written is exactly the
+# "session dies and never comes back" failure, so the shape check is on length too.
+long=$(printf 'a%.0s' $(seq 1 300))
+out=$(PATH="$SHIMPATH" CCD_HANDOFF_TOKEN="$long" shim_run "$FAKE/.local/bin/claude" 2>&1)
+case "$out" in
+  *"invalid CCD_HANDOFF_TOKEN"*) ok "an over-long token is refused" ;;
+  *) bad "token length check" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+# A wrong-length token must not satisfy the interlock either.
+eval "$(sed -n '/^launcher_present()/,/^}/p' "$ROOT/scripts/quota-guard.sh")"
+CCD_DIR="$FAKE/.claude/ccd"
+if CCD_HANDOFF=abc CCD_HANDOFF_STATE="$CCD_DIR/handoff-abc.json" launcher_present 2>/dev/null
+then bad "short token accepted" "a token of the wrong shape satisfies the interlock"
+else ok "a token of the wrong length is refused"; fi
+
+# The hook must not signal when the state write fails. Point the state at a path
+# whose parent directory does not exist: that fails for root too, unlike chmod,
+# which the container tests run as root and would ignore.
+quota 58 96
+set +m 2>/dev/null
+"$FAKE/sigbin/claude" 8 2>/dev/null & TARGET=$!
+sleep 0.3
+# CCD_DIR moves with HOME, so a HOME whose ccd directory is missing makes the
+# state write fail while the contract still matches — no production knob needed.
+BROKEN="$FAKE/broken-home"
+mkdir -p "$BROKEN/.claude"     # deliberately no ccd/ subdirectory
+cp -R "$FAKE/.claude/ccd" "$BROKEN/.claude/ccd-backup" 2>/dev/null || true
+stopfail sess-w rate_limit | HOME="$BROKEN" CCD_HANDOFF=00000000000000000000000000000002 \
+  CCD_HANDOFF_STATE="$BROKEN/.claude/ccd/handoff-00000000000000000000000000000002.json" \
+  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+sleep 0.5
+if kill -0 "$TARGET" 2>/dev/null; then ok "a failed state write means no signal"
+else bad "signalled without state" "the session would never come back"; fi
+kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
+
+# CCD_HANDOFF alone must not satisfy the interlock: `CCD_HANDOFF=x claude` would
+# otherwise end a session with no launcher waiting to bring it back.
+eval "$(sed -n '/^launcher_present()/,/^}/p' "$ROOT/scripts/quota-guard.sh")"
+CCD_DIR="$FAKE/.claude/ccd"
+if CCD_HANDOFF=x CCD_HANDOFF_STATE= launcher_present 2>/dev/null
+then bad "bare CCD_HANDOFF satisfies the interlock" "a session could be stranded"
+else ok "a token without its state path is refused"; fi
+if CCD_HANDOFF=00000000000000000000000000000003 CCD_HANDOFF_STATE=/tmp/elsewhere.json launcher_present 2>/dev/null
+then bad "mismatched state path accepted" "state path is not checked"
+else ok "a state path that does not match the token is refused"; fi
+if CCD_HANDOFF=00000000000000000000000000000003 CCD_HANDOFF_STATE="$CCD_DIR/handoff-00000000000000000000000000000003.json" launcher_present 2>/dev/null
+then ok "the real launcher contract is accepted"
+else bad "valid contract refused" "the launcher could never hand off"; fi
+
+# Two sessions running at once must not consume each other's handoff. With one
+# shared state file, whichever exits 129 first — for any reason — resumes the
+# other's conversation and leaves the signalled session with nothing to bring it
+# back. State is per-launcher and token-tagged to make that impossible.
+printf '{"armed":true,"token":"000000000000000000000000000000ff","direction":"to_fallback","session_id":"sess-other","cwd":"/tmp","armed_at":1}' \
+  > "$FAKE/.claude/ccd/handoff-000000000000000000000000000000ff.json"
+rm -f "$HSTATE"
+# A plain ccd stub: the earlier loop-cap test left one that exits 129, which
+# would pair with this 129 into a relaunch loop rather than a single check.
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "CCD:%s\n" "$*"
+EOF
+chmod +x "$HB/ccd"
+fake_real '#!/bin/sh
+printf "REAL:%s\n" "$*"
+exit 129'
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+case "$out" in
+  *"CCD:"*) bad "cross-session handoff" "consumed another launcher's state" ;;
+  *) ok "another session's handoff is never consumed" ;;
+esac
+[ -f "$FAKE/.claude/ccd/handoff-000000000000000000000000000000ff.json" ] \
+  && ok "the other session's state survives untouched" \
+  || bad "cross-session state" "deleted a handoff belonging to another launcher"
+rm -f "$FAKE/.claude/ccd/handoff-000000000000000000000000000000ff.json"
+
+# Malformed state must not be guessed at.
+fake_real '#!/bin/sh
+exit 129'
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"sideways","session_id":"sess-q","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>&1)
+case "$out" in
+  *"unrecognized handoff direction"*) ok "an unknown direction fails closed" ;;
+  *) bad "unknown direction" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+rm -f "$FAKE/.claude/ccd/handoff.json"
+
+head_ "20. automatic handoff: one launcher, never a nested one"
+# The launcher runs the REAL bin/ccd on the fallback leg, and ccd ends by exec'ing
+# claude. If that exec resolved through ~/.local/bin/claude, ccd would start a
+# SECOND handoff launcher underneath the first — one that inherits ccd's
+# OpenRouter environment. Its "return to the subscription" would then hand the
+# user a session still pointed at OpenRouter, and the outer hop cap would no
+# longer govern the round trip.
+#
+# The discriminator is the token, not the binary: both layouts eventually reach
+# the real claude, but a nested launcher mints a token of its own. These tests
+# use the real bin/ccd deliberately — a stub that exits on its own cannot show
+# which claude the real one resolves.
+"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+cp "$ROOT/bin/ccd" "$HB/ccd"; chmod +x "$HB/ccd"
+mkdir -p "$FAKE/realbin"
+NESTPATH="$FAKE/.local/bin:$FAKE/realbin:$PATH"
+
+# Invoked straight from a shell, there is no launcher at all — so the claude ccd
+# execs must not have one either.
+cat > "$FAKE/realbin/claude" <<'EOF'
+#!/bin/sh
+echo "REAL-CLAUDE:$*"
+echo "TOKEN:${CCD_HANDOFF:-<none>}"
+env | grep -E '^(CCD_ACTIVE|ANTHROPIC_BASE_URL)=' | sed 's/=.*/=set/' | sort
+EOF
+chmod +x "$FAKE/realbin/claude"
+out=$(PATH="$NESTPATH" OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
+case "$out" in
+  *"TOKEN:<none>"*) ok "ccd execs the real claude without minting a launcher" ;;
+  *"TOKEN:"*) bad "nested launcher" "ccd bounced through the shim: $(printf '%s' "$out" | grep TOKEN | head -1)" ;;
+  *) bad "ccd exec" "never reached the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+case "$out" in
+  *"CCD_ACTIVE=set"*) ok "the fallback leg runs claude with the OpenRouter environment" ;;
+  *) bad "fallback environment" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+
+# The production path: an armed launcher hands off to the real ccd, which execs
+# claude. That claude must still belong to the ORIGINAL launcher — same token,
+# same loop, same hop cap governing the round trip.
+#
+# The token is NOT pinned here: a pinned one would be inherited by a nested
+# launcher too and hide the very thing under test. The fake arms the handoff
+# with whatever token it was given and reports it on both legs; a nested
+# launcher mints its own, so the two legs would disagree.
+#
+# The fake reports through files rather than stdout: shim_run's pty output is
+# interleaved with everything else the real ccd prints on launch.
+cat > "$FAKE/realbin/claude" <<'EOF'
+#!/bin/sh
+[ "$1" = --resume ] && { printf '%s' "${CCD_HANDOFF:-<none>}" > "$HOME/.tok2"; exit 0; }
+printf '%s' "${CCD_HANDOFF:-<none>}" > "$HOME/.tok1"
+printf '{"armed":true,"token":"%s","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' \
+  "${CCD_HANDOFF:-x}" > "${CCD_HANDOFF_STATE:-/dev/null}"
+exit 129
+EOF
+chmod +x "$FAKE/realbin/claude"
+mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-n.jsonl"
+rm -f "$FAKE/.tok1" "$FAKE/.tok2"
+PATH="$NESTPATH" OPENROUTER_API_KEY=sk-or-v1-smoketest CCD_HANDOFF_TOKEN= \
+  shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+tok1=$(cat "$FAKE/.tok1" 2>/dev/null); tok2=$(cat "$FAKE/.tok2" 2>/dev/null)
+case "$tok1" in
+  ''|'<none>') bad "fallback leg" "the first leg had no launcher token" ;;
+  *) case "$tok2" in
+       '') bad "fallback leg" "the handed-off session never started" ;;
+       "$tok1") ok "the handed-off session stays under the original launcher" ;;
+       *) bad "nested launcher" "fallback got a fresh token ($tok1 -> $tok2)" ;;
+     esac ;;
+esac
+rm -f "$FAKE/.claude/ccd"/handoff-*.json "$FAKE/.tok1" "$FAKE/.tok2"
+
+# A headless run has no terminal to relaunch into and no prompt to re-send, so
+# it must pass the exit code through with instructions rather than hand the user
+# ccd's "exit Claude Code first" refusal.
+fake_real '#!/bin/sh
+exit 129'
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$NESTPATH" shim_run "$FAKE/.local/bin/claude" -p hi 2>&1)
+case "$out" in
+  *"non-interactive run"*"ccd --resume sess-n"*) ok "a headless run is not relaunched, and says how to continue" ;;
+  *) bad "headless handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+
+# `-p` is not the only way in: Claude Code also goes non-interactive when its
+# output is redirected. Relaunching that one lands the user in ccd'"'"'s no-terminal
+# refusal where they expected output, so no pty here — the point is its absence.
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+PATH="$NESTPATH" "$FAKE/.local/bin/claude" hello > "$FAKE/.piped" 2> "$FAKE/.piped-err"
+case "$(cat "$FAKE/.piped-err")" in
+  *"non-interactive run"*) ok "redirected output counts as headless too" ;;
+  *) bad "non-tty handoff" "got: $(tr '\n' ' ' < "$FAKE/.piped-err" | head -c 90)" ;;
+esac
+rm -f "$HSTATE" "$FAKE/.piped" "$FAKE/.piped-err"
+
+# `ccd off` is the manual counterpart of the recovery leg: real claude, routing
+# environment gone, no launcher invented on the way.
+cat > "$FAKE/realbin/claude" <<'EOF'
+#!/bin/sh
+echo "REAL-CLAUDE:$*"
+env | grep -E '^(CCD_ACTIVE|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN)=' | sed 's/=.*/=LEAKED/' | sort
+EOF
+chmod +x "$FAKE/realbin/claude"
+out=$(PATH="$NESTPATH" ANTHROPIC_BASE_URL=https://openrouter.ai/api ANTHROPIC_AUTH_TOKEN=x CCD_ACTIVE=1 \
+      "$ROOT/bin/ccd" off 2>/dev/null)
+case "$out" in
+  *LEAKED*) bad "ccd off" "left the OpenRouter environment in place: $(printf '%s' "$out" | grep LEAKED | tr '\n' ' ')" ;;
+  *"REAL-CLAUDE:"*) ok "ccd off returns to a clean subscription environment" ;;
+  *) bad "ccd off" "did not reach the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+
+# The recovery relaunch clears the routing environment even if it leaked in — a
+# session announcing "구독으로 복귀" while still on OpenRouter is the worst outcome
+# this feature can produce.
+cat > "$FAKE/realbin/claude" <<'EOF'
+#!/bin/sh
+[ "$1" = --resume ] && {
+  echo "RECOVERED:$*"
+  env | grep -E '^(CCD_ACTIVE|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN)=' | sed 's/=.*/=LEAKED/'
+  exit 0
+}
+exit 129
+EOF
+chmod +x "$FAKE/realbin/claude"
+mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-r.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-r","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$NESTPATH" CCD_HANDOFF_TOKEN=00000000000000000000000000000001 \
+      ANTHROPIC_BASE_URL=https://openrouter.ai/api ANTHROPIC_AUTH_TOKEN=x CCD_ACTIVE=1 \
+      shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+case "$out" in
+  *LEAKED*) bad "recovery environment" "relaunched on the subscription still pointed at OpenRouter" ;;
+  *"RECOVERED:--resume sess-r"*) ok "recovery relaunch clears the OpenRouter environment" ;;
+  *) bad "recovery relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+rm -f "$FAKE/.claude/ccd"/handoff-*.json
+"$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -139,6 +139,31 @@ conversation intact.)
 login only within that process; the login itself stays saved. **Never run
 `/logout`** — that genuinely logs you out and forces a re-login.
 
+## Doing all of this automatically
+
+Everything above is the manual round trip. It always works and needs nothing
+installed. If you would rather not type any of it:
+
+```sh
+ccd setup --auto
+```
+
+Keep starting sessions as `claude`. When quota dies the conversation reopens on
+OpenRouter by itself, and when the window resets it returns to the subscription
+the same way. Turn it off with `ccd setup --no-auto`.
+
+It is deliberately conservative, and each rule exists so a failure leaves you no
+worse off than doing nothing:
+
+- A `rate_limit` error alone never triggers it — the quota reading has to agree,
+  so transient throttling is ignored. No reading, no handoff.
+- Nothing is signalled unless the launcher is running to catch it, and nothing is
+  signalled without an OpenRouter key. Ending a session with nowhere to go would
+  be worse than leaving it alone.
+- The turn that failed is not retried. Re-send that prompt after the switch.
+- If anything is missing — plugin, key, launcher — you land in the ordinary
+  manual flow above, not in a broken state.
+
 ## If it doesn't work
 
 `ccd doctor` reports the cause by HTTP status code.
