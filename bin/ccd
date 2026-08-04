@@ -530,7 +530,10 @@ doctor() {
       OPUS)   sm="$ANTHROPIC_DEFAULT_OPUS_MODEL" ;;
     esac
     base="${sm%\[1m\]}"; base="${base%%:*}"
-    [ -x "$SELF_DIR/ccd-price-fetch" ] && "$SELF_DIR/ccd-price-fetch" "$base" >/dev/null 2>&1
+    # Fetch under the SAME routing-aware key the readers below use; a bare-key
+    # write would land in a different cache entry and every row would read as
+    # "ctx unknown" even right after a successful refresh.
+    [ -x "$SELF_DIR/ccd-price-fetch" ] && "$SELF_DIR/ccd-price-fetch" "$(cache_key_for "$base")" >/dev/null 2>&1
     # Recompute the hint from the JUST-refreshed cache — the value wired at apply_tiers
     # time is stale by one refresh, and the row must show what the next launch will do.
     case "$slot" in
@@ -541,12 +544,12 @@ doctor() {
     case "$refreshed" in
       *'[1m]') hinted_bases="$hinted_bases $base"; ceiling=$(compact_window_for "$base") ;;
     esac
-    python3 - "$PRICE_CACHE" "$base" "$slot" "$refreshed" "$ceiling" <<'PY'
+    python3 - "$PRICE_CACHE" "$(cache_key_for "$base")" "$slot" "$refreshed" "$ceiling" "$base" <<'PY'
 import json, math, sys, time
 CACHE_TTL, FUTURE_GRACE = 86400, 300   # shared cache-freshness policy
-cache, base, slot, wired, ceiling = sys.argv[1:6]
+cache, cache_key, slot, wired, ceiling, base = sys.argv[1:7]
 try:
-    entry = json.load(open(cache)).get("models", {}).get(base) or {}
+    entry = json.load(open(cache)).get("models", {}).get(cache_key) or {}
 except Exception:
     entry = {}
 lo, hi = entry.get("min_context_length"), entry.get("max_context_length")
@@ -924,9 +927,14 @@ if [ -x "$SELF_DIR/ccd-price-fetch" ]; then
   stale_slugs=$(stale_context_slugs "${slot_slugs[@]}")
   # Force-refresh the explicit selected model even when it is cached: this launch
   # path commits its global compact budget to that exact provider pool.
+  # --model takes a BARE slug, but every reader (with_context_hint,
+  # compact_window_for) looks the entry up under the routing-aware key — so route
+  # it here too. Refreshing the bare key would write a cache entry nothing reads,
+  # leaving a stale routing-aware entry to grant [1m] the pool no longer supports.
+  selected_key=""
   if [ -n "$selected_model" ]; then
-    # selected_model is already routing-aware (from with_routing or --model)
-    stale_slugs=$(printf '%s\n%s\n' "$stale_slugs" "$selected_model" | awk 'NF && !seen[$0]++')
+    selected_key=$(cache_key_for "$selected_model")
+    stale_slugs=$(printf '%s\n%s\n' "$stale_slugs" "$selected_key" | awk 'NF && !seen[$0]++')
   fi
   if [ -n "$stale_slugs" ]; then
     printf '   %s⏳ refreshing provider data (first run or stale cache)%s\n' "$d" "$r"
@@ -937,7 +945,7 @@ if [ -x "$SELF_DIR/ccd-price-fetch" ]; then
     done
     for pair in $refresh_pids; do
       pid=${pair%%:*}; slug=${pair#*:}
-      if ! wait "$pid" && [ "$slug" = "$selected_model" ]; then
+      if ! wait "$pid" && [ -n "$selected_key" ] && [ "$slug" = "$selected_key" ]; then
         invalidate_context_slug "$slug"
       fi
     done

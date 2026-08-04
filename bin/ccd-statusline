@@ -96,7 +96,9 @@ if entry:
     lo_i, lo_o = entry.get("floor_in_per_m"), entry.get("floor_out_per_m")
     hi_i, hi_o = entry.get("max_in_per_m"), entry.get("max_out_per_m")
     nums = lambda *v: all(isinstance(x, (int, float)) for x in v)
-    if routing in (":floor", "") and nums(lo_i, lo_o):
+    # :free pins the zero-cost pool and :floor pins the cheapest one — both are a
+    # single value. Only genuinely price-ranging routings get the min–max form.
+    if routing in (":free", ":floor", "") and nums(lo_i, lo_o):
         price_part = f"in {fmt(lo_i)}/M · out {fmt(lo_o)}/M"
     elif nums(lo_i, hi_i, lo_o, hi_o):
         price_part = f"in {fmt(lo_i)}–{fmt(hi_i)}/M · out {fmt(lo_o)}–{fmt(hi_o)}/M"
