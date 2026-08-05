@@ -889,6 +889,36 @@ case "$out" in
   *) bad "subscription relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
 esac
 
+# A transcript can exist and still fail to open — Claude Code answers "No
+# conversation found" and exits 1. That happens right after an automatic switch,
+# so the user would be dropped at an error with no idea what to do. Carry on in a
+# fresh session instead, and say the thread was not restored.
+: > "$FAKE/.claude/projects/-tmp/sess-bad.jsonl"
+rm -f "$FAKE/.tries"
+fake_real '#!/bin/sh
+exit 129'
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "%s\n" "$*" >> "$HOME/.tries"
+case "$1" in --resume) echo "No conversation found"; exit 1 ;; esac
+echo "CCD-FRESH:$*"
+EOF
+chmod +x "$HB/ccd"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-bad","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
+case "$out" in
+  *"CCD-FRESH:go"*) ok "a resume that fails starts a fresh session instead of erroring" ;;
+  *) bad "resume fallback" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+case "$out" in
+  *"복원하지 못했습니다"*"--resume sess-bad"*) ok "...and says the thread is still there, with how to get it" ;;
+  *) bad "resume fallback" "silent about the lost thread" ;;
+esac
+[ "$(grep -c . "$FAKE/.tries" 2>/dev/null)" = "2" ] \
+  && ok "it retries exactly once, not in a loop" \
+  || bad "resume fallback" "ran $(grep -c . "$FAKE/.tries" 2>/dev/null) times"
+rm -f "$HSTATE" "$FAKE/.tries" "$FAKE/.claude/projects/-tmp/sess-bad.jsonl"
+
 # Worst case: something keeps re-arming the handoff while every launch exits 129.
 # Disarm alone cannot stop that, so MAX_HOPS is the backstop being tested here —
 # the fake claude re-arms on every run, exactly as a stuck quota signal would.
