@@ -74,12 +74,26 @@ Opt in once and the round trip stops needing you:
 ccd setup --auto
 ```
 
+That installs a launcher at `~/.claude/ccd/bin/claude` and asks before adding one
+line to your shell startup file, so your shell finds it first:
+
+```sh
+export PATH="$HOME/.claude/ccd/bin:$PATH"
+```
+
+It gets its own directory on purpose. `~/.local/bin/claude` is where the official
+installer already puts a symlink to the real binary — shadowing it there would
+break that link, and a Claude Code update would rewrite the symlink and silently
+remove the launcher. Say no to the prompt and ccd just prints the line for you;
+`--yes` answers it in advance. `ccd setup --no-auto` and `ccd uninstall` take
+both the launcher and that line back out.
+
 Then keep starting sessions the way you already do — `claude`, unchanged. When
 quota runs out, the conversation comes back on OpenRouter by itself; when the
 window resets, it returns to your subscription the same way. The statusline's
 ccd row tells you which backbone is answering and what it costs.
 
-How it works: `ccd setup --auto` puts a small launcher at `~/.local/bin/claude`
+How it works: the launcher
 that runs the real claude and watches its exit code. A `StopFailure` hook sees
 the `rate_limit` error, confirms against the quota reading, and ends the session
 with SIGHUP — Claude Code exits gracefully (code 129) after flushing, and the
@@ -102,7 +116,8 @@ What it will not do:
   it does not proxy or relay your login.
 
 Turn it off with `ccd setup --no-auto`; `ccd uninstall` removes it too. A
-`~/.local/bin/claude` that isn't ours is always left alone.
+`~/.claude/ccd/bin/claude` that isn't ours, and a PATH line we did not write,
+are always left alone.
 
 </details>
 

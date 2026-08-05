@@ -750,6 +750,7 @@ kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
 
 head_ "18. automatic handoff: launcher shim"
+SHIM="$FAKE/.claude/ccd/bin/claude"
 # The shim must be invisible until a handoff happens: every exit code other
 # than 129 passes through untouched.
 HB="$FAKE/.claude/plugins/cache/cc-donut/ccd/0.2.0/bin"
@@ -760,11 +761,11 @@ cat > "$HB/ccd" <<'EOF'
 echo "CCD-RESUMED:$*"
 EOF
 chmod +x "$HB/ccd"
-"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
-[ -x "$FAKE/.local/bin/claude" ] && ok "setup --auto installs the claude shim" \
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+[ -x "$SHIM" ] && ok "setup --auto installs the claude shim" \
   || bad "shim install" "not executable"
 "$ROOT/bin/ccd" setup >/dev/null 2>&1
-[ -x "$FAKE/.local/bin/claude" ] && ok "bare setup leaves the shim alone" || bad "bare setup removed the shim"
+[ -x "$SHIM" ] && ok "bare setup leaves the shim alone" || bad "bare setup removed the shim"
 
 # The launcher decides whether a relaunch is possible from its terminal state:
 # production always has one, and a session with no terminal must not be relaunched
@@ -776,45 +777,72 @@ chmod +x "$HB/ccd"
 cat > "$FAKE/ptyrun.py" <<'PYRUN'
 import os, pty, select, sys
 
-pid, fd = pty.fork()
+# Give the child a terminal without losing a byte of what it writes.
+#
+# pty.fork() is the obvious tool and the wrong one here: on Linux, once the last
+# slave fd closes, output the master has not read yet is discarded, so a launcher
+# that relaunches and exits quickly loses everything after the first leg. That is
+# a property of the harness, not of the code under test, and it made the suite
+# fail on Alpine for reasons that had nothing to do with the handoff.
+#
+# So the parent holds a slave fd open for the whole run: the stream cannot end
+# early, and draining continuously also keeps a chatty child from filling the
+# buffer and blocking. Only once the child is reaped and the pty has gone quiet
+# do we close our slave and finish.
+master, slave = pty.openpty()
+pid = os.fork()
 if pid == 0:
+    os.close(master)
+    # A session of its own with the slave as controlling terminal, so /dev/tty and
+    # job control behave as they would in a real terminal — openpty alone would
+    # only hand over tty-shaped file descriptors.
+    os.setsid()
+    try:
+        import fcntl, termios
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    except Exception:
+        pass
+    for target in (0, 1, 2):
+        os.dup2(slave, target)
+    if slave > 2:
+        os.close(slave)
     try:
         os.execvp(sys.argv[1], sys.argv[1:])
     except OSError:
         os._exit(127)
 
 def drain(timeout):
-    r, _, _ = select.select([fd], [], [], timeout)
+    """Copy one readable chunk. False when there was nothing to read."""
+    r, _, _ = select.select([master], [], [], timeout)
     if not r:
-        return True
+        return False
     try:
-        b = os.read(fd, 65536)
+        chunk = os.read(master, 65536)
     except OSError:
         return False
-    if not b:
+    if not chunk:
         return False
     # A pty turns every \n into \r\n; assertions compare against plain text.
-    sys.stdout.buffer.write(b.replace(b"\r\n", b"\n"))
+    sys.stdout.buffer.write(chunk.replace(b"\r\n", b"\n"))
     return True
 
 status = None
-while True:
-    alive = drain(0.1)
+while status is None:
+    if drain(0.05):
+        continue
     done, st = os.waitpid(pid, os.WNOHANG)
     if done == pid:
         status = st
-        while drain(0.05):
-            pass
-        break
-    if not alive:
-        _, status = os.waitpid(pid, 0)
-        break
+while drain(0.2):                # whatever the child wrote on its way out
+    pass
+os.close(slave)
+os.close(master)
 sys.stdout.buffer.flush()
 sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
 PYRUN
 shim_run() { python3 "$FAKE/ptyrun.py" "$@"; }
 
-SHIMPATH="$FAKE/.local/bin:$FAKE/realbin:$PATH"
+SHIMPATH="$FAKE/.claude/ccd/bin:$FAKE/realbin:$PATH"
 # Pin the launcher token so these tests know where its state file lives; a real
 # launch mints a random one. HSTATE is that path.
 export CCD_HANDOFF_TOKEN=00000000000000000000000000000001
@@ -823,25 +851,25 @@ fake_real() { printf '%s\n' "$1" > "$FAKE/realbin/claude"; chmod +x "$FAKE/realb
 
 fake_real '#!/bin/sh
 echo "REAL:$*"'
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" --flag 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" --flag 2>/dev/null)
 [ "$out" = "REAL:--flag" ] && ok "shim forwards argv to the real claude" || bad "argv forwarding" "got: $out"
 
 fake_real '#!/bin/sh
 exit 3'
-PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+PATH="$SHIMPATH" shim_run "$SHIM" >/dev/null 2>&1
 [ "$?" -eq 3 ] && ok "non-129 exit codes pass through unchanged" || bad "exit passthrough" "got: $?"
 
 # 129 can also mean a closing terminal. Without an armed handoff, don't invent one.
 fake_real '#!/bin/sh
 exit 129'
 hf_reset
-PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+PATH="$SHIMPATH" shim_run "$SHIM" >/dev/null 2>&1
 [ "$?" -eq 129 ] && ok "129 without an armed handoff does not relaunch" || bad "unarmed 129" "got: $?"
 
 # --resume only happens when the session actually has a transcript.
 mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-x.jsonl"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-x","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
   *"CCD-RESUMED:--resume sess-x"*) ok "armed 129 relaunches the conversation on ccd" ;;
   *) bad "handoff relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
@@ -855,7 +883,7 @@ fake_real '#!/bin/sh
 exit 129'
 : > "$FAKE/.claude/projects/-tmp/sess-y.jsonl"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-y","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
   *"REAL-RESUMED:--resume sess-y"*) ok "recovery relaunches on the subscription" ;;
   *) bad "subscription relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
@@ -877,7 +905,7 @@ exit 129
 EOF
 chmod +x "$HB/ccd"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+PATH="$SHIMPATH" shim_run "$SHIM" >/dev/null 2>&1
 hops=$(wc -l < "$FAKE/.hops" 2>/dev/null | tr -d ' ')
 # Exactly MAX_HOPS=3 launches: the third increment hits the cap and stops. An
 # exact count matters — a loose range would also pass if the loop stopped early
@@ -904,7 +932,7 @@ EOF
 chmod +x "$HB/ccd"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 # A 1s window makes each 2s session count as "long"; run briefly and count.
-( PATH="$SHIMPATH" CCD_HOP_RESET_SECONDS=1 shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1 ) &
+( PATH="$SHIMPATH" CCD_HOP_RESET_SECONDS=1 shim_run "$SHIM" >/dev/null 2>&1 ) &
 LOOPPID=$!
 sleep 11
 kill -9 $LOOPPID 2>/dev/null; wait $LOOPPID 2>/dev/null
@@ -918,7 +946,7 @@ rm -f "$HSTATE" "$FAKE/.hops2"
 mv "$FAKE/.claude/plugins/cache/cc-donut" "$FAKE/plugin-away"
 fake_real '#!/bin/sh
 echo "REAL-FALLBACK:$*"'
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" --z 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" --z 2>/dev/null)
 case "$out" in
   *"REAL-FALLBACK:--z"*) ok "missing plugin falls through to the real claude" ;;
   *) bad "plugin-missing fallback" "got: $out" ;;
@@ -926,23 +954,23 @@ esac
 mv "$FAKE/plugin-away" "$FAKE/.claude/plugins/cache/cc-donut"
 
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
-[ ! -e "$FAKE/.local/bin/claude" ] && ok "setup --no-auto removes the shim" || bad "--no-auto left the shim"
+[ ! -e "$SHIM" ] && ok "setup --no-auto removes the shim" || bad "--no-auto left the shim"
 # A claude the user installed themselves must survive uninstall.
-printf '#!/bin/sh\necho mine\n' > "$FAKE/.local/bin/claude"; chmod +x "$FAKE/.local/bin/claude"
+printf '#!/bin/sh\necho mine\n' > "$SHIM"; chmod +x "$SHIM"
 out=$("$ROOT/bin/ccd" uninstall 2>&1)
 case "$out" in
   *"not a ccd shim"*) ok "a foreign ~/.local/bin/claude is left alone" ;;
   *) bad "foreign claude warning" "got: $(printf '%s' "$out" | grep -i claude | head -1)" ;;
 esac
-[ -e "$FAKE/.local/bin/claude" ] && ok "foreign claude survives uninstall" || bad "deleted a foreign claude"
+[ -e "$SHIM" ] && ok "foreign claude survives uninstall" || bad "deleted a foreign claude"
 # Install must protect what uninstall protects — otherwise `setup --auto` deletes
 # exactly the file we refuse to remove.
-out=$("$ROOT/bin/ccd" setup --auto 2>&1)
+out=$("$ROOT/bin/ccd" setup --auto --yes 2>&1)
 case "$out" in
   *"not a ccd shim"*) ok "setup --auto refuses to clobber a foreign claude" ;;
   *) bad "install-side protection" "got: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
 esac
-[ "$(cat "$FAKE/.local/bin/claude")" = "$(printf '#!/bin/sh\necho mine')" ] \
+[ "$(cat "$SHIM")" = "$(printf '#!/bin/sh\necho mine')" ] \
   && ok "the foreign claude is byte-identical after a refused install" \
   || bad "foreign claude was modified"
 
@@ -950,16 +978,232 @@ esac
 # mentions ccd in a comment is still the user's file, so the check has to match
 # the whole signature line rather than a substring of it.
 printf '#!/bin/sh\n# my wrapper, sits in front of the ccd launcher\nexec /usr/bin/claude "$@"\n' \
-  > "$FAKE/.local/bin/claude"; chmod +x "$FAKE/.local/bin/claude"
-before=$(cat "$FAKE/.local/bin/claude")
-"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
-[ "$(cat "$FAKE/.local/bin/claude")" = "$before" ] \
+  > "$SHIM"; chmod +x "$SHIM"
+before=$(cat "$SHIM")
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+[ "$(cat "$SHIM")" = "$before" ] \
   && ok "a wrapper that merely mentions ccd is not claimed as ours" \
   || bad "ownership marker" "overwrote a foreign wrapper that mentioned ccd"
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
-[ -e "$FAKE/.local/bin/claude" ] && ok "...and --no-auto does not delete it either" \
+[ -e "$SHIM" ] && ok "...and --no-auto does not delete it either" \
   || bad "ownership marker" "deleted a foreign wrapper that mentioned ccd"
-rm -f "$FAKE/.local/bin/claude"
+rm -f "$SHIM"
+
+head_ "18b. automatic handoff: the PATH line"
+# The shim only works if its directory precedes the real claude, and that means
+# editing a startup file. Consent is explicit, the edit is exact, and removal
+# takes back only what we wrote.
+export SHELL=/bin/zsh
+RC="$FAKE/.zshrc"
+rm -f "$RC" "$SHIM"
+printf '# my own file\nexport EDITOR=vim\n' > "$RC"
+
+# No terminal and no --yes: say what is needed, change nothing.
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --auto 2>&1)
+case "$out" in
+  *"Skipped"*) ok "no terminal, no --yes → the startup file is left alone" ;;
+  *) bad "consent" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+[ "$(cat "$RC")" = "$(printf '# my own file\nexport EDITOR=vim')" ] \
+  && ok "the startup file is byte-identical after a skipped install" \
+  || bad "consent" "edited a startup file without being asked"
+[ -x "$SHIM" ] && ok "the shim is installed either way" || bad "shim install" "missing"
+
+# --yes carries the consent.
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>&1)
+grep -qxF 'export PATH="$HOME/.claude/ccd/bin:$PATH"' "$RC" \
+  && ok "--yes adds the PATH line" || bad "PATH line" "not added"
+grep -c 'ccd-auto-handoff-path' "$RC" | grep -qx 1 \
+  && ok "the line is written once, with its marker" || bad "PATH line" "marker count wrong"
+
+# Running it again must not stack duplicates.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+[ "$(grep -c 'ccd-auto-handoff-path' "$RC")" = "1" ] \
+  && ok "a second install does not duplicate the line" || bad "PATH line" "duplicated"
+
+# Removal takes back exactly two lines: the marker and the export.
+mine_before=$(grep -c 'EDITOR=vim' "$RC")
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ "$(grep -c 'ccd-auto-handoff-path' "$RC")" = "0" ] \
+  && ok "--no-auto removes the PATH line" || bad "PATH line" "left behind"
+grep -q 'ccd/bin:\$PATH' "$RC" && bad "PATH line" "export survived its marker" \
+  || ok "the export goes with its marker"
+[ "$(grep -c 'EDITOR=vim' "$RC")" = "$mine_before" ] \
+  && ok "lines we did not write are untouched" || bad "PATH line" "removed something else"
+
+# If the user edits the export under our marker, that line is theirs now. Take
+# the marker back and leave their edit standing — deleting a line we did not
+# write is the one failure this design exists to prevent.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+python3 - "$RC" <<'PYX'
+import sys
+p = sys.argv[1]
+lines = open(p).read().splitlines()
+i = lines.index('# ccd-auto-handoff-path v1 (managed by: ccd setup --auto)')
+lines[i + 1] = 'export PATH="$HOME/.claude/ccd/bin:$HOME/my/tools:$PATH"'   # user edit
+open(p, 'w').write('\n'.join(lines) + '\n')
+PYX
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+grep -q 'my/tools' "$RC" \
+  && ok "an edited export is left standing when the marker is removed" \
+  || bad "PATH line" "deleted a line the user had edited"
+[ "$(grep -c 'ccd-auto-handoff-path' "$RC")" = "0" ] \
+  && ok "...and the marker still goes" || bad "PATH line" "marker survived"
+python3 - "$RC" <<'PYX'
+import sys
+p = sys.argv[1]
+open(p, 'w').write('\n'.join(
+    l for l in open(p).read().splitlines() if 'my/tools' not in l) + '\n')
+PYX
+
+# Removal must find the line even when rc_file() would now answer differently —
+# bash reads different files for login and interactive shells, and a .bashrc
+# created after install would otherwise strand our line in the old one.
+rm -f "$FAKE/.bashrc" "$FAKE/.bash_profile" "$FAKE/.profile"
+printf '# login file\n' > "$FAKE/.bash_profile"     # rc_file() answers this one...
+SHELL=/bin/bash HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+if grep -q 'ccd-auto-handoff-path' "$FAKE/.bash_profile"; then
+  ok "bash install lands in the file rc_file chose"
+  printf '# interactive file\n' > "$FAKE/.bashrc"   # ...and now it answers this one
+  SHELL=/bin/bash HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+  grep -q 'ccd-auto-handoff-path' "$FAKE/.bash_profile" \
+    && bad "PATH line" "stranded in .bash_profile once .bashrc moved the rc target" \
+    || ok "removal finds the line even after the rc target moves"
+else
+  bad "PATH line" "bash install did not write to .bash_profile"
+fi
+rm -f "$FAKE/.bashrc" "$FAKE/.bash_profile" "$FAKE/.profile"
+export SHELL=/bin/zsh
+
+# Removing our line must never be able to ruin the file. Copying a rewrite back
+# over the original truncates it first; an interrupted copy would leave someone
+# with an empty startup file. Check the swap keeps content, mode, and symlinks.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
+printf '# top\nexport EDITOR=vim\n' > "$RC"; chmod 600 "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ "$(cat "$RC")" = "$(printf '# top\nexport EDITOR=vim')" ] \
+  && ok "the rewrite keeps every line it did not remove" \
+  || bad "atomic swap" "content changed: $(tr '\n' ' ' < "$RC")"
+[ "$(ls -l "$RC" | cut -c1-10)" = "-rw-------" ] \
+  && ok "the rewrite keeps the original file mode" \
+  || bad "atomic swap" "mode became $(ls -l "$RC" | cut -c1-10)"
+# A startup file that is a symlink must stay one.
+mkdir -p "$FAKE/dotfiles"; mv "$RC" "$FAKE/dotfiles/zshrc"; ln -s "$FAKE/dotfiles/zshrc" "$RC"
+rm -f "$FAKE/.claude/ccd/auto-path"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ -L "$RC" ] && ok "a symlinked startup file is still a symlink afterwards" \
+  || bad "atomic swap" "replaced the symlink instead of its target"
+grep -q 'EDITOR=vim' "$FAKE/dotfiles/zshrc" \
+  && ok "...and the file it points at kept its contents" \
+  || bad "atomic swap" "symlink target lost its contents"
+rm -f "$RC"; rm -rf "$FAKE/dotfiles"; printf '# my own file\nexport EDITOR=vim\n' > "$RC"
+
+# A rewrite that cannot happen must leave the file exactly as it was and say so,
+# rather than half-writing it. Only meaningful as a non-root user — root writes
+# through a read-only directory, so the containers skip this one.
+if [ "$(id -u)" -ne 0 ]; then
+  mkdir -p "$FAKE/ro"; printf '# theirs\n' > "$FAKE/ro/rc"
+  printf '\n%s\n%s\n' '# ccd-auto-handoff-path v1 (managed by: ccd setup --auto)' \
+    'export PATH="$HOME/.claude/ccd/bin:$PATH"' >> "$FAKE/ro/rc"
+  before=$(cat "$FAKE/ro/rc")
+  mkdir -p "$FAKE/.claude/ccd"; printf '%s\n' "$FAKE/ro/rc" > "$FAKE/.claude/ccd/auto-path"
+  chmod 500 "$FAKE/ro"                       # no new files: mktemp will fail
+  out=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto 2>&1)
+  chmod 700 "$FAKE/ro"
+  [ "$(cat "$FAKE/ro/rc")" = "$before" ] \
+    && ok "a rewrite that cannot be staged leaves the file untouched" \
+    || bad "atomic swap" "damaged a file it could not rewrite"
+  case "$out" in
+    *"could not rewrite"*) ok "...and reports the failure instead of claiming success" ;;
+    *) bad "atomic swap" "silent failure: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+  esac
+  [ -f "$FAKE/.claude/ccd/auto-path" ] \
+    && ok "the ownership record survives a failed removal, so a retry can find it" \
+    || bad "atomic swap" "dropped the record after failing to use it"
+  rm -rf "$FAKE/ro" "$FAKE/.claude/ccd/auto-path"
+fi
+
+# An edit that escapes the ownership record could never be removed, and setup
+# would still have claimed success. If the record cannot be written, the startup
+# file must not be touched at all.
+rm -rf "$FAKE/.claude/ccd/auto-path"
+mkdir -p "$FAKE/.claude/ccd/auto-path"        # a directory: appending will fail
+printf '# untouched\n' > "$RC"
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>&1)
+[ "$(cat "$RC")" = "# untouched" ] \
+  && ok "an unrecordable install leaves the startup file alone" \
+  || bad "ownership record" "edited a startup file it could not record"
+case "$out" in
+  *"could not record ownership"*) ok "...and says why instead of claiming success" ;;
+  *) bad "ownership record" "got: $(printf '%s' "$out" | grep -i 'added\|record' | head -1)" ;;
+esac
+rmdir "$FAKE/.claude/ccd/auto-path"
+
+# Nothing internal may leak onto stderr. A missing shell function still "works"
+# — bash treats command-not-found as false — so only stderr reveals it, and every
+# other test here redirects stderr away. This one exists to look at it.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
+err=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>&1 >/dev/null)
+case "$err" in
+  *"command not found"*|*"unbound variable"*|*"syntax error"*)
+    bad "setup stderr" "$(printf '%s' "$err" | head -1)" ;;
+  *) ok "setup --auto runs without shell errors on stderr" ;;
+esac
+# Same again on the path where the shim already leads PATH — a different branch.
+err=$(PATH="$FAKE/.claude/ccd/bin:$PATH" HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>&1 >/dev/null)
+case "$err" in
+  *"command not found"*|*"unbound variable"*)
+    bad "setup stderr" "$(printf '%s' "$err" | head -1)" ;;
+  *) ok "...and when the shim already leads PATH" ;;
+esac
+out=$(PATH="$FAKE/.claude/ccd/bin:$PATH" HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>/dev/null)
+case "$out" in
+  *"already first on PATH"*) ok "a shim that already leads PATH needs no line" ;;
+  *) bad "shim_leads_path" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+
+# The marker asserts ownership of a line WE appended. The same text sitting in
+# someone else'"'"'s file — inside a heredoc, a pasted snippet, documentation — is
+# their data, and editing it would break the promise the whole design rests on.
+cat > "$FAKE/.bashrc" <<'FIXTURE'
+cat > /tmp/example <<'INNER'
+# ccd-auto-handoff-path v1 (managed by: ccd setup --auto)
+export PATH="$HOME/.claude/ccd/bin:$PATH"
+INNER
+echo done
+FIXTURE
+fixture=$(cat "$FAKE/.bashrc")
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ "$(cat "$FAKE/.bashrc")" = "$fixture" ] \
+  && ok "a marker inside a heredoc is data, not ours to delete" \
+  || bad "candidate sweep" "edited a file ccd never wrote to"
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" uninstall 2>&1)
+[ "$(cat "$FAKE/.bashrc")" = "$fixture" ] \
+  && ok "uninstall leaves it alone too" || bad "uninstall" "edited a file ccd never wrote to"
+case "$out" in
+  *"left alone"*) ok "and says where the unowned line is" ;;
+  *) bad "candidate sweep" "silently ignored a marker it refused to touch" ;;
+esac
+rm -f "$FAKE/.bashrc"
+
+# A PATH entry the user wrote themselves has no marker, so we must not claim it.
+printf 'export PATH="$HOME/.claude/ccd/bin:$PATH"\n' >> "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+grep -q 'ccd/bin:\$PATH' "$RC" \
+  && ok "an unmarked PATH line the user wrote is left alone" \
+  || bad "PATH line" "deleted a line we did not write"
+
+# uninstall cleans up after itself too.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
+[ "$(grep -c 'ccd-auto-handoff-path' "$RC")" = "0" ] \
+  && ok "uninstall removes the PATH line" || bad "uninstall" "PATH line left behind"
+[ ! -e "$SHIM" ] && ok "uninstall removes the shim" || bad "uninstall" "shim left behind"
+rm -f "$RC"
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
 head_ "19. automatic handoff: readiness gates"
 # Each of these ends a session, so each must fail closed. A key ccd would later
@@ -1027,7 +1271,7 @@ rm -f "$FAKE/fakebin/curl" "$FAKE/.claude/ccd/handoff-00000000000000000000000000
 # A session that ended before its first exchange has no transcript, and
 # `--resume` on it fails with "No conversation found". Found by driving the real
 # thing under a pty: the handoff worked but landed the user on an error.
-"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 # Exit 129 the first time so the shim performs a handoff, then 0 so the loop
 # ends — without the second launch the relaunch would spin to the hop cap.
 fake_real '#!/bin/sh
@@ -1042,7 +1286,7 @@ EOF
 chmod +x "$HB/ccd"
 rm -rf "$FAKE/.claude/projects" "$FAKE/.been-here" "$HSTATE"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-new","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
   *"CCD:go"*) ok "a session with no transcript starts fresh instead of failing" ;;
   *) bad "no-transcript handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
@@ -1052,7 +1296,7 @@ mkdir -p "$FAKE/.claude/projects/-tmp"
 : > "$FAKE/.claude/projects/-tmp/sess-old.jsonl"
 rm -f "$FAKE/.been-here"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-old","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
   *"CCD:--resume sess-old"*) ok "an existing transcript is resumed, not discarded" ;;
   *) bad "transcript resume" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
@@ -1066,7 +1310,7 @@ rm -rf "$FAKE/.claude/projects" "$HSTATE"
 fake_real '#!/bin/sh
 echo "REAL-RAN"
 exit 0'
-out=$(PATH="$SHIMPATH" CCD_HANDOFF_TOKEN='../../escape' shim_run "$FAKE/.local/bin/claude" 2>&1)
+out=$(PATH="$SHIMPATH" CCD_HANDOFF_TOKEN='../../escape' shim_run "$SHIM" 2>&1)
 case "$out" in
   *"invalid CCD_HANDOFF_TOKEN"*) ok "a path-traversing token is refused" ;;
   *) bad "token validation" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
@@ -1083,7 +1327,7 @@ esac
 # cannot create. Signalling against state that was never written is exactly the
 # "session dies and never comes back" failure, so the shape check is on length too.
 long=$(printf 'a%.0s' $(seq 1 300))
-out=$(PATH="$SHIMPATH" CCD_HANDOFF_TOKEN="$long" shim_run "$FAKE/.local/bin/claude" 2>&1)
+out=$(PATH="$SHIMPATH" CCD_HANDOFF_TOKEN="$long" shim_run "$SHIM" 2>&1)
 case "$out" in
   *"invalid CCD_HANDOFF_TOKEN"*) ok "an over-long token is refused" ;;
   *) bad "token length check" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
@@ -1146,7 +1390,7 @@ chmod +x "$HB/ccd"
 fake_real '#!/bin/sh
 printf "REAL:%s\n" "$*"
 exit 129'
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
   *"CCD:"*) bad "cross-session handoff" "consumed another launcher's state" ;;
   *) ok "another session's handoff is never consumed" ;;
@@ -1160,7 +1404,7 @@ rm -f "$FAKE/.claude/ccd/handoff-000000000000000000000000000000ff.json"
 fake_real '#!/bin/sh
 exit 129'
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"sideways","session_id":"sess-q","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-out=$(PATH="$SHIMPATH" shim_run "$FAKE/.local/bin/claude" 2>&1)
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
 case "$out" in
   *"unrecognized handoff direction"*) ok "an unknown direction fails closed" ;;
   *) bad "unknown direction" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
@@ -1179,10 +1423,10 @@ head_ "20. automatic handoff: one launcher, never a nested one"
 # the real claude, but a nested launcher mints a token of its own. These tests
 # use the real bin/ccd deliberately — a stub that exits on its own cannot show
 # which claude the real one resolves.
-"$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 cp "$ROOT/bin/ccd" "$HB/ccd"; chmod +x "$HB/ccd"
 mkdir -p "$FAKE/realbin"
-NESTPATH="$FAKE/.local/bin:$FAKE/realbin:$PATH"
+NESTPATH="$FAKE/.claude/ccd/bin:$FAKE/realbin:$PATH"
 
 # Invoked straight from a shell, there is no launcher at all — so the claude ccd
 # execs must not have one either.
@@ -1227,7 +1471,7 @@ chmod +x "$FAKE/realbin/claude"
 mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-n.jsonl"
 rm -f "$FAKE/.tok1" "$FAKE/.tok2"
 PATH="$NESTPATH" OPENROUTER_API_KEY=sk-or-v1-smoketest CCD_HANDOFF_TOKEN= \
-  shim_run "$FAKE/.local/bin/claude" >/dev/null 2>&1
+  shim_run "$SHIM" >/dev/null 2>&1
 tok1=$(cat "$FAKE/.tok1" 2>/dev/null); tok2=$(cat "$FAKE/.tok2" 2>/dev/null)
 case "$tok1" in
   ''|'<none>') bad "fallback leg" "the first leg had no launcher token" ;;
@@ -1245,17 +1489,17 @@ rm -f "$FAKE/.claude/ccd"/handoff-*.json "$FAKE/.tok1" "$FAKE/.tok2"
 fake_real '#!/bin/sh
 exit 129'
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-out=$(PATH="$NESTPATH" shim_run "$FAKE/.local/bin/claude" -p hi 2>&1)
+out=$(PATH="$NESTPATH" shim_run "$SHIM" -p hi 2>&1)
 case "$out" in
   *"non-interactive run"*"ccd --resume sess-n"*) ok "a headless run is not relaunched, and says how to continue" ;;
   *) bad "headless handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 
 # `-p` is not the only way in: Claude Code also goes non-interactive when its
-# output is redirected. Relaunching that one lands the user in ccd'"'"'s no-terminal
+# output is redirected. Relaunching that one lands the user in ccd's no-terminal
 # refusal where they expected output, so no pty here — the point is its absence.
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-PATH="$NESTPATH" "$FAKE/.local/bin/claude" hello > "$FAKE/.piped" 2> "$FAKE/.piped-err"
+PATH="$NESTPATH" "$SHIM" hello > "$FAKE/.piped" 2> "$FAKE/.piped-err"
 case "$(cat "$FAKE/.piped-err")" in
   *"non-interactive run"*) ok "redirected output counts as headless too" ;;
   *) bad "non-tty handoff" "got: $(tr '\n' ' ' < "$FAKE/.piped-err" | head -c 90)" ;;
@@ -1295,7 +1539,7 @@ mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-r.
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-r","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$NESTPATH" CCD_HANDOFF_TOKEN=00000000000000000000000000000001 \
       ANTHROPIC_BASE_URL=https://openrouter.ai/api ANTHROPIC_AUTH_TOKEN=x CCD_ACTIVE=1 \
-      shim_run "$FAKE/.local/bin/claude" 2>/dev/null)
+      shim_run "$SHIM" 2>/dev/null)
 case "$out" in
   *LEAKED*) bad "recovery environment" "relaunched on the subscription still pointed at OpenRouter" ;;
   *"RECOVERED:--resume sess-r"*) ok "recovery relaunch clears the OpenRouter environment" ;;

@@ -690,26 +690,157 @@ PY
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────
-# Ownership of ~/.local/bin/claude decides whether we overwrite or delete a file
-# the user may have put there. A substring match is not good enough for that: a
-# hand-written wrapper with "ccd launcher" in a comment would be treated as ours.
-# Match the whole signature line, and keep this literal byte-identical to the one
-# in the generated shim below. Bounded read — the real claude may be a big binary.
+# The auto-handoff shim gets its own directory rather than ~/.local/bin, which is
+# where the official installer already puts `claude` — a symlink into
+# ~/.local/share/claude/versions/. Shadowing it there would break the only link to
+# the real binary, and a Claude Code update would rewrite that symlink and silently
+# remove the shim. Its own directory needs a PATH entry to be found, which is the
+# one line `ccd setup --auto` offers to add.
+CCD_SHIM_DIR="$CCD_DIR/bin"
+# Ownership decides whether we overwrite or delete a file the user may have put
+# there. A substring match is not good enough for that: a hand-written wrapper
+# with "ccd launcher" in a comment would be treated as ours. Match the whole
+# signature line, and keep this literal byte-identical to the one in the generated
+# shim below. Bounded read — the real claude may be a big binary.
 CCD_SHIM_SIG='# ccd-auto-handoff-shim v1 (managed by: ccd setup --auto)'
 is_ccd_shim() {
   [ -f "$1" ] || return 1
   head -c 4096 "$1" 2>/dev/null | grep -qxF "$CCD_SHIM_SIG"
 }
 
+# The PATH line is written as a marked pair so removal is exact — we never edit a
+# line we did not write.
+CCD_PATH_SIG='# ccd-auto-handoff-path v1 (managed by: ccd setup --auto)'
+CCD_PATH_LINE='export PATH="$HOME/.claude/ccd/bin:$PATH"'
+
+# Which startup file to edit. Only the shells whose syntax the line above is valid
+# in: fish and friends get told what to do rather than handed something broken.
+rc_file() {
+  case "${SHELL##*/}" in
+    zsh)  printf '%s' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash) if [ -f "$HOME/.bashrc" ]; then printf '%s' "$HOME/.bashrc"
+          elif [ -f "$HOME/.bash_profile" ]; then printf '%s' "$HOME/.bash_profile"
+          elif [ -f "$HOME/.profile" ]; then printf '%s' "$HOME/.profile"
+          else printf '%s' "$HOME/.bashrc"; fi ;;
+    *)    return 1 ;;
+  esac
+}
+
+# Removal must not depend on rc_file() answering the same way it did at install
+# time — bash reads different files for login and interactive shells, and a
+# ~/.bashrc created later would move the answer and strand our line in the old
+# file. So record every file we actually wrote to, and clean exactly those.
+CCD_PATH_TARGET="$CCD_DIR/auto-path"
+record_path_target() {
+  grep -qxF "$1" "$CCD_PATH_TARGET" 2>/dev/null && return 0
+  printf '%s\n' "$1" >> "$CCD_PATH_TARGET" 2>/dev/null
+}
+rc_candidates() {
+  printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.zshrc" \
+    "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"
+}
+
+# Is the shim already the first `claude` on PATH? Then nothing needs adding —
+# the user may well have wired it up themselves.
+shim_leads_path() {
+  local d c
+  local IFS=:
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    c="$d/claude"
+    { [ -x "$c" ] && [ ! -d "$c" ]; } || continue
+    is_ccd_shim "$c" && return 0
+    return 1
+  done
+  return 1
+}
+
+path_line_present() { [ -f "$1" ] && grep -qxF "$CCD_PATH_SIG" "$1"; }
+
+# Take back exactly what we wrote: our marker, and the line after it only when it
+# is still verbatim the export we put there. If the user edited that line it is
+# theirs now — drop the marker and leave their edit alone. Deleting a line we did
+# not write is the one failure mode this whole design exists to avoid.
+remove_path_line() {
+  local rc="$1" tmp target
+  path_line_present "$rc" || return 0
+  # Rewrite the file a symlink points at, rather than replacing the symlink.
+  target=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$rc" 2>/dev/null)
+  [ -n "$target" ] || target="$rc"
+  tmp=$(mktemp "$target.ccd.XXXXXX") || return 1
+  if ! awk -v sig="$CCD_PATH_SIG" -v line="$CCD_PATH_LINE" '
+    skip      { skip = 0; if ($0 == line) next }
+    $0 == sig { skip = 1; next }
+    { print }
+  ' "$target" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # Swap atomically. Copying back over the original would truncate it first, so a
+  # failure partway through would leave someone's startup file empty — the file
+  # is either the old one or the new one, never a ruin of both.
+  python3 - "$target" "$tmp" <<'CCD_SWAP' || { rm -f "$tmp"; return 1; }
+import os, shutil, sys
+target, tmp = sys.argv[1], sys.argv[2]
+shutil.copymode(target, tmp)
+try:
+    st = os.stat(target)
+    os.chown(tmp, st.st_uid, st.st_gid)
+except OSError:
+    pass          # not ours to give away; the mode is what matters
+os.replace(tmp, target)
+CCD_SWAP
+}
+
+# Clean the files we recorded writing to — and only those. The marker is an
+# ownership assertion in a line WE appended; the same text sitting in someone's
+# startup file (inside a heredoc, a docstring, a pasted snippet) is their data.
+# Editing it would break the promise this whole design rests on, so unrecorded
+# copies get pointed at, never touched.
+remove_path_line_everywhere() {
+  local f removed=1 failed=0
+  if [ -f "$CCD_PATH_TARGET" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      path_line_present "$f" || continue
+      if remove_path_line "$f"; then
+        printf '✓ PATH line removed from %s\n' "$f"
+        removed=0
+      else
+        printf '%s⚠ could not rewrite %s — remove the ccd PATH line by hand%s\n' "$ylw" "$f" "$r"
+        failed=1
+      fi
+    done <<RC_RECORDED
+$(awk '!seen[$0]++' "$CCD_PATH_TARGET" 2>/dev/null)
+RC_RECORDED
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -qxF "$f" "$CCD_PATH_TARGET" 2>/dev/null && continue
+    path_line_present "$f" \
+      && printf '%s⚠ a ccd PATH line also appears in %s — left alone, since we did not write it%s\n' \
+           "$ylw" "$f" "$r"
+  done <<RC_OTHERS
+$(rc_candidates)
+RC_OTHERS
+  # Keep the record when something failed, so a retry still knows where to look.
+  if [ "$failed" -eq 1 ]; then
+    return 1
+  fi
+  rm -f "$CCD_PATH_TARGET"
+  return "$removed"
+}
+
 setup() {
   local launcher="$HOME/.local/bin/ccd" statusline_launcher="$CCD_DIR/statusline-launcher.sh"
   local settings="$HOME/.claude/settings.json"
-  local auto=0
+  local auto=0 assume_yes=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --auto)    auto=1; shift ;;
       --no-auto) auto=-1; shift ;;
-      *) die "Usage: ccd setup [--auto|--no-auto]" ;;
+      --yes|-y)  assume_yes=1; shift ;;
+      *) die "Usage: ccd setup [--auto|--no-auto] [--yes]" ;;
     esac
   done
   mkdir -p "$HOME/.local/bin" "$CCD_DIR" "$HOME/.claude"
@@ -734,14 +865,15 @@ CCD_STATUSLINE_LAUNCHER
   # Automatic handoff is opt-in: it shadows the `claude` command, which is too
   # invasive to install without being asked. --auto installs, --no-auto removes,
   # and a bare `ccd setup` leaves whatever is already there alone.
-  local claude_shim="$HOME/.local/bin/claude"
+  local claude_shim="$CCD_SHIM_DIR/claude"
   case "$auto" in
     1)
-      # Never clobber a claude the user installed here themselves — uninstall
-      # protects it, so install must too, or we would delete what we refuse to.
+      mkdir -p "$CCD_SHIM_DIR"
+      # Never clobber a claude the user put here themselves — uninstall protects
+      # it, so install must too, or we would delete what we refuse to.
       if { [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; } \
          && ! is_ccd_shim "$claude_shim"; then
-        printf '%s✗ ~/.local/bin/claude already exists and is not a ccd shim — not touching it.%s\n' "$red" "$r" >&2
+        printf '%s✗ %s already exists and is not a ccd shim — not touching it.%s\n' "$red" "$claude_shim" "$r" >&2
         printf '  %sMove or remove it first, then re-run: ccd setup --auto%s\n' "$d" "$r" >&2
         return 1
       fi
@@ -771,14 +903,61 @@ fi
 CCD_SHIM_PATH="$self" exec "$t" "$@"
 CCD_CLAUDE_SHIM
       chmod +x "$claude_shim"
-      printf '✓ automatic handoff enabled — `claude` now hands off on quota exhaustion\n'
+      printf '✓ automatic handoff installed at %s\n' "$claude_shim"
+
+      # The shim is only reachable if its directory comes before the real claude
+      # on PATH. Ask before editing a startup file: --auto is consent to install
+      # the feature, not blanket consent to rewrite the user's dotfiles.
+      if shim_leads_path; then
+        printf '✓ already first on PATH — `claude` hands off on quota exhaustion\n'
+      else
+        local rc reply="" do_edit=0
+        if rc=$(rc_file) && ! path_line_present "$rc"; then
+          printf '\n  One line is still needed so your shell finds it first:\n'
+          printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+          # Consent, explicitly. With no terminal to ask at, do nothing and say
+          # so — a scripted install must not quietly rewrite a startup file.
+          if [ "$assume_yes" -eq 1 ]; then
+            do_edit=1
+          elif [ -t 0 ] && [ -t 1 ]; then
+            printf '  Add it to %s? %s[Y/n]%s ' "$rc" "$d" "$r"
+            read -r reply || reply=n
+            case "${reply:-y}" in y|Y|yes|YES) do_edit=1 ;; esac
+          fi
+          if [ "$do_edit" -eq 1 ]; then
+            # Record ownership BEFORE editing. Removal only ever touches files we
+            # recorded, so an edit that escaped the record could never be taken
+            # back out — and setup would still have claimed success. A record with
+            # no edit behind it is harmless by comparison: removal finds no marker.
+            if ! record_path_target "$rc" 2>/dev/null; then
+              printf '%s⚠ could not record ownership in %s — leaving %s alone.%s\n' \
+                "$ylw" "$CCD_PATH_TARGET" "$rc" "$r"
+              printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
+            elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
+              printf '✓ added to %s — open a new terminal, or: source %s\n' "$rc" "$rc"
+            else
+              printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$rc" "$r"
+            fi
+          else
+            printf '  %sSkipped. Add that line yourself, then open a new terminal.%s\n' "$d" "$r"
+          fi
+        elif [ -n "${rc:-}" ]; then
+          printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$rc"
+        else
+          printf '\n  %sAdd this to your shell startup file, then open a new terminal:%s\n' "$d" "$r"
+          printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+        fi
+      fi
       ;;
     -1)
       if is_ccd_shim "$claude_shim"; then
         rm "$claude_shim"; printf '✓ automatic handoff disabled\n'
       elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
-        printf '%s⚠ ~/.local/bin/claude is not a ccd shim — left alone%s\n' "$ylw" "$r"
+        printf '%s⚠ %s is not a ccd shim — left alone%s\n' "$ylw" "$claude_shim" "$r"
       fi
+      # Take the PATH line back out with the shim: an entry pointing at a
+      # directory we just emptied is litter in someone's startup file.
+      remove_path_line_everywhere || true
       ;;
   esac
 
@@ -896,13 +1075,14 @@ PY
   fi
   # The auto-handoff shim shadows `claude`, so removing it matters more than the
   # rest: leaving one behind after uninstall would keep intercepting every launch.
-  local claude_shim="$HOME/.local/bin/claude"
+  local claude_shim="$CCD_SHIM_DIR/claude"
   if is_ccd_shim "$claude_shim"; then
     rm "$claude_shim"
     printf '✓ automatic-handoff shim removed\n'
   elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
-    printf '⚠ ~/.local/bin/claude left alone — not a ccd shim\n'
+    printf '⚠ %s left alone — not a ccd shim\n' "$claude_shim"
   fi
+  remove_path_line_everywhere || true
   [ -e "$statusline_launcher" ] || [ -L "$statusline_launcher" ] && rm "$statusline_launcher"
   printf '✓ launchers removed\n'
 

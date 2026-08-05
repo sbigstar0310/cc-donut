@@ -74,13 +74,26 @@ ccd doctor    # ✓ OK = your spare is inflated and ready
 ccd setup --auto
 ```
 
+이 명령은 `~/.claude/ccd/bin/claude`에 launcher를 설치하고, 셸이 그걸 먼저 찾도록
+startup 파일에 한 줄을 추가해도 되는지 물어봅니다:
+
+```sh
+export PATH="$HOME/.claude/ccd/bin:$PATH"
+```
+
+전용 디렉터리를 쓰는 데는 이유가 있습니다. `~/.local/bin/claude`는 공식 설치
+프로그램이 진짜 바이너리로 가는 symlink를 이미 두는 자리라, 거길 덮으면 그 링크가
+끊기고 Claude Code가 업데이트될 때 symlink를 다시 쓰면서 launcher를 조용히
+지워버립니다. 물음에 아니라고 답하면 ccd는 그 줄을 출력만 하고, `--yes`를 붙이면
+미리 승낙한 것으로 봅니다. `ccd setup --no-auto`와 `ccd uninstall`은 launcher와 그
+줄을 함께 되돌립니다.
+
 그다음부터는 지금까지 하던 대로 `claude`로 시작하면 됩니다. quota가 소진되면
 대화가 알아서 OpenRouter로 넘어가고, window가 reset되면 같은 방식으로 구독으로
 돌아옵니다. 지금 어느 backbone이 답하고 있고 비용이 얼마인지는 statusline의 ccd
 행에 그대로 표시됩니다.
 
-동작 방식: `ccd setup --auto`는 `~/.local/bin/claude`에 작은 launcher를 둡니다.
-이 launcher가 진짜 claude를 실행하고 종료 코드를 지켜봅니다. `StopFailure` hook이
+동작 방식: 이 launcher가 진짜 claude를 실행하고 종료 코드를 지켜봅니다. `StopFailure` hook이
 `rate_limit` 오류를 보고 quota 관측치와 대조한 뒤 SIGHUP으로 세션을 끝내면, Claude
 Code는 flush를 마치고 정상 종료(코드 129)하며, launcher가 같은 대화를 반대편
 backbone에서 다시 엽니다.
@@ -102,7 +115,7 @@ backbone에서 다시 엽니다.
   중계하지 않습니다.
 
 끄려면 `ccd setup --no-auto`, `ccd uninstall`로도 제거됩니다. 우리가 만들지 않은
-`~/.local/bin/claude`는 언제나 그대로 둡니다.
+`~/.claude/ccd/bin/claude`와, 우리가 쓰지 않은 PATH 줄은 언제나 그대로 둡니다.
 
 </details>
 
