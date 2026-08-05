@@ -793,8 +793,75 @@ case "$row" in
 esac
 [ -s "$FAKE/.claude/ccd/.dashboard-row" ] \
   && ok "...and remembers them for next time" || bad "statusline" "nothing cached"
+# A statusline renders on every prompt and tool call. Without single-flight, a
+# stalled dashboard would leave a new `node` behind on each render, and two that
+# finished out of order would let the older row win.
+printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+cat > "$FAKE/fakebin/node" <<'EOF'
+#!/bin/sh
+sleep 30
+echo "SLOW-ROW"
+EOF
+chmod +x "$FAKE/fakebin/node"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 \
+    "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
+done
+sleep 1
+children=$(pgrep -f "$FAKE/fakebin/node" 2>/dev/null | wc -l | tr -d ' ')
+[ "${children:-0}" -le 1 ] \
+  && ok "ten renders against a stalled dashboard leave at most one child ($children)" \
+  || bad "statusline fan-out" "$children dashboard children alive"
+[ -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
+  && ok "the refresh holds a lock while it runs" || bad "single-flight" "no lock"
+pkill -f "$FAKE/fakebin/node" 2>/dev/null
+rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+
+# A child that hangs must not outlive the row it was fetched for.
+printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 CCD_DASH_TIMEOUT=1 \
+  "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
+sleep 3
+[ "$(pgrep -f "$FAKE/fakebin/node" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && ok "a hung dashboard child is killed by the watchdog" \
+  || bad "watchdog" "child survived its timeout"
+[ ! -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
+  && ok "...and the lock is released with it" || bad "watchdog" "lock leaked"
+
+# A lock left behind by a killed refresher must not freeze refreshes forever.
+mkdir -p "$FAKE/.claude/ccd/.dashboard-row.lock"
+python3 -c "import os,sys;os.utime(sys.argv[1], (0, 0))" "$FAKE/.claude/ccd/.dashboard-row.lock"
+cat > "$FAKE/fakebin/node" <<'EOF'
+#!/bin/sh
+echo "REFRESHED-ROW"
+EOF
+chmod +x "$FAKE/fakebin/node"
+printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 \
+  "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
+# Wait for the refresh rather than guessing at it: a container can take a second
+# or two to get a detached child scheduled, and a fixed sleep turns that into a
+# flake that looks like a product bug.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  grep -q 'REFRESHED-ROW' "$FAKE/.claude/ccd/.dashboard-row" 2>/dev/null && break
+  sleep 0.5
+done
+grep -q 'REFRESHED-ROW' "$FAKE/.claude/ccd/.dashboard-row" \
+  && ok "a stale lock is reclaimed instead of blocking refreshes forever" \
+  || bad "stale lock" "refresh never ran again"
+
+# Staleness has a ceiling: past it, the render pays rather than showing a lie.
+printf 'ANCIENT-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+python3 -c "import os,sys;os.utime(sys.argv[1], (0, 0))" "$FAKE/.claude/ccd/.dashboard-row"
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 \
+      "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in
+  *"REFRESHED-ROW"*) ok "a row too old to stand behind is fetched fresh instead" ;;
+  *"ANCIENT-ROW"*) bad "staleness" "served a row with no upper bound on its age" ;;
+  *) bad "staleness" "got: $(printf '%s' "$row" | head -c 60)" ;;
+esac
+
 cp "$FAKE/node.real" "$FAKE/fakebin/node"; chmod +x "$FAKE/fakebin/node"
-rm -f "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/node.real"
+rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock" "$FAKE/node.real"
 
 head_ "18. automatic handoff: launcher shim"
 SHIM="$FAKE/.claude/ccd/bin/claude"

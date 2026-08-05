@@ -32,20 +32,53 @@ orig=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/d
 # broken rather than a number being a few seconds old. So serve the last rows we
 # saw and refresh behind them: slightly stale beats absent.
 DASH_CACHE="$CCD_DIR/.dashboard-row"
+DASH_LOCK="$CCD_DIR/.dashboard-row.lock"
+# Tunable only so the test suite can reach both sides of each bound in seconds
+# rather than minutes; nothing in normal use sets them.
+DASH_MAX_STALE=${CCD_DASH_MAX_STALE:-300}   # older than this, pay for a fresh read
+DASH_TIMEOUT=${CCD_DASH_TIMEOUT:-10}        # a hung child must not outlive its row
+
+# Seconds since a file was written, or a large number when it is absent. python3
+# rather than stat(1): the -f/-c split between BSD and GNU has bitten this repo
+# before, and python3 is already a hard dependency here.
+dash_age() {
+  python3 -c 'import os,sys,time
+try: print(int(time.time() - os.path.getmtime(sys.argv[1])))
+except OSError: print(999999)' "$1" 2>/dev/null || echo 999999
+}
+
 base=""
 if [ -n "$orig" ]; then
-  if [ -s "$DASH_CACHE" ]; then
+  age=$(dash_age "$DASH_CACHE")
+  if [ -s "$DASH_CACHE" ] && [ "$age" -le "$DASH_MAX_STALE" ]; then
     base=$(cat "$DASH_CACHE" 2>/dev/null)
-    # Refresh for the next render. Detached, so a slow call costs this one nothing.
-    (
-      fresh=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
-      if [ -n "$fresh" ]; then
+    # Refresh for the next render, exactly once at a time. A statusline renders on
+    # every prompt and tool call, so without this a stalled dashboard would leave
+    # a new `node` behind on each one, and two that finish out of order would let
+    # the older row win. mkdir is the atomic test-and-set; a lock left by a killed
+    # refresher is reclaimed once it is older than the timeout it lived under.
+    lock_age=$(dash_age "$DASH_LOCK")
+    [ "$lock_age" -gt "$((DASH_TIMEOUT * 3))" ] && rmdir "$DASH_LOCK" 2>/dev/null
+    if mkdir "$DASH_LOCK" 2>/dev/null; then
+      (
+        trap 'rmdir "$DASH_LOCK" 2>/dev/null' EXIT
         tmp=$(mktemp "$DASH_CACHE.XXXXXX" 2>/dev/null) || exit 0
-        printf '%s' "$fresh" > "$tmp" && mv -f "$tmp" "$DASH_CACHE" 2>/dev/null || rm -f "$tmp"
-      fi
-    ) >/dev/null 2>&1 &
+        printf '%s' "$payload" | node "$orig" > "$tmp" 2>/dev/null &
+        node_pid=$!
+        ( sleep "$DASH_TIMEOUT"; kill -9 "$node_pid" 2>/dev/null ) 2>/dev/null &
+        watchdog=$!
+        wait "$node_pid"; node_rc=$?
+        kill "$watchdog" 2>/dev/null
+        if [ "$node_rc" -eq 0 ] && [ -s "$tmp" ]; then
+          mv -f "$tmp" "$DASH_CACHE" 2>/dev/null || rm -f "$tmp"
+        else
+          rm -f "$tmp"
+        fi
+      ) >/dev/null 2>&1 &
+    fi
   else
-    # Nothing cached yet: this one render pays for it, so the rows exist at all.
+    # No cache, or one too old to stand behind: this render pays for it, so the
+    # rows are never absent and never unboundedly stale.
     base=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
     [ -n "$base" ] && printf '%s' "$base" > "$DASH_CACHE" 2>/dev/null
   fi

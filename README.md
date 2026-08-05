@@ -39,7 +39,9 @@ Slash commands are parsed **one line at a time** — enter each separately (past
 
 ## What it does
 
-When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset (it re-checks on each interaction) and hands you the exact command to switch back. Not your forever ride. Just enough donut to get home.
+When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset and takes you back to your subscription. Not your forever ride. Just enough donut to get home.
+
+Two commands each way, or [none at all](#automatic-handoff) — `ccd setup --auto` and the round trip stops needing you.
 
 ## Before / After
 
@@ -57,8 +59,9 @@ AUTO     quota dies    → 🍩 donut goes on by itself      (ccd setup --auto)
 Set it up **while you still have quota** — after zero, Claude can't walk you through it:
 
 ```sh
-ccd key       # store your OpenRouter key (hidden input, never enters chat)
-ccd doctor    # ✓ OK = your spare is inflated and ready
+ccd key           # store your OpenRouter key (hidden input, never enters chat)
+ccd doctor        # ✓ OK = your spare is inflated and ready
+ccd setup --auto  # optional: hand off by itself, both ways
 ```
 
 That's everything you need. Details below when you want them.
