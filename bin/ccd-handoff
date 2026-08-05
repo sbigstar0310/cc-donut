@@ -211,10 +211,14 @@ while :; do
   case "$dir" in
     to_fallback)
       if [ "$resumed" -eq 1 ]; then
-        printf '\n\033[33m▶ 🍩 도넛 장착 — 같은 대화를 OpenRouter에서 이어갑니다\033[0m\n'
+        printf '\n\033[33m▶ 🍩 Claude 쿼타 소진 — 도넛으로 갈아끼웁니다\033[0m\n'
+        printf '\033[33m   같은 대화를 그대로 OpenRouter에서 이어갑니다 (여기부터 OpenRouter 유료 사용)\033[0m\n'
+        printf '\033[2m   쿼타가 회복되면 구독으로 자동 복귀합니다 — 입력할 건 없습니다\033[0m\n'
         args=(--resume "$sid")
       else
-        printf '\n\033[33m▶ 🍩 도넛 장착 — OpenRouter로 전환합니다\033[0m\n'
+        printf '\n\033[33m▶ 🍩 Claude 쿼타 소진 — 도넛으로 갈아끼웁니다\033[0m\n'
+        printf '\033[33m   OpenRouter에서 새 세션으로 시작합니다 (여기부터 OpenRouter 유료 사용)\033[0m\n'
+        printf '\033[2m   쿼타가 회복되면 구독으로 자동 복귀합니다 — 입력할 건 없습니다\033[0m\n'
         args=(go)
       fi
       backbone=fallback
@@ -233,10 +237,11 @@ while :; do
             CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_OUTPUT_TOKENS \
             CCD_ACTIVE 2>/dev/null || true
       if [ "$resumed" -eq 1 ]; then
-        printf '\n\033[32m▶ ✓ 구독으로 복귀 — 같은 대화를 이어갑니다\033[0m\n'
+        printf '\n\033[32m▶ ✓ Claude 쿼타 회복 — 구독으로 돌아왔습니다\033[0m\n'
+        printf '\033[32m   같은 대화를 그대로 이어갑니다 (OpenRouter 과금 종료)\033[0m\n'
         args=(--resume "$sid")
       else
-        printf '\n\033[32m▶ ✓ 구독으로 복귀합니다\033[0m\n'
+        printf '\n\033[32m▶ ✓ Claude 쿼타 회복 — 구독으로 돌아왔습니다 (OpenRouter 과금 종료)\033[0m\n'
         args=()
       fi
       backbone=subscription

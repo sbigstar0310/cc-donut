@@ -440,9 +440,28 @@ status() {
   tier_row "sonnet" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "default · everyday coding"
   tier_row "opus"   "$ANTHROPIC_DEFAULT_OPUS_MODEL"   "hard decisions · debugging"
 
-  printf '\n%sWhen quota runs out — these two commands%s\n' "$b" "$r"
-  printf '  %s1. /exit%s        End the current session %s(required)%s\n' "$b" "$r" "$d" "$r"
-  printf '  %s2. ccd -c%s       In the same terminal; restores the conversation\n' "$b" "$r"
+  # What to do when quota dies depends on whether anything will do it for you.
+  # Telling someone who turned automation ON to type the manual commands is the
+  # kind of small lie that makes people distrust the automation.
+  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
+    printf '\n%sWhen quota runs out%s %s(automatic handoff is on)%s\n' "$b" "$r" "$grn" "$r"
+    if shim_leads_path; then
+      printf '  %sNothing to type.%s The conversation moves to OpenRouter by itself,\n' "$grn" "$r"
+      printf '  and returns to your subscription when the window resets.\n'
+      # The manual route still works and always will. Automation you cannot step
+      # around is worse than no automation — show the way out, quietly.
+      printf '  %sIf it ever does not fire: /exit, then ccd -c (the manual route still works)%s\n' "$d" "$r"
+    else
+      printf '  %s⚠ installed, but not active in this shell.%s Open a new terminal, or:\n' "$ylw" "$r"
+      printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+    fi
+    printf '  %sTurn it off with: ccd setup --no-auto%s\n' "$d" "$r"
+  else
+    printf '\n%sWhen quota runs out — these two commands%s\n' "$b" "$r"
+    printf '  %s1. /exit%s        End the current session %s(required)%s\n' "$b" "$r" "$d" "$r"
+    printf '  %s2. ccd -c%s       In the same terminal; restores the conversation\n' "$b" "$r"
+    printf '  %sWant this to happen by itself next time? Run: ccd setup --auto%s\n' "$d" "$r"
+  fi
   printf '\n%sOther commands%s\n' "$b" "$r"
   printf '  %sccd pick%s        Change the three model slots\n' "$b" "$r"
   printf '  %sccd models%s      Full catalog and prices\n' "$b" "$r"
@@ -696,6 +715,10 @@ PY
 # the real binary, and a Claude Code update would rewrite that symlink and silently
 # remove the shim. Its own directory needs a PATH entry to be found, which is the
 # one line `ccd setup --auto` offers to add.
+# Paths in messages read better as ~/... than as /Users/someone/... — these lines
+# are about a file the user may want to look at, not about being precise.
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
 CCD_SHIM_DIR="$CCD_DIR/bin"
 # Ownership decides whether we overwrite or delete a file the user may have put
 # there. A substring match is not good enough for that: a hand-written wrapper
@@ -804,10 +827,10 @@ remove_path_line_everywhere() {
       [ -n "$f" ] || continue
       path_line_present "$f" || continue
       if remove_path_line "$f"; then
-        printf '✓ PATH line removed from %s\n' "$f"
+        printf '✓ PATH line removed from %s\n' "$(tilde "$f")"
         removed=0
       else
-        printf '%s⚠ could not rewrite %s — remove the ccd PATH line by hand%s\n' "$ylw" "$f" "$r"
+        printf '%s⚠ could not rewrite %s — remove the ccd PATH line by hand%s\n' "$ylw" "$(tilde "$f")" "$r"
         failed=1
       fi
     done <<RC_RECORDED
@@ -819,7 +842,7 @@ RC_RECORDED
     grep -qxF "$f" "$CCD_PATH_TARGET" 2>/dev/null && continue
     path_line_present "$f" \
       && printf '%s⚠ a ccd PATH line also appears in %s — left alone, since we did not write it%s\n' \
-           "$ylw" "$f" "$r"
+           "$ylw" "$(tilde "$f")" "$r"
   done <<RC_OTHERS
 $(rc_candidates)
 RC_OTHERS
@@ -873,7 +896,7 @@ CCD_STATUSLINE_LAUNCHER
       # it, so install must too, or we would delete what we refuse to.
       if { [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; } \
          && ! is_ccd_shim "$claude_shim"; then
-        printf '%s✗ %s already exists and is not a ccd shim — not touching it.%s\n' "$red" "$claude_shim" "$r" >&2
+        printf '%s✗ %s already exists and is not a ccd shim — not touching it.%s\n' "$red" "$(tilde "$claude_shim")" "$r" >&2
         printf '  %sMove or remove it first, then re-run: ccd setup --auto%s\n' "$d" "$r" >&2
         return 1
       fi
@@ -903,7 +926,10 @@ fi
 CCD_SHIM_PATH="$self" exec "$t" "$@"
 CCD_CLAUDE_SHIM
       chmod +x "$claude_shim"
-      printf '✓ automatic handoff installed at %s\n' "$claude_shim"
+      printf '✓ automatic handoff installed at %s\n' "$(tilde "$claude_shim")"
+      printf '  %sWhen your Claude quota runs out, sessions continue on OpenRouter —%s\n' "$d" "$r"
+      printf '  %spaid per token with your own key — and return to your subscription%s\n' "$d" "$r"
+      printf '  %sby themselves when the quota resets.%s\n' "$d" "$r"
 
       # The shim is only reachable if its directory comes before the real claude
       # on PATH. Ask before editing a startup file: --auto is consent to install
@@ -920,7 +946,7 @@ CCD_CLAUDE_SHIM
           if [ "$assume_yes" -eq 1 ]; then
             do_edit=1
           elif [ -t 0 ] && [ -t 1 ]; then
-            printf '  Add it to %s? %s[Y/n]%s ' "$rc" "$d" "$r"
+            printf '  Add it to %s? %s[Y/n]%s ' "$(tilde "$rc")" "$d" "$r"
             read -r reply || reply=n
             case "${reply:-y}" in y|Y|yes|YES) do_edit=1 ;; esac
           fi
@@ -931,18 +957,20 @@ CCD_CLAUDE_SHIM
             # no edit behind it is harmless by comparison: removal finds no marker.
             if ! record_path_target "$rc" 2>/dev/null; then
               printf '%s⚠ could not record ownership in %s — leaving %s alone.%s\n' \
-                "$ylw" "$CCD_PATH_TARGET" "$rc" "$r"
+                "$ylw" "$(tilde "$CCD_PATH_TARGET")" "$(tilde "$rc")" "$r"
               printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
             elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
-              printf '✓ added to %s — open a new terminal, or: source %s\n' "$rc" "$rc"
+              printf '✓ added to %s\n' "$(tilde "$rc")"
+              printf '  %sThat line only reaches shells started from now on — open a new%s\n' "$d" "$r"
+              printf '  %sterminal, or run: source %s%s\n' "$d" "$(tilde "$rc")" "$r"
             else
-              printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$rc" "$r"
+              printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
             fi
           else
             printf '  %sSkipped. Add that line yourself, then open a new terminal.%s\n' "$d" "$r"
           fi
         elif [ -n "${rc:-}" ]; then
-          printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$rc"
+          printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
         else
           printf '\n  %sAdd this to your shell startup file, then open a new terminal:%s\n' "$d" "$r"
           printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
@@ -953,7 +981,7 @@ CCD_CLAUDE_SHIM
       if is_ccd_shim "$claude_shim"; then
         rm "$claude_shim"; printf '✓ automatic handoff disabled\n'
       elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
-        printf '%s⚠ %s is not a ccd shim — left alone%s\n' "$ylw" "$claude_shim" "$r"
+        printf '%s⚠ %s is not a ccd shim — left alone%s\n' "$ylw" "$(tilde "$claude_shim")" "$r"
       fi
       # Take the PATH line back out with the shim: an entry pointing at a
       # directory we just emptied is litter in someone's startup file.
@@ -999,7 +1027,7 @@ PY
 
   printf '✓ ccd command installed (~/.local/bin/ccd)\n'
   printf '✓ statusline wired — dashboard output preserved\n'
-  printf '→ No restart needed: /reload-plugins activates the hooks; the statusline appears on your next interaction\n'
+  printf '→ This session: /reload-plugins activates the hooks; the statusline appears on your next interaction\n'
   case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) printf '→ Add to PATH: export PATH="$HOME/.local/bin:$PATH"\n' ;; esac
   if python3 - "$KEYS" <<'PY' >/dev/null 2>&1
 import re, sys
@@ -1080,7 +1108,7 @@ PY
     rm "$claude_shim"
     printf '✓ automatic-handoff shim removed\n'
   elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
-    printf '⚠ %s left alone — not a ccd shim\n' "$claude_shim"
+    printf '⚠ %s left alone — not a ccd shim\n' "$(tilde "$claude_shim")"
   fi
   remove_path_line_everywhere || true
   [ -e "$statusline_launcher" ] || [ -L "$statusline_launcher" ] && rm "$statusline_launcher"
@@ -1246,7 +1274,12 @@ printf '   haiku %s / sonnet %s / opus %s\n' \
   "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"
 printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
 printf '%s   Statusline adds: model·effort │ price per 1M │ run cost. Updates on prompts/tools.%s\n' "$d" "$r"
-printf '%s   To return to the subscription, /exit then run claude in the same terminal. Never /logout.%s\n' "$d" "$r"
+if [ -n "${CCD_HANDOFF:-}" ]; then
+  printf '%s   구독 복귀는 자동입니다 — 쿼타가 회복되면 알아서 돌아갑니다. /logout은 절대 금지.%s\n' "$d" "$r"
+  printf '%s   자동 복귀가 안 되면: /exit 후 같은 터미널에서 claude (수동 경로는 그대로 살아 있습니다)%s\n' "$d" "$r"
+else
+  printf '%s   To return to the subscription, /exit then run claude in the same terminal. Never /logout.%s\n' "$d" "$r"
+fi
 
 # Warm the curated Pareto/default set only after visible launch feedback. These
 # detached writers share ccd-price-fetch's lock/atomic merge path with statusline

@@ -115,6 +115,10 @@ What it will not do:
 - **Your subscription credential is never touched.** ccd replaces the process,
   it does not proxy or relay your login.
 
+The manual route is not replaced. `/exit` then `ccd -c` still works exactly as
+before, and stays documented — automation you cannot step around is worse than
+none, so if a handoff ever fails to fire you take the two commands and carry on.
+
 Turn it off with `ccd setup --no-auto`; `ccd uninstall` removes it too. A
 `~/.claude/ccd/bin/claude` that isn't ours, and a PATH line we did not write,
 are always left alone.
