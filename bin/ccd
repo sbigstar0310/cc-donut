@@ -540,6 +540,27 @@ doctor() {
   # Context budget per slot: refresh each slug's provider data, then report what
   # apply_tiers will do. Rows show each model's own ceiling; the footer shows the
   # one process-wide window Claude Code actually uses (smallest hinted ceiling).
+  # "Why did nothing happen?" is the question the first user test ended on.
+  # Installed is not active, and active in some shell is not supervising THIS one.
+  printf '\n%sAutomatic handoff%s\n' "$b" "$r"
+  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
+    printf '  %s✓%s installed at %s\n' "$grn" "$r" "$(tilde "$CCD_SHIM_DIR/claude")"
+    if shim_leads_path; then
+      printf '  %s✓%s active in this shell — `claude` starts the supervised launcher\n' "$grn" "$r"
+    else
+      printf '  %s✗ not active in this shell%s — `claude` here is the plain one\n' "$red" "$r"
+      printf '      %sOpen a new terminal, or run: %s%s\n' "$d" "$CCD_PATH_LINE" "$r"
+    fi
+    if [ -n "${CCD_HANDOFF:-}" ]; then
+      printf '  %s✓%s this session is supervised — a quota handoff will fire here\n' "$grn" "$r"
+    elif [ -n "${CLAUDECODE:-}" ]; then
+      printf '  %s✗ this session is NOT supervised%s — nothing will hand off from here\n' "$red" "$r"
+      printf '      %sIt started before the launcher was on PATH. /exit, then run claude again.%s\n' "$d" "$r"
+    fi
+  else
+    printf '  %s· off%s — turn it on with: ccd setup --auto\n' "$d" "$r"
+  fi
+
   printf '\n%sContext budget per slot%s %s([1m] on sonnet/opus; auto-compact = smallest verified pool − headroom)%s\n' "$b" "$d" "$r"
   local slot sm base refreshed ceiling cw hinted_bases=""
   for slot in HAIKU SONNET OPUS; do
@@ -857,7 +878,7 @@ RC_OTHERS
 setup() {
   local launcher="$HOME/.local/bin/ccd" statusline_launcher="$CCD_DIR/statusline-launcher.sh"
   local settings="$HOME/.claude/settings.json"
-  local auto=0 assume_yes=0
+  local auto=0 assume_yes=0 auto_next=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --auto)    auto=1; shift ;;
@@ -969,8 +990,7 @@ CCD_CLAUDE_SHIM
               printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
             elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
               printf '✓ added to %s\n' "$(tilde "$rc")"
-              printf '  %sThat line only reaches shells started from now on — open a new%s\n' "$d" "$r"
-              printf '  %sterminal, or run: source %s%s\n' "$d" "$(tilde "$rc")" "$r"
+              auto_next="source $(tilde "$rc")"
             else
               printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
             fi
@@ -1049,6 +1069,13 @@ if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'": value = valu
 raise SystemExit(0 if value else 1)
 PY
   then printf '→ Verify anytime: ccd doctor\n'; else printf '→ Before quota runs out: set your OpenRouter key with `ccd key`\n'; fi
+  # Last line on screen, because it is the only one that still needs doing. Buried
+  # mid-output it reads as trivia — which is how someone ends up testing a handoff
+  # in a shell that never had the launcher on PATH.
+  if [ -n "$auto_next" ]; then
+    printf '\n%s→ One thing left: that PATH line only reaches shells started from now on.%s\n' "$b" "$r"
+    printf '%s     Open a new terminal, or run:  %s%s\n' "$b" "$auto_next" "$r"
+  fi
 }
 
 uninstall() {

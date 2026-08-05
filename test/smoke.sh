@@ -1288,6 +1288,44 @@ case "$out" in
 esac
 rm -f "$FAKE/.bashrc"
 
+# "Why did nothing happen?" ended the first user test. Installed is not active,
+# and active in some shell is not supervising THIS session — doctor has to be
+# able to tell those three apart, because that is the whole diagnosis.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
+"$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+out=$("$ROOT/bin/ccd" doctor 2>&1 | sed -n '/Automatic handoff/,/^$/p')
+case "$out" in
+  *"off"*"ccd setup --auto"*) ok "doctor: off says how to turn it on" ;;
+  *) bad "doctor handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+out=$(CLAUDECODE=1 "$ROOT/bin/ccd" doctor 2>&1 | sed -n '/Automatic handoff/,/^$/p')
+case "$out" in
+  *"not active in this shell"*"NOT supervised"*)
+    ok "doctor: installed but inactive says both, and why" ;;
+  *) bad "doctor handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+out=$(CLAUDECODE=1 CCD_HANDOFF=0123456789abcdef0123456789abcdef \
+      PATH="$FAKE/.claude/ccd/bin:$PATH" "$ROOT/bin/ccd" doctor 2>&1 \
+      | sed -n '/Automatic handoff/,/^$/p')
+case "$out" in
+  *"active in this shell"*"is supervised"*)
+    case "$out" in
+      *"not active"*|*"NOT supervised"*) bad "doctor handoff" "reported ready and not-ready at once" ;;
+      *) ok "doctor: a supervised session is reported as ready" ;;
+    esac ;;
+  *) bad "doctor handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+
+# The one thing still to do must be the LAST line, not buried between checkmarks.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path"; printf '# mine\n' > "$RC"
+"$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+last=$("$ROOT/bin/ccd" setup --auto --yes 2>&1 | grep -v '^$' | tail -1)
+case "$last" in
+  *"Open a new terminal"*) ok "the remaining step is the last line of setup" ;;
+  *) bad "setup ordering" "last line was: $(printf '%s' "$last" | head -c 70)" ;;
+esac
+
 # A PATH entry the user wrote themselves has no marker, so we must not claim it.
 printf 'export PATH="$HOME/.claude/ccd/bin:$PATH"\n' >> "$RC"
 HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
