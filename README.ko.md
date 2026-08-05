@@ -39,7 +39,9 @@ claude plugin install ccd@cc-donut
 
 ## What it does
 
-Claude quota가 바닥나도 cc-donut은 도구, hook, skill, MCP server, 그리고 **지금 대화 자체**를 유지한 채 모델만 OpenRouter로 바꿉니다. 스페어타이어는 본래 임시 수단이므로, 계속 작업하는 동안 cc-donut은 quota reset을 감지합니다(매 상호작용마다 다시 확인). 그리고 원래 구독으로 돌아갈 정확한 명령을 알려줍니다. 영구적인 탈것이 아닙니다. 집까지 갈 만큼의 도넛일 뿐입니다.
+Claude quota가 바닥나도 cc-donut은 도구, hook, skill, MCP server, 그리고 **지금 대화 자체**를 유지한 채 모델만 OpenRouter로 바꿉니다. 스페어타이어는 본래 임시 수단이므로, 계속 작업하는 동안 cc-donut은 quota reset을 감지해 원래 구독으로 되돌립니다. 영구적인 탈것이 아닙니다. 집까지 갈 만큼의 도넛일 뿐입니다.
+
+왕복에 명령 두 개, 또는 [아예 없이](#automatic-handoff) — `ccd setup --auto`를 켜면 양방향 모두 칠 것이 없습니다. (막힌 그 턴만 다시 보내면 됩니다.)
 
 ## Before / After
 
@@ -49,16 +51,80 @@ BEFORE   quota dies mid-task → stuck, restart, lose the thread
 AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
          quota resets  → we flag it for you   /exit → claude --resume
          same conversation, back on your subscription — round trip, zero thread lost
+
+AUTO     quota dies    → 🍩 도넛이 알아서 장착        (ccd setup --auto)
+         quota resets  → 구독으로 알아서 복귀          칠 것 없음
 ```
 
 quota가 남아 있을 때 **미리** 설정하세요. 0이 된 뒤에는 Claude가 설정 과정을 안내할 수 없습니다.
 
 ```sh
-ccd key       # store your OpenRouter key (hidden input, never enters chat)
-ccd doctor    # ✓ OK = your spare is inflated and ready
+ccd key           # store your OpenRouter key (hidden input, never enters chat)
+ccd doctor        # ✓ OK = your spare is inflated and ready
+ccd setup --auto  # 선택: 왕복을 알아서 (양방향)
 ```
 
 여기까지가 필요한 전부입니다. 세부 내용은 필요할 때 아래에서 확인하세요.
+
+<a name="자동-전환"></a>
+
+<details>
+<summary><b>자동 전환 — 아무 명령도 필요 없음</b></summary>
+
+한 번만 켜두면 왕복에 손이 가지 않습니다.
+
+```sh
+ccd setup --auto
+```
+
+이 명령은 `~/.claude/ccd/bin/claude`에 launcher를 설치하고, 셸이 그걸 먼저 찾도록
+startup 파일에 한 줄을 추가해도 되는지 물어봅니다:
+
+```sh
+export PATH="$HOME/.claude/ccd/bin:$PATH"
+```
+
+전용 디렉터리를 쓰는 데는 이유가 있습니다. `~/.local/bin/claude`는 공식 설치
+프로그램이 진짜 바이너리로 가는 symlink를 이미 두는 자리라, 거길 덮으면 그 링크가
+끊기고 Claude Code가 업데이트될 때 symlink를 다시 쓰면서 launcher를 조용히
+지워버립니다. 물음에 아니라고 답하면 ccd는 그 줄을 출력만 하고, `--yes`를 붙이면
+미리 승낙한 것으로 봅니다. `ccd setup --no-auto`와 `ccd uninstall`은 launcher와 그
+줄을 함께 되돌립니다.
+
+그다음부터는 지금까지 하던 대로 `claude`로 시작하면 됩니다. quota가 소진되면
+대화가 알아서 OpenRouter로 넘어가고, window가 reset되면 같은 방식으로 구독으로
+돌아옵니다. 지금 어느 backbone이 답하고 있고 비용이 얼마인지는 statusline의 ccd
+행에 그대로 표시됩니다.
+
+동작 방식: 이 launcher가 진짜 claude를 실행하고 종료 코드를 지켜봅니다. `StopFailure` hook이
+`rate_limit` 오류를 보고 quota 관측치와 대조한 뒤 SIGHUP으로 세션을 끝내면, Claude
+Code는 flush를 마치고 정상 종료(코드 129)하며, launcher가 같은 대화를 반대편
+backbone에서 다시 엽니다.
+
+하지 않는 것들:
+
+- **launcher가 받을 준비가 돼 있지 않으면 아무 신호도 보내지 않습니다.** hook은
+  launcher가 내보내는 표시를 확인하며, 없으면 절대 시그널을 보내지 않습니다.
+- **rate_limit 하나만으로는 부족합니다.** quota 관측치가 함께 맞아야 하므로
+  일시적인 throttling으로는 전환되지 않습니다. 관측치가 없으면 전환도 없습니다.
+- **key가 없으면 신호도 없습니다.** 갈 곳 없이 세션을 끝내는 것은 그냥 두는 것보다
+  나쁩니다.
+- **진행 중이던 turn은 사라집니다.** 실패한 turn 뒤에 전환되므로 마지막 프롬프트는
+  다시 보내야 합니다.
+- **비대화형 실행은 재시작하지 않습니다.** `claude -p ...` 는 물론 출력을 redirect한
+  경우도 마찬가지입니다. 돌아갈 터미널도, 다시 보낼 프롬프트도 없기 때문에, 대신
+  이어가는 방법을 알려줍니다.
+- **구독 자격증명은 건드리지 않습니다.** ccd는 process를 교체할 뿐, login을 proxy하거나
+  중계하지 않습니다.
+
+수동 방법은 그대로 남아 있습니다. `/exit` 후 `ccd -c`는 예전과 똑같이 동작하고 문서에도
+그대로 유지됩니다 — 우회할 수 없는 자동화는 없느니만 못하니, 자동 전환이 안 걸리면 두
+명령으로 그냥 이어가면 됩니다.
+
+끄려면 `ccd setup --no-auto`, `ccd uninstall`로도 제거됩니다. 우리가 만들지 않은
+`~/.claude/ccd/bin/claude`와, 우리가 쓰지 않은 PATH 줄은 언제나 그대로 둡니다.
+
+</details>
 
 ---
 
@@ -126,6 +192,8 @@ catalog는 snapshot이므로 시간이 지나면 오래됩니다. 최신 benchma
 | `ccd -c --routing exacto` | 저렴한 provider가 tool call을 제대로 처리하지 못할 때 |
 | `ccd -c --model provider/model` | direct model로 재개하고 시작 시 pool을 검증·budget 설정 |
 | `ccd off` | 구독 기반 claude 실행으로 복귀 |
+| `ccd setup --auto` | 자동 전환 켜기 — `/exit`도 명령도 필요 없음 ([아래](#자동-전환)) |
+| `ccd setup --no-auto` | 자동 전환 끄기 |
 
 **Claude Code 안의 skills**(`/`를 입력해 찾을 수 있음):
 

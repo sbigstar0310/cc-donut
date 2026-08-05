@@ -440,9 +440,28 @@ status() {
   tier_row "sonnet" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "default · everyday coding"
   tier_row "opus"   "$ANTHROPIC_DEFAULT_OPUS_MODEL"   "hard decisions · debugging"
 
-  printf '\n%sWhen quota runs out — these two commands%s\n' "$b" "$r"
-  printf '  %s1. /exit%s        End the current session %s(required)%s\n' "$b" "$r" "$d" "$r"
-  printf '  %s2. ccd -c%s       In the same terminal; restores the conversation\n' "$b" "$r"
+  # What to do when quota dies depends on whether anything will do it for you.
+  # Telling someone who turned automation ON to type the manual commands is the
+  # kind of small lie that makes people distrust the automation.
+  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
+    printf '\n%sWhen quota runs out%s %s(automatic handoff is on)%s\n' "$b" "$r" "$grn" "$r"
+    if shim_leads_path; then
+      printf '  %sNothing to type.%s The conversation moves to OpenRouter by itself,\n' "$grn" "$r"
+      printf '  and returns to your subscription when the window resets.\n'
+      # The manual route still works and always will. Automation you cannot step
+      # around is worse than no automation — show the way out, quietly.
+      printf '  %sIf it ever does not fire: /exit, then ccd -c (the manual route still works)%s\n' "$d" "$r"
+    else
+      printf '  %s⚠ installed, but not active in this shell.%s Open a new terminal, or:\n' "$ylw" "$r"
+      printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+    fi
+    printf '  %sTurn it off with: ccd setup --no-auto%s\n' "$d" "$r"
+  else
+    printf '\n%sWhen quota runs out — these two commands%s\n' "$b" "$r"
+    printf '  %s1. /exit%s        End the current session %s(required)%s\n' "$b" "$r" "$d" "$r"
+    printf '  %s2. ccd -c%s       In the same terminal; restores the conversation\n' "$b" "$r"
+    printf '  %sWant this to happen by itself next time? Run: ccd setup --auto%s\n' "$d" "$r"
+  fi
   printf '\n%sOther commands%s\n' "$b" "$r"
   printf '  %sccd pick%s        Change the three model slots\n' "$b" "$r"
   printf '  %sccd models%s      Full catalog and prices\n' "$b" "$r"
@@ -495,6 +514,27 @@ pick() {
 
 doctor() {
   load_env; require_key; apply_tiers
+  # "Why did nothing happen?" is the question the first user test ended on.
+  # Installed is not active, and active in some shell is not supervising THIS one.
+  printf '\n%sAutomatic handoff%s\n' "$b" "$r"
+  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
+    printf '  %s✓%s installed at %s\n' "$grn" "$r" "$(tilde "$CCD_SHIM_DIR/claude")"
+    if shim_leads_path; then
+      printf '  %s✓%s active in this shell — `claude` starts the supervised launcher\n' "$grn" "$r"
+    else
+      printf '  %s✗ not active in this shell%s — `claude` here is the plain one\n' "$red" "$r"
+      printf '      %sOpen a new terminal, or run: %s%s\n' "$d" "$CCD_PATH_LINE" "$r"
+    fi
+    if [ -n "${CCD_HANDOFF:-}" ]; then
+      printf '  %s✓%s this session is supervised — a quota handoff will fire here\n' "$grn" "$r"
+    elif [ -n "${CLAUDECODE:-}" ]; then
+      printf '  %s✗ this session is NOT supervised%s — nothing will hand off from here\n' "$red" "$r"
+      printf '      %sIt started before the launcher was on PATH. /exit, then run claude again.%s\n' "$d" "$r"
+    fi
+  else
+    printf '  %s· off%s — turn it on with: ccd setup --auto\n' "$d" "$r"
+  fi
+
   local model="$ANTHROPIC_MODEL"
   [ $# -ge 1 ] && { model=$(slug_of "$1") || die "Unknown model key: $1"; model=$(with_routing "$model"); }
   # The [1m] hint is Claude Code-local — never send it to the provider.
@@ -690,9 +730,163 @@ PY
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────
+# The auto-handoff shim gets its own directory rather than ~/.local/bin, which is
+# where the official installer already puts `claude` — a symlink into
+# ~/.local/share/claude/versions/. Shadowing it there would break the only link to
+# the real binary, and a Claude Code update would rewrite that symlink and silently
+# remove the shim. Its own directory needs a PATH entry to be found, which is the
+# one line `ccd setup --auto` offers to add.
+# Paths in messages read better as ~/... than as /Users/someone/... — these lines
+# are about a file the user may want to look at, not about being precise.
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+CCD_SHIM_DIR="$CCD_DIR/bin"
+# Ownership decides whether we overwrite or delete a file the user may have put
+# there. A substring match is not good enough for that: a hand-written wrapper
+# with "ccd launcher" in a comment would be treated as ours. Match the whole
+# signature line, and keep this literal byte-identical to the one in the generated
+# shim below. Bounded read — the real claude may be a big binary.
+CCD_SHIM_SIG='# ccd-auto-handoff-shim v1 (managed by: ccd setup --auto)'
+is_ccd_shim() {
+  [ -f "$1" ] || return 1
+  head -c 4096 "$1" 2>/dev/null | grep -qxF "$CCD_SHIM_SIG"
+}
+
+# The PATH line is written as a marked pair so removal is exact — we never edit a
+# line we did not write.
+CCD_PATH_SIG='# ccd-auto-handoff-path v1 (managed by: ccd setup --auto)'
+CCD_PATH_LINE='export PATH="$HOME/.claude/ccd/bin:$PATH"'
+
+# Which startup file to edit. Only the shells whose syntax the line above is valid
+# in: fish and friends get told what to do rather than handed something broken.
+rc_file() {
+  case "${SHELL##*/}" in
+    zsh)  printf '%s' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash) if [ -f "$HOME/.bashrc" ]; then printf '%s' "$HOME/.bashrc"
+          elif [ -f "$HOME/.bash_profile" ]; then printf '%s' "$HOME/.bash_profile"
+          elif [ -f "$HOME/.profile" ]; then printf '%s' "$HOME/.profile"
+          else printf '%s' "$HOME/.bashrc"; fi ;;
+    *)    return 1 ;;
+  esac
+}
+
+# Removal must not depend on rc_file() answering the same way it did at install
+# time — bash reads different files for login and interactive shells, and a
+# ~/.bashrc created later would move the answer and strand our line in the old
+# file. So record every file we actually wrote to, and clean exactly those.
+CCD_PATH_TARGET="$CCD_DIR/auto-path"
+record_path_target() {
+  grep -qxF "$1" "$CCD_PATH_TARGET" 2>/dev/null && return 0
+  printf '%s\n' "$1" >> "$CCD_PATH_TARGET" 2>/dev/null
+}
+rc_candidates() {
+  printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.zshrc" \
+    "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"
+}
+
+# Is the shim already the first `claude` on PATH? Then nothing needs adding —
+# the user may well have wired it up themselves.
+shim_leads_path() {
+  local d c
+  local IFS=:
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    c="$d/claude"
+    { [ -x "$c" ] && [ ! -d "$c" ]; } || continue
+    is_ccd_shim "$c" && return 0
+    return 1
+  done
+  return 1
+}
+
+path_line_present() { [ -f "$1" ] && grep -qxF "$CCD_PATH_SIG" "$1"; }
+
+# Take back exactly what we wrote: our marker, and the line after it only when it
+# is still verbatim the export we put there. If the user edited that line it is
+# theirs now — drop the marker and leave their edit alone. Deleting a line we did
+# not write is the one failure mode this whole design exists to avoid.
+remove_path_line() {
+  local rc="$1" tmp target
+  path_line_present "$rc" || return 0
+  # Rewrite the file a symlink points at, rather than replacing the symlink.
+  target=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$rc" 2>/dev/null)
+  [ -n "$target" ] || target="$rc"
+  tmp=$(mktemp "$target.ccd.XXXXXX") || return 1
+  if ! awk -v sig="$CCD_PATH_SIG" -v line="$CCD_PATH_LINE" '
+    skip      { skip = 0; if ($0 == line) next }
+    $0 == sig { skip = 1; next }
+    { print }
+  ' "$target" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # Swap atomically. Copying back over the original would truncate it first, so a
+  # failure partway through would leave someone's startup file empty — the file
+  # is either the old one or the new one, never a ruin of both.
+  python3 - "$target" "$tmp" <<'CCD_SWAP' || { rm -f "$tmp"; return 1; }
+import os, shutil, sys
+target, tmp = sys.argv[1], sys.argv[2]
+shutil.copymode(target, tmp)
+try:
+    st = os.stat(target)
+    os.chown(tmp, st.st_uid, st.st_gid)
+except OSError:
+    pass          # not ours to give away; the mode is what matters
+os.replace(tmp, target)
+CCD_SWAP
+}
+
+# Clean the files we recorded writing to — and only those. The marker is an
+# ownership assertion in a line WE appended; the same text sitting in someone's
+# startup file (inside a heredoc, a docstring, a pasted snippet) is their data.
+# Editing it would break the promise this whole design rests on, so unrecorded
+# copies get pointed at, never touched.
+remove_path_line_everywhere() {
+  local f removed=1 failed=0
+  if [ -f "$CCD_PATH_TARGET" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      path_line_present "$f" || continue
+      if remove_path_line "$f"; then
+        printf '✓ PATH line removed from %s\n' "$(tilde "$f")"
+        removed=0
+      else
+        printf '%s⚠ could not rewrite %s — remove the ccd PATH line by hand%s\n' "$ylw" "$(tilde "$f")" "$r"
+        failed=1
+      fi
+    done <<RC_RECORDED
+$(awk '!seen[$0]++' "$CCD_PATH_TARGET" 2>/dev/null)
+RC_RECORDED
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -qxF "$f" "$CCD_PATH_TARGET" 2>/dev/null && continue
+    path_line_present "$f" \
+      && printf '%s⚠ a ccd PATH line also appears in %s — left alone, since we did not write it%s\n' \
+           "$ylw" "$(tilde "$f")" "$r"
+  done <<RC_OTHERS
+$(rc_candidates)
+RC_OTHERS
+  # Keep the record when something failed, so a retry still knows where to look.
+  if [ "$failed" -eq 1 ]; then
+    return 1
+  fi
+  rm -f "$CCD_PATH_TARGET"
+  return "$removed"
+}
+
 setup() {
   local launcher="$HOME/.local/bin/ccd" statusline_launcher="$CCD_DIR/statusline-launcher.sh"
   local settings="$HOME/.claude/settings.json"
+  local auto=0 assume_yes=0 auto_next=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --auto)    auto=1; shift ;;
+      --no-auto) auto=-1; shift ;;
+      --yes|-y)  assume_yes=1; shift ;;
+      *) die "Usage: ccd setup [--auto|--no-auto] [--yes]" ;;
+    esac
+  done
   mkdir -p "$HOME/.local/bin" "$CCD_DIR" "$HOME/.claude"
   [ -L "$launcher" ] && rm "$launcher"
   cat > "$launcher" <<'CCD_LAUNCHER'
@@ -711,6 +905,118 @@ t=$(ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd-statusline 2>/dev/null |
 exec "$t"
 CCD_STATUSLINE_LAUNCHER
   chmod +x "$statusline_launcher"
+
+  # Automatic handoff is opt-in: it shadows the `claude` command, which is too
+  # invasive to install without being asked. --auto installs, --no-auto removes,
+  # and a bare `ccd setup` leaves whatever is already there alone.
+  local claude_shim="$CCD_SHIM_DIR/claude"
+  case "$auto" in
+    1)
+      mkdir -p "$CCD_SHIM_DIR"
+      # Never clobber a claude the user put here themselves — uninstall protects
+      # it, so install must too, or we would delete what we refuse to.
+      if { [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; } \
+         && ! is_ccd_shim "$claude_shim"; then
+        printf '%s✗ %s already exists and is not a ccd shim — not touching it.%s\n' "$red" "$(tilde "$claude_shim")" "$r" >&2
+        printf '  %sMove or remove it first, then re-run: ccd setup --auto%s\n' "$d" "$r" >&2
+        return 1
+      fi
+      [ -L "$claude_shim" ] && rm "$claude_shim"
+      cat > "$claude_shim" <<'CCD_CLAUDE_SHIM'
+#!/usr/bin/env bash
+# ccd-auto-handoff-shim v1 (managed by: ccd setup --auto)
+# Automatic quota handoff. Regenerated by `ccd setup --auto`.
+# Resolves the newest installed ccd plugin, so plugin updates apply without
+# re-running setup. CCD_SHIM_PATH lets the handoff script skip this file when it
+# looks for the real claude on PATH.
+self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
+t=$(ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd-handoff 2>/dev/null | sort -V | tail -1)
+if [ -z "$t" ]; then
+  # Never strand the user: fall through to the real claude if the plugin is gone.
+  # Compare resolved paths, not strings — a relative PATH entry or a different
+  # spelling of this file's own directory would otherwise re-exec us forever.
+  IFS=: read -ra _dirs <<< "$PATH"
+  for d in "${_dirs[@]}"; do
+    [ -n "$d" ] || continue
+    [ -x "$d/claude" ] && [ ! -d "$d/claude" ] || continue
+    [ "$(cd "$d" 2>/dev/null && pwd)/claude" = "$self" ] && continue
+    exec "$d/claude" "$@"
+  done
+  echo "ccd: neither the ccd plugin nor claude was found" >&2; exit 127
+fi
+CCD_SHIM_PATH="$self" exec "$t" "$@"
+CCD_CLAUDE_SHIM
+      chmod +x "$claude_shim"
+      printf '✓ automatic handoff installed at %s\n' "$(tilde "$claude_shim")"
+      printf '  %sWhen your Claude quota runs out, sessions continue on OpenRouter —%s\n' "$d" "$r"
+      printf '  %spaid per token with your own key — and return to your subscription%s\n' "$d" "$r"
+      printf '  %sby themselves when the quota resets.%s\n' "$d" "$r"
+
+      # The shim is only reachable if its directory comes before the real claude
+      # on PATH. Ask before editing a startup file: --auto is consent to install
+      # the feature, not blanket consent to rewrite the user's dotfiles.
+      if shim_leads_path; then
+        printf '✓ already first on PATH — `claude` hands off on quota exhaustion\n'
+      else
+        local rc reply="" do_edit=0
+        if rc=$(rc_file) && ! path_line_present "$rc"; then
+          printf '\n  One line is still needed so your shell finds it first:\n'
+          printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+          # Consent, explicitly — but ask wherever a human can actually answer.
+          # `ccd setup` is routinely run as a `!` command inside Claude Code,
+          # where stdin is a pipe; `ccd key` already reaches past that to
+          # /dev/tty for the same reason. Only when there is no controlling
+          # terminal at all do we treat it as scripted and change nothing.
+          if [ "$assume_yes" -eq 1 ]; then
+            do_edit=1
+          elif [ -t 0 ] && [ -t 1 ]; then
+            printf '  Add it to %s? %s[Y/n]%s ' "$(tilde "$rc")" "$d" "$r"
+            read -r reply || reply=n
+            case "${reply:-y}" in y|Y|yes|YES) do_edit=1 ;; esac
+          elif (exec < /dev/tty) 2>/dev/null; then
+            printf '  Add it to %s? %s[Y/n]%s ' "$(tilde "$rc")" "$d" "$r" > /dev/tty
+            read -r reply < /dev/tty || reply=n
+            printf '\n' > /dev/tty
+            case "${reply:-y}" in y|Y|yes|YES) do_edit=1 ;; esac
+          fi
+          if [ "$do_edit" -eq 1 ]; then
+            # Record ownership BEFORE editing. Removal only ever touches files we
+            # recorded, so an edit that escaped the record could never be taken
+            # back out — and setup would still have claimed success. A record with
+            # no edit behind it is harmless by comparison: removal finds no marker.
+            if ! record_path_target "$rc" 2>/dev/null; then
+              printf '%s⚠ could not record ownership in %s — leaving %s alone.%s\n' \
+                "$ylw" "$(tilde "$CCD_PATH_TARGET")" "$(tilde "$rc")" "$r"
+              printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
+            elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
+              printf '✓ added to %s\n' "$(tilde "$rc")"
+              auto_next="source $(tilde "$rc")"
+            else
+              printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
+            fi
+          else
+            printf '  %sSkipped — automatic handoff is installed but not active yet.%s\n' "$ylw" "$r"
+            printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
+          fi
+        elif [ -n "${rc:-}" ]; then
+          printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
+        else
+          printf '\n  %sAdd this to your shell startup file, then open a new terminal:%s\n' "$d" "$r"
+          printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+        fi
+      fi
+      ;;
+    -1)
+      if is_ccd_shim "$claude_shim"; then
+        rm "$claude_shim"; printf '✓ automatic handoff disabled\n'
+      elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
+        printf '%s⚠ %s is not a ccd shim — left alone%s\n' "$ylw" "$(tilde "$claude_shim")" "$r"
+      fi
+      # Take the PATH line back out with the shim: an entry pointing at a
+      # directory we just emptied is litter in someone's startup file.
+      remove_path_line_everywhere || true
+      ;;
+  esac
 
   python3 - "$settings" <<'PY'
 import json, os, sys, tempfile
@@ -750,7 +1056,7 @@ PY
 
   printf '✓ ccd command installed (~/.local/bin/ccd)\n'
   printf '✓ statusline wired — dashboard output preserved\n'
-  printf '→ No restart needed: /reload-plugins activates the hooks; the statusline appears on your next interaction\n'
+  printf '→ In a running Claude Code session: /reload-plugins activates the hooks\n'
   case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) printf '→ Add to PATH: export PATH="$HOME/.local/bin:$PATH"\n' ;; esac
   if python3 - "$KEYS" <<'PY' >/dev/null 2>&1
 import re, sys
@@ -763,6 +1069,13 @@ if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'": value = valu
 raise SystemExit(0 if value else 1)
 PY
   then printf '→ Verify anytime: ccd doctor\n'; else printf '→ Before quota runs out: set your OpenRouter key with `ccd key`\n'; fi
+  # Last line on screen, because it is the only one that still needs doing. Buried
+  # mid-output it reads as trivia — which is how someone ends up testing a handoff
+  # in a shell that never had the launcher on PATH.
+  if [ -n "$auto_next" ]; then
+    printf '\n%s→ One thing left: that PATH line only reaches shells started from now on.%s\n' "$b" "$r"
+    printf '%s     Open a new terminal, or run:  %s%s\n' "$b" "$auto_next" "$r"
+  fi
 }
 
 uninstall() {
@@ -824,6 +1137,16 @@ PY
   elif [ -e "$launcher" ] || [ -L "$launcher" ]; then
     printf '⚠ ccd command not removed — ~/.local/bin/ccd is not a ccd launcher\n'
   fi
+  # The auto-handoff shim shadows `claude`, so removing it matters more than the
+  # rest: leaving one behind after uninstall would keep intercepting every launch.
+  local claude_shim="$CCD_SHIM_DIR/claude"
+  if is_ccd_shim "$claude_shim"; then
+    rm "$claude_shim"
+    printf '✓ automatic-handoff shim removed\n'
+  elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
+    printf '⚠ %s left alone — not a ccd shim\n' "$(tilde "$claude_shim")"
+  fi
+  remove_path_line_everywhere || true
   [ -e "$statusline_launcher" ] || [ -L "$statusline_launcher" ] && rm "$statusline_launcher"
   printf '✓ launchers removed\n'
 
@@ -837,9 +1160,36 @@ PY
   printf '→ In a running session: /reload-plugins unloads the hooks — no restart needed\n'
 }
 
+# Exec the REAL claude, never the auto-handoff shim at ~/.local/bin/claude.
+#
+# A bare `exec claude` would find that shim first and start a SECOND handoff
+# launcher underneath this one. The inner launcher inherits the OpenRouter
+# environment we just exported, so when it later relaunches "back to the
+# subscription" it hands the user a session that is still on OpenRouter — and
+# the outer loop's hop cap no longer governs the round trip. One launcher
+# supervises one session; ccd is always the supervised process, never a new
+# supervisor. Skipping the shim also keeps `ccd off` honest.
+exec_claude() {
+  local d c self="${CCD_SHIM_PATH:-}"
+  local IFS=:
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    c="$d/claude"
+    { [ -x "$c" ] && [ ! -d "$c" ]; } || continue
+    # Identity first (the shim tells us its own path), then the ownership marker
+    # for the case where ccd was invoked straight from a shell. Read a bounded
+    # prefix: the real claude may be a large binary, and the marker sits on
+    # line 2 of a 13-line script.
+    [ -n "$self" ] && [ "$(cd "$d" 2>/dev/null && pwd)/claude" = "$self" ] && continue
+    is_ccd_shim "$c" && continue
+    exec "$c" "$@"
+  done
+  die "claude not found on PATH"
+}
+
 case "${1:-}" in
   ""|status|help|-h|--help) status; exit 0 ;;
-  setup)  setup; exit 0 ;;
+  setup)  shift; setup "$@"; exit 0 ;;
   uninstall) shift; uninstall "$@"; exit 0 ;;
   key)    set_key; exit 0 ;;
   models) [ -f "$CATALOG" ] || die "Catalog not found: $CATALOG"; show_models; exit 0 ;;
@@ -851,9 +1201,10 @@ case "${1:-}" in
                 ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
                 ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
                 CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS \
-                CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_OUTPUT_TOKENS 2>/dev/null
+                CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_OUTPUT_TOKENS \
+                CCD_ACTIVE 2>/dev/null
           printf '%s▶ Running with Anthropic subscription%s\n' "$grn" "$r"
-          exec claude "$@" ;;
+          exec_claude "$@" ;;
   go)     shift ;;
 esac
 
@@ -912,7 +1263,10 @@ fi
 
 # Instant feedback before anything that can block (the prefetch below can take
 # seconds on a stale cache) — never leave the terminal silent after `ccd -c`.
-printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
+# A supervised launch was just explained by the launcher one line above; saying
+# "switching backbone" again is noise at the moment the user wants to get back
+# to work. Keep only what the launcher cannot know: which models answer now.
+[ -n "${CCD_HANDOFF:-}" ] || printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
 
 # apply_tiers budgets from the cached provider data. On a cache miss/stale entry the
 # slot would launch at 200K even when the model serves far more — the exact failure
@@ -955,11 +1309,18 @@ fi
 apply_tiers
 export CCD_ACTIVE=1
 
-printf '   haiku %s / sonnet %s / opus %s\n' \
-  "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"
-printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
-printf '%s   Statusline adds: model·effort │ price per 1M │ run cost. Updates on prompts/tools.%s\n' "$d" "$r"
-printf '%s   To return to the subscription, /exit then run claude in the same terminal. Never /logout.%s\n' "$d" "$r"
+if [ -n "${CCD_HANDOFF:-}" ]; then
+  printf '%s▶ OpenRouter: haiku %s / sonnet %s / opus %s%s\n' "$ylw" \
+    "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" \
+    "$ANTHROPIC_DEFAULT_OPUS_MODEL" "$r"
+  printf '%s   /model 로 전환 · 비용은 statusline · 복귀 안 되면 /exit 후 claude · /logout 금지%s\n' "$d" "$r"
+else
+  printf '   haiku %s / sonnet %s / opus %s\n' \
+    "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"
+  printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
+  printf '%s   Statusline adds: model·effort │ price per 1M │ run cost. Updates on prompts/tools.%s\n' "$d" "$r"
+  printf '%s   To return to the subscription, /exit then run claude in the same terminal. Never /logout.%s\n' "$d" "$r"
+fi
 
 # Warm the curated Pareto/default set only after visible launch feedback. These
 # detached writers share ccd-price-fetch's lock/atomic merge path with statusline
@@ -984,7 +1345,17 @@ fi
 
 init_run_state
 fill_baseline_async
+# Claude Code takes a few seconds to boot and draw. After an automatic handoff
+# that silence follows a banner the user did not ask for, which reads as a hang —
+# one of them called it "the dashboard taking 5 seconds". ccd's own share of that
+# gap is a fraction of a second; the rest is not ours to speed up, but it is ours
+# to account for.
+if [ -n "${CCD_HANDOFF:-}" ]; then
+  printf '%s   Claude Code 여는 중…%s\n' "$d" "$r"
+else
+  printf '%s   Starting Claude Code...%s\n' "$d" "$r"
+fi
 # No detached price re-fetch here: the sync prefetch above already refreshed stale
 # entries, fresh entries are good for a day, and the statusline fetches anything
 # else lazily on its own. Three extra API hits per launch bought nothing.
-exec claude ${args+"${args[@]}"}
+exec_claude ${args+"${args[@]}"}

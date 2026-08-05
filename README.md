@@ -39,7 +39,9 @@ Slash commands are parsed **one line at a time** — enter each separately (past
 
 ## What it does
 
-When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset (it re-checks on each interaction) and hands you the exact command to switch back. Not your forever ride. Just enough donut to get home.
+When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset and takes you back to your subscription. Not your forever ride. Just enough donut to get home.
+
+Two commands each way, or [none at all](#automatic-handoff) — with `ccd setup --auto` neither crossing asks anything of you. (The turn that hit the wall is still yours to re-send.)
 
 ## Before / After
 
@@ -49,16 +51,82 @@ BEFORE   quota dies mid-task → stuck, restart, lose the thread
 AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
          quota resets  → we flag it for you   /exit → claude --resume
          same conversation, back on your subscription — round trip, zero thread lost
+
+AUTO     quota dies    → 🍩 donut goes on by itself      (ccd setup --auto)
+         quota resets  → back on the subscription        nothing to type
 ```
 
 Set it up **while you still have quota** — after zero, Claude can't walk you through it:
 
 ```sh
-ccd key       # store your OpenRouter key (hidden input, never enters chat)
-ccd doctor    # ✓ OK = your spare is inflated and ready
+ccd key           # store your OpenRouter key (hidden input, never enters chat)
+ccd doctor        # ✓ OK = your spare is inflated and ready
+ccd setup --auto  # optional: hand off by itself, both ways
 ```
 
 That's everything you need. Details below when you want them.
+
+<a name="automatic-handoff"></a>
+
+<details>
+<summary><b>Automatic handoff — no commands at all</b></summary>
+
+Opt in once and the round trip stops needing you:
+
+```sh
+ccd setup --auto
+```
+
+That installs a launcher at `~/.claude/ccd/bin/claude` and asks before adding one
+line to your shell startup file, so your shell finds it first:
+
+```sh
+export PATH="$HOME/.claude/ccd/bin:$PATH"
+```
+
+It gets its own directory on purpose. `~/.local/bin/claude` is where the official
+installer already puts a symlink to the real binary — shadowing it there would
+break that link, and a Claude Code update would rewrite the symlink and silently
+remove the launcher. Say no to the prompt and ccd just prints the line for you;
+`--yes` answers it in advance. `ccd setup --no-auto` and `ccd uninstall` take
+both the launcher and that line back out.
+
+Then keep starting sessions the way you already do — `claude`, unchanged. When
+quota runs out, the conversation comes back on OpenRouter by itself; when the
+window resets, it returns to your subscription the same way. The statusline's
+ccd row tells you which backbone is answering and what it costs.
+
+How it works: the launcher
+that runs the real claude and watches its exit code. A `StopFailure` hook sees
+the `rate_limit` error, confirms against the quota reading, and ends the session
+with SIGHUP — Claude Code exits gracefully (code 129) after flushing, and the
+launcher relaunches the same conversation on the other backbone.
+
+What it will not do:
+
+- **Nothing is signalled unless the launcher is there to catch it.** The hook
+  checks for a marker the launcher exports; without it, no signal is ever sent.
+- **A bare rate-limit is not enough.** The quota reading has to agree, so
+  transient throttling doesn't trigger a handoff. No reading means no handoff.
+- **No key, no signal.** Ending a session with nowhere to go is worse than
+  leaving it alone.
+- **The in-flight turn is lost.** The transition happens after the failed turn,
+  so re-send that last prompt.
+- **Non-interactive runs are not relaunched.** `claude -p ...`, or anything with its
+  output redirected, has no terminal to come back to and no prompt to re-send;
+  ccd tells you how to continue instead.
+- **Your subscription credential is never touched.** ccd replaces the process,
+  it does not proxy or relay your login.
+
+The manual route is not replaced. `/exit` then `ccd -c` still works exactly as
+before, and stays documented — automation you cannot step around is worse than
+none, so if a handoff ever fails to fire you take the two commands and carry on.
+
+Turn it off with `ccd setup --no-auto`; `ccd uninstall` removes it too. A
+`~/.claude/ccd/bin/claude` that isn't ours, and a PATH line we did not write,
+are always left alone.
+
+</details>
 
 ---
 
@@ -126,6 +194,8 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | `ccd -c --routing exacto` | If a cheap provider fumbles tool calls |
 | `ccd -c --model provider/model` | Resume with a direct model; verify and budget its pool at launch |
 | `ccd off` | Run claude on the subscription again |
+| `ccd setup --auto` | Opt in to automatic handoff — no `/exit`, no commands ([below](#automatic-handoff)) |
+| `ccd setup --no-auto` | Turn automatic handoff back off |
 
 **Skills inside Claude Code** (type `/` to find them):
 
