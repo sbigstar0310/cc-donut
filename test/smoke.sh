@@ -749,6 +749,53 @@ else bad "signalled without a key" "target died with no fallback available"; fi
 kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
 
+head_ "17b. the statusline never waits on the dashboard"
+# ccd renders the dashboard's rows above its own, by running it as a child. That
+# child is usually instant, but it refreshes its usage reading on its own
+# schedule — and while it does, waiting for it blanks the WHOLE statusline. A
+# user reported that as "the dashboard takes five seconds to appear". Serve the
+# rows we saw last and refresh behind them: slightly stale beats absent.
+mkdir -p "$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist"
+: > "$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist/index.js"
+printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+cp "$FAKE/fakebin/node" "$FAKE/node.real"
+cat > "$FAKE/fakebin/node" <<'EOF'
+#!/bin/sh
+sleep 5
+echo "FRESH-DASHBOARD-ROW"
+EOF
+chmod +x "$FAKE/fakebin/node"
+sl_start=$(date +%s)
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+sl_elapsed=$(( $(date +%s) - sl_start ))
+[ "$sl_elapsed" -le 2 ] \
+  && ok "a five-second dashboard does not hold up the statusline (${sl_elapsed}s)" \
+  || bad "statusline latency" "waited ${sl_elapsed}s for the dashboard"
+case "$row" in
+  *"CACHED-DASHBOARD-ROW"*) ok "the rows we saw last are shown meanwhile" ;;
+  *) bad "statusline" "lost the dashboard rows: $(printf '%s' "$row" | head -c 70)" ;;
+esac
+case "$row" in
+  *"ccd"*) ok "and the ccd row is still rendered alongside them" ;;
+  *) bad "statusline" "no ccd row" ;;
+esac
+# With nothing cached yet, one render pays for it so the rows exist at all.
+rm -f "$FAKE/.claude/ccd/.dashboard-row"
+cat > "$FAKE/fakebin/node" <<'EOF'
+#!/bin/sh
+echo "FIRST-DASHBOARD-ROW"
+EOF
+chmod +x "$FAKE/fakebin/node"
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$row" in
+  *"FIRST-DASHBOARD-ROW"*) ok "the very first render still fetches, so nothing is missing" ;;
+  *) bad "statusline" "first render had no dashboard rows" ;;
+esac
+[ -s "$FAKE/.claude/ccd/.dashboard-row" ] \
+  && ok "...and remembers them for next time" || bad "statusline" "nothing cached"
+cp "$FAKE/node.real" "$FAKE/fakebin/node"; chmod +x "$FAKE/fakebin/node"
+rm -f "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/node.real"
+
 head_ "18. automatic handoff: launcher shim"
 SHIM="$FAKE/.claude/ccd/bin/claude"
 # The shim must be invisible until a handoff happens: every exit code other

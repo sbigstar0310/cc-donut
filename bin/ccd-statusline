@@ -26,10 +26,29 @@ payload=$(cat)
 
 # Locate the newest claude-dashboard build dynamically (survives plugin updates)
 orig=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/index.js 2>/dev/null | sort -V | tail -1)
+# The dashboard is usually instant, but it refreshes its usage reading on its own
+# schedule, and when it does the call takes seconds. Waiting for it blanks the
+# WHOLE statusline — ours and its rows both — which reads as the statusline being
+# broken rather than a number being a few seconds old. So serve the last rows we
+# saw and refresh behind them: slightly stale beats absent.
+DASH_CACHE="$CCD_DIR/.dashboard-row"
+base=""
 if [ -n "$orig" ]; then
-  base=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
-else
-  base=""
+  if [ -s "$DASH_CACHE" ]; then
+    base=$(cat "$DASH_CACHE" 2>/dev/null)
+    # Refresh for the next render. Detached, so a slow call costs this one nothing.
+    (
+      fresh=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
+      if [ -n "$fresh" ]; then
+        tmp=$(mktemp "$DASH_CACHE.XXXXXX" 2>/dev/null) || exit 0
+        printf '%s' "$fresh" > "$tmp" && mv -f "$tmp" "$DASH_CACHE" 2>/dev/null || rm -f "$tmp"
+      fi
+    ) >/dev/null 2>&1 &
+  else
+    # Nothing cached yet: this one render pays for it, so the rows exist at all.
+    base=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
+    [ -n "$base" ] && printf '%s' "$base" > "$DASH_CACHE" 2>/dev/null
+  fi
 fi
 
 if [ -n "${CCD_ACTIVE:-}" ]; then

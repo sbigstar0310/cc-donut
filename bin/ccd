@@ -1345,6 +1345,16 @@ fi
 
 init_run_state
 fill_baseline_async
+# Claude Code takes a few seconds to boot and draw. After an automatic handoff
+# that silence follows a banner the user did not ask for, which reads as a hang —
+# one of them called it "the dashboard taking 5 seconds". ccd's own share of that
+# gap is a fraction of a second; the rest is not ours to speed up, but it is ours
+# to account for.
+if [ -n "${CCD_HANDOFF:-}" ]; then
+  printf '%s   Claude Code 여는 중…%s\n' "$d" "$r"
+else
+  printf '%s   Starting Claude Code...%s\n' "$d" "$r"
+fi
 # No detached price re-fetch here: the sync prefetch above already refreshed stale
 # entries, fresh entries are good for a day, and the statusline fetches anything
 # else lazily on its own. Three extra API hits per launch bought nothing.
