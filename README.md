@@ -41,7 +41,7 @@ Slash commands are parsed **one line at a time** — enter each separately (past
 
 When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset and takes you back to your subscription. Not your forever ride. Just enough donut to get home.
 
-Two commands each way, or [none at all](#automatic-handoff) — `ccd setup --auto` and the round trip stops needing you.
+Two commands each way, or [none at all](#automatic-handoff) — with `ccd setup --auto` neither crossing asks anything of you. (The turn that hit the wall is still yours to re-send.)
 
 ## Before / After
 

@@ -860,6 +860,32 @@ case "$row" in
   *) bad "staleness" "got: $(printf '%s' "$row" | head -c 60)" ;;
 esac
 
+# The cold and over-stale path fetches synchronously, and needs the same bounds:
+# a hung dashboard there would hold the statusline hostage with no cache to fall
+# back on. On timeout we render our own row without its rows rather than freeze.
+rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock"
+cat > "$FAKE/fakebin/node" <<'EOF'
+#!/bin/sh
+sleep 30
+echo "NEVER-ARRIVES"
+EOF
+chmod +x "$FAKE/fakebin/node"
+sl_start=$(date +%s)
+row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 CCD_DASH_TIMEOUT=2 \
+      "$ROOT/bin/ccd-statusline" 2>/dev/null)
+sl_elapsed=$(( $(date +%s) - sl_start ))
+[ "$sl_elapsed" -le 5 ] \
+  && ok "a hung dashboard with nothing cached is bounded too (${sl_elapsed}s)" \
+  || bad "cold-path timeout" "waited ${sl_elapsed}s"
+case "$row" in
+  *"NEVER-ARRIVES"*) bad "cold-path timeout" "served output from a child it killed" ;;
+  *"ccd"*) ok "...and the ccd row is rendered without the dashboard rows" ;;
+  *) bad "cold-path timeout" "no row at all: $(printf '%s' "$row" | head -c 60)" ;;
+esac
+[ ! -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
+  && ok "the lock is released on the cold path as well" || bad "cold-path lock" "leaked"
+pkill -f "$FAKE/fakebin/node" 2>/dev/null
+
 cp "$FAKE/node.real" "$FAKE/fakebin/node"; chmod +x "$FAKE/fakebin/node"
 rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock" "$FAKE/node.real"
 

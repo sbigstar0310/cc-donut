@@ -41,7 +41,7 @@ claude plugin install ccd@cc-donut
 
 Claude quota가 바닥나도 cc-donut은 도구, hook, skill, MCP server, 그리고 **지금 대화 자체**를 유지한 채 모델만 OpenRouter로 바꿉니다. 스페어타이어는 본래 임시 수단이므로, 계속 작업하는 동안 cc-donut은 quota reset을 감지해 원래 구독으로 되돌립니다. 영구적인 탈것이 아닙니다. 집까지 갈 만큼의 도넛일 뿐입니다.
 
-왕복에 명령 두 개, 또는 [아예 없이](#automatic-handoff) — `ccd setup --auto` 한 번이면 왕복에 손이 가지 않습니다.
+왕복에 명령 두 개, 또는 [아예 없이](#automatic-handoff) — `ccd setup --auto`를 켜면 양방향 모두 칠 것이 없습니다. (막힌 그 턴만 다시 보내면 됩니다.)
 
 ## Before / After
 

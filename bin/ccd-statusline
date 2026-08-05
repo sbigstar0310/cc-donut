@@ -47,40 +47,52 @@ try: print(int(time.time() - os.path.getmtime(sys.argv[1])))
 except OSError: print(999999)' "$1" 2>/dev/null || echo 999999
 }
 
+# Run the dashboard under a watchdog, leaving its rows in the cache on success
+# and nothing behind on failure or timeout. Both paths use it: a hung child must
+# never hold the statusline hostage, cold cache or not.
+dash_fetch() {
+  local tmp node_pid watchdog rc
+  tmp=$(mktemp "$DASH_CACHE.XXXXXX" 2>/dev/null) || return 1
+  printf '%s' "$payload" | node "$orig" > "$tmp" 2>/dev/null &
+  node_pid=$!
+  ( sleep "$DASH_TIMEOUT"; kill -9 "$node_pid" 2>/dev/null ) 2>/dev/null &
+  watchdog=$!
+  wait "$node_pid"; rc=$?
+  kill "$watchdog" 2>/dev/null
+  if [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$DASH_CACHE" 2>/dev/null && return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Atomic test-and-set, reclaiming a lock left behind by a killed refresher.
+dash_lock() {
+  local lock_age
+  lock_age=$(dash_age "$DASH_LOCK")
+  [ "$lock_age" -gt "$((DASH_TIMEOUT * 3))" ] && rmdir "$DASH_LOCK" 2>/dev/null
+  mkdir "$DASH_LOCK" 2>/dev/null
+}
+
 base=""
 if [ -n "$orig" ]; then
   age=$(dash_age "$DASH_CACHE")
   if [ -s "$DASH_CACHE" ] && [ "$age" -le "$DASH_MAX_STALE" ]; then
+    # Fresh enough to stand behind: show it now, refresh for the next render.
     base=$(cat "$DASH_CACHE" 2>/dev/null)
-    # Refresh for the next render, exactly once at a time. A statusline renders on
-    # every prompt and tool call, so without this a stalled dashboard would leave
-    # a new `node` behind on each one, and two that finish out of order would let
-    # the older row win. mkdir is the atomic test-and-set; a lock left by a killed
-    # refresher is reclaimed once it is older than the timeout it lived under.
-    lock_age=$(dash_age "$DASH_LOCK")
-    [ "$lock_age" -gt "$((DASH_TIMEOUT * 3))" ] && rmdir "$DASH_LOCK" 2>/dev/null
-    if mkdir "$DASH_LOCK" 2>/dev/null; then
-      (
-        trap 'rmdir "$DASH_LOCK" 2>/dev/null' EXIT
-        tmp=$(mktemp "$DASH_CACHE.XXXXXX" 2>/dev/null) || exit 0
-        printf '%s' "$payload" | node "$orig" > "$tmp" 2>/dev/null &
-        node_pid=$!
-        ( sleep "$DASH_TIMEOUT"; kill -9 "$node_pid" 2>/dev/null ) 2>/dev/null &
-        watchdog=$!
-        wait "$node_pid"; node_rc=$?
-        kill "$watchdog" 2>/dev/null
-        if [ "$node_rc" -eq 0 ] && [ -s "$tmp" ]; then
-          mv -f "$tmp" "$DASH_CACHE" 2>/dev/null || rm -f "$tmp"
-        else
-          rm -f "$tmp"
-        fi
-      ) >/dev/null 2>&1 &
+    if dash_lock; then
+      ( trap 'rmdir "$DASH_LOCK" 2>/dev/null' EXIT; dash_fetch ) >/dev/null 2>&1 &
     fi
-  else
-    # No cache, or one too old to stand behind: this render pays for it, so the
-    # rows are never absent and never unboundedly stale.
-    base=$(printf '%s' "$payload" | node "$orig" 2>/dev/null)
-    [ -n "$base" ] && printf '%s' "$base" > "$DASH_CACHE" 2>/dev/null
+  elif dash_lock; then
+    # Cold, or too old to stand behind: fetch now — under the same lock and the
+    # same watchdog, so a hung dashboard costs this render at most DASH_TIMEOUT
+    # and then we render our own row without its rows rather than freeze.
+    dash_fetch && base=$(cat "$DASH_CACHE" 2>/dev/null)
+    rmdir "$DASH_LOCK" 2>/dev/null
+  elif [ -s "$DASH_CACHE" ]; then
+    # Another render is already fetching. An over-age row beats a blank one, and
+    # this one costs nothing.
+    base=$(cat "$DASH_CACHE" 2>/dev/null)
   fi
 fi
 
