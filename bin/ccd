@@ -1263,7 +1263,10 @@ fi
 
 # Instant feedback before anything that can block (the prefetch below can take
 # seconds on a stale cache) — never leave the terminal silent after `ccd -c`.
-printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
+# A supervised launch was just explained by the launcher one line above; saying
+# "switching backbone" again is noise at the moment the user wants to get back
+# to work. Keep only what the launcher cannot know: which models answer now.
+[ -n "${CCD_HANDOFF:-}" ] || printf '%s▶ Switching backbone: OpenRouter%s\n' "$ylw" "$r"
 
 # apply_tiers budgets from the cached provider data. On a cache miss/stale entry the
 # slot would launch at 200K even when the model serves far more — the exact failure
@@ -1306,14 +1309,16 @@ fi
 apply_tiers
 export CCD_ACTIVE=1
 
-printf '   haiku %s / sonnet %s / opus %s\n' \
-  "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"
-printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
-printf '%s   Statusline adds: model·effort │ price per 1M │ run cost. Updates on prompts/tools.%s\n' "$d" "$r"
 if [ -n "${CCD_HANDOFF:-}" ]; then
-  printf '%s   구독 복귀는 자동입니다 — 쿼타가 회복되면 알아서 돌아갑니다. /logout은 절대 금지.%s\n' "$d" "$r"
-  printf '%s   자동 복귀가 안 되면: /exit 후 같은 터미널에서 claude (수동 경로는 그대로 살아 있습니다)%s\n' "$d" "$r"
+  printf '%s▶ OpenRouter: haiku %s / sonnet %s / opus %s%s\n' "$ylw" \
+    "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" \
+    "$ANTHROPIC_DEFAULT_OPUS_MODEL" "$r"
+  printf '%s   /model 로 전환 · 비용은 statusline · 복귀 안 되면 /exit 후 claude · /logout 금지%s\n' "$d" "$r"
 else
+  printf '   haiku %s / sonnet %s / opus %s\n' \
+    "$ANTHROPIC_DEFAULT_HAIKU_MODEL" "$ANTHROPIC_DEFAULT_SONNET_MODEL" "$ANTHROPIC_DEFAULT_OPUS_MODEL"
+  printf '%s   Switch instantly with /model haiku|sonnet|opus or /model <slug>.%s\n' "$d" "$r"
+  printf '%s   Statusline adds: model·effort │ price per 1M │ run cost. Updates on prompts/tools.%s\n' "$d" "$r"
   printf '%s   To return to the subscription, /exit then run claude in the same terminal. Never /logout.%s\n' "$d" "$r"
 fi
 

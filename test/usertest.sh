@@ -96,15 +96,30 @@ json.dump(d, open(p, "w"))
 print("✓ 5-hour window now reads 99% — a rate_limit will arm the handoff")
 PY
          ;;
-      ok) python3 - "$QUOTA" <<'PY'
-import json, sys, time
-p = sys.argv[1]; d = json.load(open(p))
+      ok) python3 - "$QUOTA" "$HOME/.claude/ccd/run-state.json" <<'PY'
+import json, os, sys, time
+# Recovery is a TRANSITION, not a value: the guard arms only when the previous
+# observation was >=95%, the new one is lower, and the reset id changed. Seeding
+# the cache alone is not enough — the "previous observation" lives in run-state,
+# and a real dashboard refresh may have already overwritten what we seeded. So
+# state both ends of the transition explicitly.
+quota, run = sys.argv[1], sys.argv[2]
+d = json.load(open(quota))
+old_reset = d["claude"].get("fiveHourReset") or "seeded-old-window"
+try:
+    s = json.load(open(run))
+except Exception:
+    s = None
+if s is not None:
+    s["last_five_hour_percent"] = 99
+    s["last_five_hour_reset"] = old_reset
+    json.dump(s, open(run, "w"))
 d["claude"]["fiveHourPercent"] = 12
-# A different reset id is what marks the window as having turned over.
 d["claude"]["fiveHourReset"] = time.strftime(
     "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 5 * 3600))
-json.dump(d, open(p, "w"))
-print("✓ 5-hour window now reads 12% with a new reset — the return trip will arm")
+json.dump(d, open(quota, "w"))
+print("✓ window reset: 99% -> 12% with a new reset id — the return trip will arm")
+print("  send one prompt in the ccd session now, before the real dashboard refreshes")
 PY
          ;;
       *) echo "usage: test/usertest.sh quota 99|ok"; exit 2 ;;
