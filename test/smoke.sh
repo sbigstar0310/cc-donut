@@ -780,7 +780,10 @@ case "$row" in
   *) bad "statusline" "no ccd row" ;;
 esac
 # With nothing cached yet, one render pays for it so the rows exist at all.
-rm -f "$FAKE/.claude/ccd/.dashboard-row"
+# Let the refresh above finish first: while one is in flight it holds the lock,
+# and a second render would correctly decline to start another.
+pkill -f "$FAKE/fakebin/node" 2>/dev/null
+rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock"
 cat > "$FAKE/fakebin/node" <<'EOF'
 #!/bin/sh
 echo "FIRST-DASHBOARD-ROW"
