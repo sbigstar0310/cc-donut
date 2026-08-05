@@ -514,6 +514,27 @@ pick() {
 
 doctor() {
   load_env; require_key; apply_tiers
+  # "Why did nothing happen?" is the question the first user test ended on.
+  # Installed is not active, and active in some shell is not supervising THIS one.
+  printf '\n%sAutomatic handoff%s\n' "$b" "$r"
+  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
+    printf '  %s✓%s installed at %s\n' "$grn" "$r" "$(tilde "$CCD_SHIM_DIR/claude")"
+    if shim_leads_path; then
+      printf '  %s✓%s active in this shell — `claude` starts the supervised launcher\n' "$grn" "$r"
+    else
+      printf '  %s✗ not active in this shell%s — `claude` here is the plain one\n' "$red" "$r"
+      printf '      %sOpen a new terminal, or run: %s%s\n' "$d" "$CCD_PATH_LINE" "$r"
+    fi
+    if [ -n "${CCD_HANDOFF:-}" ]; then
+      printf '  %s✓%s this session is supervised — a quota handoff will fire here\n' "$grn" "$r"
+    elif [ -n "${CLAUDECODE:-}" ]; then
+      printf '  %s✗ this session is NOT supervised%s — nothing will hand off from here\n' "$red" "$r"
+      printf '      %sIt started before the launcher was on PATH. /exit, then run claude again.%s\n' "$d" "$r"
+    fi
+  else
+    printf '  %s· off%s — turn it on with: ccd setup --auto\n' "$d" "$r"
+  fi
+
   local model="$ANTHROPIC_MODEL"
   [ $# -ge 1 ] && { model=$(slug_of "$1") || die "Unknown model key: $1"; model=$(with_routing "$model"); }
   # The [1m] hint is Claude Code-local — never send it to the provider.
@@ -540,27 +561,6 @@ doctor() {
   # Context budget per slot: refresh each slug's provider data, then report what
   # apply_tiers will do. Rows show each model's own ceiling; the footer shows the
   # one process-wide window Claude Code actually uses (smallest hinted ceiling).
-  # "Why did nothing happen?" is the question the first user test ended on.
-  # Installed is not active, and active in some shell is not supervising THIS one.
-  printf '\n%sAutomatic handoff%s\n' "$b" "$r"
-  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
-    printf '  %s✓%s installed at %s\n' "$grn" "$r" "$(tilde "$CCD_SHIM_DIR/claude")"
-    if shim_leads_path; then
-      printf '  %s✓%s active in this shell — `claude` starts the supervised launcher\n' "$grn" "$r"
-    else
-      printf '  %s✗ not active in this shell%s — `claude` here is the plain one\n' "$red" "$r"
-      printf '      %sOpen a new terminal, or run: %s%s\n' "$d" "$CCD_PATH_LINE" "$r"
-    fi
-    if [ -n "${CCD_HANDOFF:-}" ]; then
-      printf '  %s✓%s this session is supervised — a quota handoff will fire here\n' "$grn" "$r"
-    elif [ -n "${CLAUDECODE:-}" ]; then
-      printf '  %s✗ this session is NOT supervised%s — nothing will hand off from here\n' "$red" "$r"
-      printf '      %sIt started before the launcher was on PATH. /exit, then run claude again.%s\n' "$d" "$r"
-    fi
-  else
-    printf '  %s· off%s — turn it on with: ccd setup --auto\n' "$d" "$r"
-  fi
-
   printf '\n%sContext budget per slot%s %s([1m] on sonnet/opus; auto-compact = smallest verified pool − headroom)%s\n' "$b" "$d" "$r"
   local slot sm base refreshed ceiling cw hinted_bases=""
   for slot in HAIKU SONNET OPUS; do
