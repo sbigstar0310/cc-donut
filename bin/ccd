@@ -941,13 +941,21 @@ CCD_CLAUDE_SHIM
         if rc=$(rc_file) && ! path_line_present "$rc"; then
           printf '\n  One line is still needed so your shell finds it first:\n'
           printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
-          # Consent, explicitly. With no terminal to ask at, do nothing and say
-          # so — a scripted install must not quietly rewrite a startup file.
+          # Consent, explicitly — but ask wherever a human can actually answer.
+          # `ccd setup` is routinely run as a `!` command inside Claude Code,
+          # where stdin is a pipe; `ccd key` already reaches past that to
+          # /dev/tty for the same reason. Only when there is no controlling
+          # terminal at all do we treat it as scripted and change nothing.
           if [ "$assume_yes" -eq 1 ]; then
             do_edit=1
           elif [ -t 0 ] && [ -t 1 ]; then
             printf '  Add it to %s? %s[Y/n]%s ' "$(tilde "$rc")" "$d" "$r"
             read -r reply || reply=n
+            case "${reply:-y}" in y|Y|yes|YES) do_edit=1 ;; esac
+          elif (exec < /dev/tty) 2>/dev/null; then
+            printf '  Add it to %s? %s[Y/n]%s ' "$(tilde "$rc")" "$d" "$r" > /dev/tty
+            read -r reply < /dev/tty || reply=n
+            printf '\n' > /dev/tty
             case "${reply:-y}" in y|Y|yes|YES) do_edit=1 ;; esac
           fi
           if [ "$do_edit" -eq 1 ]; then
@@ -967,7 +975,8 @@ CCD_CLAUDE_SHIM
               printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
             fi
           else
-            printf '  %sSkipped. Add that line yourself, then open a new terminal.%s\n' "$d" "$r"
+            printf '  %sSkipped — automatic handoff is installed but not active yet.%s\n' "$ylw" "$r"
+            printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
           fi
         elif [ -n "${rc:-}" ]; then
           printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
@@ -1027,7 +1036,7 @@ PY
 
   printf '✓ ccd command installed (~/.local/bin/ccd)\n'
   printf '✓ statusline wired — dashboard output preserved\n'
-  printf '→ This session: /reload-plugins activates the hooks; the statusline appears on your next interaction\n'
+  printf '→ In a running Claude Code session: /reload-plugins activates the hooks\n'
   case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) printf '→ Add to PATH: export PATH="$HOME/.local/bin:$PATH"\n' ;; esac
   if python3 - "$KEYS" <<'PY' >/dev/null 2>&1
 import re, sys

@@ -1141,6 +1141,105 @@ case "$out" in
 esac
 rmdir "$FAKE/.claude/ccd/auto-path"
 
+# Claude Code runs shell commands with stdin and stdout as PIPES while the
+# controlling terminal is still there. That is neither "interactive" nor
+# "scripted", and getting it wrong means the consent prompt silently never
+# appears — which is exactly what happened in the first user test. This helper
+# reproduces that shape, and `bare` drops the controlling terminal too, for the
+# genuinely scripted case.
+cat > "$FAKE/ttyask.py" <<'TTYASK'
+import os, pty, select, sys, time
+
+mode, answer, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+argv = sys.argv[4:]
+master, slave = pty.openpty()
+pid = os.fork()
+if pid == 0:
+    os.close(master)
+    os.setsid()
+    if mode == "ctty":                      # a terminal exists, just not on 0/1
+        import fcntl, termios
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    r, w = os.pipe()
+    os.dup2(r, 0)                           # stdin: a pipe nobody writes to
+    os.close(w)
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    if slave > 2:
+        os.close(slave)
+    try:
+        os.execvp(argv[0], argv)
+    except OSError:
+        os._exit(127)
+
+seen = b""
+status = None
+deadline = time.time() + 25
+while time.time() < deadline:
+    r, _, _ = select.select([master], [], [], 0.2)
+    if r:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            chunk = b""
+        if chunk:
+            seen += chunk
+            if b"[Y/n]" in seen and answer != "none":
+                os.write(master, answer.encode() + b"\n")
+                answer = "none"
+            continue
+    done, st = os.waitpid(pid, os.WNOHANG)
+    if done == pid:
+        status = st
+        break
+if status is None:
+    os.kill(pid, 9)
+    _, status = os.waitpid(pid, 0)
+os.close(slave)
+os.close(master)
+sys.stdout.buffer.write(seen.replace(b"\r\n", b"\n"))
+sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
+TTYASK
+
+# The prompt has to reach a person wherever one is sitting. `ccd key` already
+# reaches past a piped stdin to /dev/tty; consent must do the same, or every
+# install run from inside Claude Code silently declines.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path" "$FAKE/.claude/ccd/bin/claude"
+printf '# mine\n' > "$RC"
+asked=$(python3 "$FAKE/ttyask.py" ctty "" "$FAKE/.ask-out" \
+          env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --auto 2>/dev/null)
+case "$asked" in
+  *"[Y/n]"*) ok "the consent prompt reaches the terminal even with piped stdio" ;;
+  *) bad "consent prompt" "never asked: $(printf '%s' "$asked" | tr '\n' ' ' | head -c 70)" ;;
+esac
+grep -q 'ccd-auto-handoff-path' "$RC" \
+  && ok "...and Enter accepts it" || bad "consent prompt" "answer was not applied"
+
+# Saying no must still mean no.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path" "$FAKE/.claude/ccd/bin/claude"
+printf '# mine\n' > "$RC"
+python3 "$FAKE/ttyask.py" ctty n "$FAKE/.ask-out" \
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+grep -q 'ccd-auto-handoff-path' "$RC" \
+  && bad "consent prompt" "added the line after the user said no" \
+  || ok "answering n leaves the startup file alone"
+grep -q 'not active yet' "$FAKE/.ask-out" \
+  && ok "...and says the feature is installed but not active" \
+  || bad "consent prompt" "declining left the user with no idea where they stand"
+
+# With no controlling terminal at all there is nobody to ask, and a scripted
+# install must not rewrite a startup file on its own.
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path" "$FAKE/.claude/ccd/bin/claude"
+printf '# mine\n' > "$RC"
+python3 "$FAKE/ttyask.py" bare none "$FAKE/.ask-out" \
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
+[ "$(cat "$RC")" = "# mine" ] \
+  && ok "a truly scripted install changes nothing" \
+  || bad "consent prompt" "edited a startup file with nobody to ask"
+rm -f "$FAKE/.ask-out"
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+
 # Nothing internal may leak onto stderr. A missing shell function still "works"
 # — bash treats command-not-found as false — so only stderr reveals it, and every
 # other test here redirects stderr away. This one exists to look at it.
