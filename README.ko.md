@@ -23,7 +23,7 @@ claude plugin marketplace add sbigstar0310/cc-donut
 claude plugin install ccd@cc-donut
 ```
 
-그다음 Claude Code를 열고 `/ccd:setup`을 실행하세요. 재시작은 필요 없습니다. Claude Code가 설정을 자동으로 다시 읽으므로 다음 상호작용부터 statusline이 나타나며, 이미 열린 세션에서는 `/reload-plugins`로 hook을 활성화합니다.
+그다음 Claude Code에서 `/ccd:setup`을 실행하세요. 이미 열려 있는 세션이라면 `/reload-plugins`로 hook을 켭니다.
 
 <details>
 <summary>Claude Code 안에서 설치하고 싶나요?</summary>
@@ -39,9 +39,9 @@ claude plugin install ccd@cc-donut
 
 ## What it does
 
-Claude quota가 바닥나도 cc-donut은 도구, hook, skill, MCP server, 그리고 **지금 대화 자체**를 유지한 채 모델만 OpenRouter로 바꿉니다. 스페어타이어는 본래 임시 수단이므로, 계속 작업하는 동안 cc-donut은 quota reset을 감지해 원래 구독으로 되돌립니다. 영구적인 탈것이 아닙니다. 집까지 갈 만큼의 도넛일 뿐입니다.
+quota가 바닥나면 cc-donut은 여유가 남은 다른 Claude 구독으로, 그것도 없으면 OpenRouter로 대화를 옮깁니다. 도구, hook, skill, MCP server, 그리고 하던 대화는 그대로입니다. quota가 reset되면 다시 구독으로 돌려놓습니다.
 
-왕복에 명령 두 개, 또는 [아예 없이](#automatic-handoff) — `ccd setup --auto`를 켜면 양방향 모두 칠 것이 없습니다. (막힌 그 턴만 다시 보내면 됩니다.)
+왕복에 명령 두 개, `ccd setup --auto`를 켜면 [아예 없이](#automatic-handoff)도 됩니다.
 
 ## Before / After
 
@@ -50,7 +50,7 @@ BEFORE   quota dies mid-task → stuck, restart, lose the thread
 
 AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
          quota resets  → we flag it for you   /exit → claude --resume
-         same conversation, back on your subscription — round trip, zero thread lost
+         same conversation, back on your subscription
 
 AUTO     quota dies    → 🍩 도넛이 알아서 장착        (ccd setup --auto)
          quota resets  → 구독으로 알아서 복귀          칠 것 없음
@@ -62,22 +62,22 @@ AUTO     quota dies    → 🍩 도넛이 알아서 장착        (ccd setup --a
 quota가 남아 있을 때 **미리** 설정하세요. 0이 된 뒤에는 Claude가 설정 과정을 안내할 수 없습니다.
 
 ```sh
-ccd key           # store your OpenRouter key (hidden input, never enters chat)
-ccd doctor        # ✓ OK = your spare is inflated and ready
+ccd key           # OpenRouter 키 저장 (가려진 입력, 대화에 남지 않음)
+ccd doctor        # ✓ OK = 탈출 경로가 살아 있음
 ccd setup --auto  # 선택: 왕복을 알아서 (양방향)
 ```
 
-여기까지가 필요한 전부입니다. 세부 내용은 필요할 때 아래에서 확인하세요.
+macOS와 Linux에서 동작합니다 (bash, python3, curl). OpenRouter 계정과 크레딧이
+필요합니다. 유료 폴백이니까요. [Claude 구독이 하나 더](#multi-account) 있다면
+ccd가 그쪽을 먼저 쓰고, 그건 공짜입니다.
 
-<a name="멀티-계정"></a>
+<a name="multi-account"></a>
 
 <details>
 <summary><b>Claude 구독이 2개 이상이라면 — 돈 쓰기 전에 그것부터</b></summary>
 
-Claude 구독이 하나 더 있는데 그걸 놀려두고 OpenRouter에 돈을 쓸 이유는 없습니다.
-두 계정을 등록해두면 쿼타가 소진될 때 **여유가 남은 계정으로** 대화가 옮겨갑니다.
-같은 대화, 여전히 구독, 과금 없음. OpenRouter는 원래 있어야 할 자리 —
-첫 번째 수단이 아니라 마지막 수단 — 로 돌아갑니다.
+두 계정을 등록해두면 쿼타가 소진될 때 **여유가 남은 계정으로** 대화가 넘어갑니다.
+같은 대화, 여전히 구독, 과금 없음. OpenRouter는 마지막 수단으로 남습니다.
 
 ```sh
 ccd account add                  # 지금 로그인된 계정을 등록
@@ -86,50 +86,34 @@ ccd account add                  # 그 계정도 등록
 ccd account list                 # 두 계정과 실시간 쿼타
 ```
 
-```text
-A 소진  →  B에 여유 있나?  →  B     무과금, 같은 대화
-        →  B도 소진?      →  🍩    OpenRouter, 진짜 최후 수단
-```
-
-나머지는 그대로입니다. 크레덴셜 교체는 **세션과 세션 사이** — 아무도 그것을 붙잡고
-있지 않은 순간 — 에 일어나므로 돌아가는 Claude Code와 다툴 일이 없고, Notion·Slack
-같은 MCP 로그인은 전환의 영향을 받지 않습니다.
-
+나머지는 그대로이고, Notion·Slack 같은 MCP 로그인도 전환의 영향을 받지 않습니다.
 statusline이 지금 어느 계정인지, 예비 계정이 준비됐는지 알려줍니다:
 
 ```text
-● claude:personal │ spare kaist 20%
+● claude:personal │ spare work 20%
 ```
 
-우선순위(등록 순서 또는 `--priority`) 순으로 고르므로 주 계정에 여유가 있는 한
-주 계정을 씁니다. 그리고 **5시간·7일 창 둘 다** 여유가 있을 때만 후보가 됩니다 —
-주간 창이 99%인 계정은 도착하자마자 몇 분 만에 다시 죽습니다.
+등록 순서대로 고르고(`--priority`로 조정), **5시간·7일 창 둘 다** 여유가 있을
+때만 후보가 됩니다. 주간 창이 99%인 계정은 옮겨가자마자 몇 분 만에 또 소진됩니다.
 
-`ccd doctor`가 계정별 쿼타와 — 중요하게 — **재로그인이 필요한 계정**을 짚어줍니다.
-토큰이 만료된 예비 계정은 다른 어디서도 멀쩡해 보이다가 정작 필요한 순간에만
-정체를 드러내기 때문입니다. 애초에 그런 일이 없도록 ccd가 하루 한 번 유휴 계정의
-토큰을 갱신합니다.
+`ccd doctor`가 계정별 쿼타와 재로그인이 필요한 계정을 함께 보여줍니다. 만료된
+토큰은 평소엔 티가 안 나고 정작 필요할 때 드러나므로, ccd가 하루 한 번 유휴 계정의
+토큰을 갱신해 둡니다.
 
 > **여러 계정에 대해.** Anthropic은 구독을 여러 개 보유하는 것 자체는 약관 위반이
 > 아니라고 밝혔습니다. 금지 대상은 계정 공유와 접근 권한 재판매입니다. 이 기능은
 > *본인이 보유한* 구독을 위한 것입니다. 여러 사람이 함께 쓰는 계정을 등록하는 것은
 > 사용자의 판단이자 책임입니다.
 
-계정 토큰은 `~/.claude/ccd/accounts/` 에 mode 600 파일로 저장됩니다. OS에 따라
-동작이 달라지지 않도록 모든 플랫폼에서 저장 방식을 하나로 통일했습니다. Linux와
-Windows에서는 Claude Code가 이미 토큰을 두는 바로 그 방식이고, macOS에서는
-Keychain보다 한 단계 낮습니다 — 이식성의 대가입니다. 퍼미션이 느슨해지면
-`ccd doctor`가 실패로 잡습니다. 삭제는 `ccd account rm <name>` 이며, 파일은
-지우기 전에 덮어씁니다.
+토큰은 `~/.claude/ccd/accounts/` 에 mode 600으로 저장됩니다([SECURITY.md](SECURITY.md)).
+삭제는 `ccd account rm <name>`.
 
 </details>
 
-<a name="자동-전환"></a>
+<a name="automatic-handoff"></a>
 
 <details>
 <summary><b>자동 전환 — 아무 명령도 필요 없음</b></summary>
-
-한 번만 켜두면 왕복에 손이 가지 않습니다.
 
 ```sh
 ccd setup --auto
@@ -142,42 +126,28 @@ startup 파일에 한 줄을 추가해도 되는지 물어봅니다:
 export PATH="$HOME/.claude/ccd/bin:$PATH"
 ```
 
-전용 디렉터리를 쓰는 데는 이유가 있습니다. `~/.local/bin/claude`는 공식 설치
-프로그램이 진짜 바이너리로 가는 symlink를 이미 두는 자리라, 거길 덮으면 그 링크가
-끊기고 Claude Code가 업데이트될 때 symlink를 다시 쓰면서 launcher를 조용히
-지워버립니다. 물음에 아니라고 답하면 ccd는 그 줄을 출력만 하고, `--yes`를 붙이면
-미리 승낙한 것으로 봅니다. `ccd setup --no-auto`와 `ccd uninstall`은 launcher와 그
-줄을 함께 되돌립니다.
+공식 설치 프로그램이 `~/.local/bin/claude`를 쓰기 때문에, 그 자리를 덮지 않고
+전용 디렉터리를 씁니다. 물음에 아니라고 답하면 ccd는 그 줄을 출력만 하고, `--yes`를
+붙이면 미리 승낙한 것으로 봅니다.
 
-그다음부터는 지금까지 하던 대로 `claude`로 시작하면 됩니다. quota가 소진되면
-대화가 알아서 OpenRouter로 넘어가고, window가 reset되면 같은 방식으로 구독으로
-돌아옵니다. 지금 어느 backbone이 답하고 있고 비용이 얼마인지는 statusline의 ccd
-행에 그대로 표시됩니다.
-
-동작 방식: 이 launcher가 진짜 claude를 실행하고 종료 코드를 지켜봅니다. `StopFailure` hook이
-`rate_limit` 오류를 보고 quota 관측치와 대조한 뒤 SIGHUP으로 세션을 끝내면, Claude
-Code는 flush를 마치고 정상 종료(코드 129)하며, launcher가 같은 대화를 반대편
-backbone에서 다시 엽니다.
+그다음부터는 하던 대로 `claude`로 시작하면 됩니다. launcher가 진짜 claude를 실행하고
+종료 코드를 지켜보다가, quota가 소진되면 대화를 OpenRouter로 넘기고 window가
+reset되면 다시 구독으로 돌려놓습니다. 지금 어느 backbone이 답하는지와 비용은
+statusline의 ccd 행에 표시됩니다.
 
 하지 않는 것들:
 
-- **launcher가 받을 준비가 돼 있지 않으면 아무 신호도 보내지 않습니다.** hook은
-  launcher가 내보내는 표시를 확인하며, 없으면 절대 시그널을 보내지 않습니다.
-- **rate_limit 하나만으로는 부족합니다.** quota 관측치가 함께 맞아야 하므로
-  일시적인 throttling으로는 전환되지 않습니다. 관측치가 없으면 전환도 없습니다.
-- **key가 없으면 신호도 없습니다.** 갈 곳 없이 세션을 끝내는 것은 그냥 두는 것보다
-  나쁩니다.
+- **착지할 수 있을 때만 발동합니다.** launcher가 떠 있어야 하고, quota 관측치가
+  rate_limit 오류를 뒷받침해야 하고, key가 설정돼 있어야 합니다. 하나라도 빠지면
+  아무 일도 일어나지 않습니다. 갈 곳 없이 세션이 끝나는 경우는 없습니다.
 - **진행 중이던 turn은 사라집니다.** 실패한 turn 뒤에 전환되므로 마지막 프롬프트는
   다시 보내야 합니다.
 - **비대화형 실행은 재시작하지 않습니다.** `claude -p ...` 는 물론 출력을 redirect한
   경우도 마찬가지입니다. 돌아갈 터미널도, 다시 보낼 프롬프트도 없기 때문에, 대신
   이어가는 방법을 알려줍니다.
-- **구독 자격증명은 건드리지 않습니다.** ccd는 process를 교체할 뿐, login을 proxy하거나
-  중계하지 않습니다.
 
-수동 방법은 그대로 남아 있습니다. `/exit` 후 `ccd -c`는 예전과 똑같이 동작하고 문서에도
-그대로 유지됩니다 — 우회할 수 없는 자동화는 없느니만 못하니, 자동 전환이 안 걸리면 두
-명령으로 그냥 이어가면 됩니다.
+`/exit` 후 `ccd -c`는 예전 그대로 동작하고 문서에도 남아 있습니다. 자동 전환이 안
+걸릴 때 쓰면 됩니다.
 
 끄려면 `ccd setup --no-auto`, `ccd uninstall`로도 제거됩니다. 우리가 만들지 않은
 `~/.claude/ccd/bin/claude`와, 우리가 쓰지 않은 PATH 줄은 언제나 그대로 둡니다.
@@ -189,13 +159,10 @@ backbone에서 다시 엽니다.
 <details>
 <summary><b>What you get</b></summary>
 
-- 🧰 **기존 Claude Code를 그대로 유지** — 전체 scaffold(도구, hook, skill, MCP server, keybinding, history)는 계속 실행되고, ccd는 그 뒤의 모델만 교체합니다.
-- 🔄 **양방향으로 대화가 유지됨** — `ccd -c`는 OpenRouter에서 대화를 재개하고, `claude --resume`은 원래 환경으로 돌아옵니다. 어느 쪽이든 같은 conversation store를 사용합니다.
-- 🎛 **세션 중에도 모든 OpenRouter 모델 사용 가능** — 매우 저렴한 모델을 포함한 수백 개 모델을 재시작 없이 `/model` 한 번으로 전환할 수 있습니다.
-- 🚨 **quota 상태를 대신 확인** — 소진 직전에는 빨간색, reset 감지 시에는 초록색으로 표시합니다(매 상호작용마다 재확인, 최대 10분 신선도, 5시간 및 7일 window). 각각 실행할 정확한 명령도 함께 알려줍니다.
-- 🏠 **두 번째 차가 아닌 스페어타이어** — recovery detection 덕분에 필요 이상으로 도넛을 타지 않고, reset이 보이면 바로 구독으로 돌아갑니다.
-- 💸 **기본값은 최저가 provider, 모든 비용은 표시** — `:floor` routing과 실시간 run/outage spend를 statusline에서 확인합니다.
-- 🔒 **인증 위험 없음** — claude.ai login은 건드리지 않습니다. key는 로컬에 mode 600으로 저장되며 chat에 입력하지 않습니다.
+- **세션 중에도 OpenRouter의 모든 모델을 씁니다.** 수백 개를 재시작 없이 `/model` 한 번으로 바꿉니다.
+- **statusline에서 quota를 지켜봅니다.** 소진 직전엔 빨강, reset이 잡히면 초록. 실행할 명령까지 같이 나옵니다. 매 상호작용마다 5시간·7일 window를 다시 확인합니다.
+- **`:floor` routing, 비용은 화면에.** 기본이 최저가 provider이고, 이번 run과 이번 소진 전체의 지출을 실시간으로 보여줍니다.
+- **claude.ai login은 건드리지 않습니다.** ccd는 process를 교체할 뿐 proxy나 중계를 하지 않습니다. key는 로컬에 mode 600으로만 저장되고 chat에 들어가지 않습니다.
 
 ```text
 ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run $0.0123 · total $0.4200
@@ -250,7 +217,10 @@ catalog는 snapshot이므로 시간이 지나면 오래됩니다. 최신 benchma
 | `ccd -c --routing exacto` | 저렴한 provider가 tool call을 제대로 처리하지 못할 때 |
 | `ccd -c --model provider/model` | direct model로 재개하고 시작 시 pool을 검증·budget 설정 |
 | `ccd off` | 구독 기반 claude 실행으로 복귀 |
-| `ccd setup --auto` | 자동 전환 켜기 — `/exit`도 명령도 필요 없음 ([아래](#자동-전환)) |
+| `ccd account add` | 지금 로그인된 계정을 예비 구독으로 등록 ([위](#multi-account)) |
+| `ccd account list` | 등록된 계정과 실시간 쿼타 |
+| `ccd account rm <name>` | 등록 해제 |
+| `ccd setup --auto` | 자동 전환 켜기 — `/exit`도 명령도 필요 없음 ([아래](#automatic-handoff)) |
 | `ccd setup --no-auto` | 자동 전환 끄기 |
 
 **Claude Code 안의 skills**(`/`를 입력해 찾을 수 있음):

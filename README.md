@@ -23,7 +23,7 @@ claude plugin marketplace add sbigstar0310/cc-donut
 claude plugin install ccd@cc-donut
 ```
 
-Then open Claude Code and run `/ccd:setup`. No restart needed — Claude Code reloads settings automatically, so the statusline appears on your next interaction, and `/reload-plugins` activates the hooks in an already-open session.
+Then open Claude Code and run `/ccd:setup`. In a session that is already open, `/reload-plugins` activates the hooks.
 
 <details>
 <summary>Prefer installing inside Claude Code?</summary>
@@ -39,9 +39,9 @@ Slash commands are parsed **one line at a time** — enter each separately (past
 
 ## What it does
 
-When Claude quota hits the wall, cc-donut keeps your tools, hooks, skills, MCP servers, and the very conversation — and swaps only the model to OpenRouter. And because a spare is temporary by definition: as you keep working, cc-donut spots the quota reset and takes you back to your subscription. Not your forever ride. Just enough donut to get home.
+When quota runs out, cc-donut moves the conversation to a spare Claude subscription if you have one, and to OpenRouter otherwise. Everything else stays in place: tools, hooks, skills, MCP servers, and the conversation you were in. When the quota window resets, it moves you back.
 
-Two commands each way, or [none at all](#automatic-handoff) — with `ccd setup --auto` neither crossing asks anything of you. (The turn that hit the wall is still yours to re-send.)
+Two commands each way, or [none at all](#automatic-handoff) with `ccd setup --auto`.
 
 ## Before / After
 
@@ -50,7 +50,7 @@ BEFORE   quota dies mid-task → stuck, restart, lose the thread
 
 AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
          quota resets  → we flag it for you   /exit → claude --resume
-         same conversation, back on your subscription — round trip, zero thread lost
+         same conversation, back on your subscription
 
 AUTO     quota dies    → 🍩 donut goes on by itself      (ccd setup --auto)
          quota resets  → back on the subscription        nothing to type
@@ -63,21 +63,22 @@ Set it up **while you still have quota** — after zero, Claude can't walk you t
 
 ```sh
 ccd key           # store your OpenRouter key (hidden input, never enters chat)
-ccd doctor        # ✓ OK = your spare is inflated and ready
+ccd doctor        # ✓ OK = the escape route works
 ccd setup --auto  # optional: hand off by itself, both ways
 ```
 
-That's everything you need. Details below when you want them.
+Runs on macOS and Linux (bash, python3, curl). You need an OpenRouter account
+with credit — this is a paid fallback. Got a [second Claude
+subscription](#multi-account)? ccd uses that first, and it costs nothing.
 
 <a name="multi-account"></a>
 
 <details>
 <summary><b>More than one Claude subscription? Use it before you pay</b></summary>
 
-If you have a second Claude subscription, paying OpenRouter while it sits idle
-makes no sense. Register both and quota exhaustion moves the conversation to the
-one that still has room — same conversation, still on the subscription, nothing
-billed. OpenRouter becomes what it should be: the last resort, not the first.
+Register both accounts and quota exhaustion moves the conversation to whichever
+one still has room. Same conversation, still on the subscription, nothing billed.
+OpenRouter stays the last resort.
 
 ```sh
 ccd account add                  # registers whoever is signed in right now
@@ -86,42 +87,26 @@ ccd account add                  # register that one too
 ccd account list                 # both accounts, with live quota
 ```
 
-```text
-quota dies on A  →  B has room?  →  B     free, same conversation
-                 →  B spent too? →  🍩    OpenRouter, the real last resort
-```
-
-Nothing else changes. The launcher swaps the credential between sessions — the
-one moment nothing holds it — so there is no fight with a running Claude Code,
-and your Notion/Slack MCP logins are untouched by the switch.
-
-The statusline names the account you are on and whether a spare is ready:
+Nothing else changes, and your MCP logins (Notion, Slack) are unaffected by the
+switch. The statusline names the account you are on and whether a spare is ready:
 
 ```text
-● claude:personal │ spare kaist 20%
+● claude:personal │ spare work 20%
 ```
 
-Ordering is by priority (registration order, or `--priority`), so your main
-account is preferred while it has room. An account is only offered when **both**
-its 5-hour and 7-day windows have headroom — a weekly window at 99% would die
-again within minutes of arriving.
+Accounts are tried in registration order (`--priority` to change), and only while
+**both** the 5-hour and 7-day windows have room — a weekly window at 99% would
+run out again minutes after arriving.
 
-`ccd doctor` reports each account's quota and, importantly, any that needs a
-re-login: a spare whose token has lapsed looks fine everywhere else and only
-reveals itself at the moment you needed it. ccd refreshes idle accounts once a
-day to keep that from happening at all.
+`ccd doctor` reports each account's quota and flags any that needs a re-login.
+Lapsed tokens look fine until the moment you need them, so ccd refreshes idle
+accounts once a day. Tokens are stored in `~/.claude/ccd/accounts/` (mode 600,
+see [SECURITY.md](SECURITY.md)); `ccd account rm <name>` removes one.
 
 > **On multiple accounts.** Anthropic has said holding more than one subscription
 > is not a terms violation; what is prohibited is sharing an account and reselling
 > access. This feature is for subscriptions *you* hold. Registering an account
 > several people share is your call and your risk.
-
-Account tokens live in `~/.claude/ccd/accounts/` as mode-600 files, one store on
-every platform so the behaviour does not vary by OS. On Linux and Windows that is
-exactly where Claude Code already keeps them; on macOS it is a step down from the
-Keychain, which is the price of that portability. `ccd doctor` fails if the
-permissions ever loosen. Remove one with `ccd account rm <name>` — the file is
-overwritten before it is unlinked.
 
 </details>
 
@@ -129,8 +114,6 @@ overwritten before it is unlinked.
 
 <details>
 <summary><b>Automatic handoff — no commands at all</b></summary>
-
-Opt in once and the round trip stops needing you:
 
 ```sh
 ccd setup --auto
@@ -143,47 +126,34 @@ line to your shell startup file, so your shell finds it first:
 export PATH="$HOME/.claude/ccd/bin:$PATH"
 ```
 
-It gets its own directory on purpose. `~/.local/bin/claude` is where the official
-installer already puts a symlink to the real binary — shadowing it there would
-break that link, and a Claude Code update would rewrite the symlink and silently
-remove the launcher. Say no to the prompt and ccd just prints the line for you;
-`--yes` answers it in advance. `ccd setup --no-auto` and `ccd uninstall` take
-both the launcher and that line back out.
+It gets its own directory rather than shadowing `~/.local/bin/claude`, which the
+official installer owns. Say no to the prompt and ccd prints the line for you;
+`--yes` answers it in advance.
 
-Then keep starting sessions the way you already do — `claude`, unchanged. When
-quota runs out, the conversation comes back on OpenRouter by itself; when the
-window resets, it returns to your subscription the same way. The statusline's
-ccd row tells you which backbone is answering and what it costs.
-
-How it works: the launcher
-that runs the real claude and watches its exit code. A `StopFailure` hook sees
-the `rate_limit` error, confirms against the quota reading, and ends the session
-with SIGHUP — Claude Code exits gracefully (code 129) after flushing, and the
-launcher relaunches the same conversation on the other backbone.
+Then start sessions the way you already do: `claude`, unchanged. The launcher
+runs the real claude and watches its exit code, so when quota runs out the
+conversation comes back on OpenRouter on its own, and returns when the window
+resets. The ccd statusline row shows which backbone is answering and what it
+costs.
 
 What it will not do:
 
-- **Nothing is signalled unless the launcher is there to catch it.** The hook
-  checks for a marker the launcher exports; without it, no signal is ever sent.
-- **A bare rate-limit is not enough.** The quota reading has to agree, so
-  transient throttling doesn't trigger a handoff. No reading means no handoff.
-- **No key, no signal.** Ending a session with nowhere to go is worse than
-  leaving it alone.
-- **The in-flight turn is lost.** The transition happens after the failed turn,
-  so re-send that last prompt.
-- **Non-interactive runs are not relaunched.** `claude -p ...`, or anything with its
-  output redirected, has no terminal to come back to and no prompt to re-send;
-  ccd tells you how to continue instead.
-- **Your subscription credential is never touched.** ccd replaces the process,
-  it does not proxy or relay your login.
+- **It only fires when it can land.** The launcher has to be running, the quota
+  reading has to confirm the rate-limit error, and a key has to be configured.
+  Miss any of those and nothing happens — no session is ever ended with nowhere
+  to go.
+- **The in-flight turn is lost.** The switch happens after the failed turn, so
+  re-send that last prompt.
+- **Non-interactive runs are not relaunched.** `claude -p ...`, or anything with
+  its output redirected, has no terminal to come back to and no prompt to
+  re-send; ccd tells you how to continue instead.
 
-The manual route is not replaced. `/exit` then `ccd -c` still works exactly as
-before, and stays documented — automation you cannot step around is worse than
-none, so if a handoff ever fails to fire you take the two commands and carry on.
+`/exit` then `ccd -c` still works and stays documented, for whenever a handoff
+doesn't fire.
 
-Turn it off with `ccd setup --no-auto`; `ccd uninstall` removes it too. A
-`~/.claude/ccd/bin/claude` that isn't ours, and a PATH line we did not write,
-are always left alone.
+`ccd setup --no-auto` turns it off and `ccd uninstall` removes it. A
+`~/.claude/ccd/bin/claude` that isn't ours, and a PATH line we did not write, are
+always left alone.
 
 </details>
 
@@ -192,13 +162,10 @@ are always left alone.
 <details>
 <summary><b>What you get</b></summary>
 
-- 🧰 **Your whole Claude Code, untouched** — the entire scaffold (tools, hooks, skills, MCP servers, keybindings, history) keeps running; ccd swaps nothing but the model behind it
-- 🔄 **The conversation survives both directions** — `ccd -c` resumes it on OpenRouter, `claude --resume` brings it home; same conversation store either way
-- 🎛 **Any OpenRouter model, mid-session** — hundreds of models incl. dirt-cheap ones, one `/model` away, no restart
-- 🚨 **We watch the tank so you don't have to** — red near exhaustion, green when the reset is detected (re-checked on each interaction, ≤10 min fresh, on the 5-hour and 7-day windows), each with the exact command to run
-- 🏠 **A spare, not a second car** — recovery detection means you never ride the donut a mile longer than needed; back on your subscription as soon as the reset shows up
-- 💸 **Cheapest provider by default, every cent visible** — `:floor` routing + live run/outage spend in the statusline
-- 🔒 **Zero auth risk** — your claude.ai login is never touched; key stored locally (600), never typed in chat
+- **Any OpenRouter model, mid-session.** Hundreds of them, one `/model` away, no restart.
+- **Quota warnings in the statusline.** Red near exhaustion, green when the reset lands, each with the command to run. Checked on every interaction against the 5-hour and 7-day windows.
+- **`:floor` routing, spend on screen.** Cheapest provider by default; this run and the whole outage, live.
+- **Your claude.ai login is never touched.** ccd replaces the process; it does not proxy or relay. The key stays local (mode 600) and never enters the chat.
 
 ```text
 ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run $0.0123 · total $0.4200
@@ -209,7 +176,7 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 <details>
 <summary><b>Models — defaults and switching</b></summary>
 
-Sensible defaults are pre-wired onto the aliases you already use:
+Defaults, wired onto the aliases you already use:
 
 | Alias | Default model | Price (in/out per 1M) | Use for |
 | --- | --- | --- | --- |
@@ -217,7 +184,7 @@ Sensible defaults are pre-wired onto the aliases you already use:
 | `/model sonnet` | openai/gpt-5.6-luna | $0.10 / $0.60 | everyday coding |
 | `/model opus` | moonshotai/kimi-k3 | $2.90 / $14.00 | hard problems, debugging |
 
-But you're not limited to these. Any slug from [openrouter.ai/models](https://openrouter.ai/models) works mid-session:
+Any slug from [openrouter.ai/models](https://openrouter.ai/models) works mid-session:
 
 ```text
 /model z-ai/glm-5.2:floor
@@ -235,7 +202,7 @@ The statusline cannot change a running Claude Code process itself. Follow its ex
 
 Remap the aliases permanently with `ccd pick` (an offline menu over the curated catalog), per-run with `ccd -c --opus sol`, or resume a direct model with its launch-time context budget via `ccd -c --model provider/model`.
 
-The catalog is a snapshot and goes stale. To refresh it with current benchmarks and prices, ask Claude (while you have quota): *"refresh the ccd model picks"* — the `/ccd` skill researches independent benchmarks and live OpenRouter pricing, recomputes the price/performance frontier, and proposes an updated catalog before writing anything.
+The catalog is a snapshot and goes stale. To refresh it with current benchmarks and prices, ask Claude (while you have quota): *"refresh the ccd model picks"* — the `/ccd` skill proposes an updated catalog from current benchmarks and prices before writing anything.
 
 </details>
 
@@ -253,6 +220,9 @@ The catalog is a snapshot and goes stale. To refresh it with current benchmarks 
 | `ccd -c --routing exacto` | If a cheap provider fumbles tool calls |
 | `ccd -c --model provider/model` | Resume with a direct model; verify and budget its pool at launch |
 | `ccd off` | Run claude on the subscription again |
+| `ccd account add` | Register the signed-in account as a spare subscription ([above](#multi-account)) |
+| `ccd account list` | Registered accounts with live quota |
+| `ccd account rm <name>` | Remove one |
 | `ccd setup --auto` | Opt in to automatic handoff — no `/exit`, no commands ([below](#automatic-handoff)) |
 | `ccd setup --no-auto` | Turn automatic handoff back off |
 
@@ -278,7 +248,7 @@ Complete emergency runbook (readable without Claude, kept offline at `~/.claude/
 
 A `UserPromptSubmit`/`PostToolUse` hook tracks OpenRouter spend against two baselines (this run, this whole outage) and detects Claude quota resets. State and config live under `~/.claude/ccd/`.
 
-Quota warnings and recovery detection need the optional [claude-dashboard](https://github.com/uppinote20/claude-dashboard) plugin (it supplies the quota data). Without it, switching and cost tracking still work — you just don't get the red/green nudges.
+Quota readings come from the [claude-dashboard](https://github.com/uppinote20/claude-dashboard) plugin. **Automatic handoff needs it**: a handoff only arms when a quota reading confirms the rate-limit error, so with no reading there is nothing to confirm and nothing fires. Manual `ccd -c`, cost tracking, and model switching work without it.
 
 </details>
 
@@ -303,7 +273,7 @@ macOS and break Linux users. CI runs all three on every push.
 - **Officially unsupported path**: both Anthropic and OpenRouter state that Claude Code targeting non-Claude models isn't guaranteed. It works via the standard model-slot variables today, but a Claude Code update could break it — hence `ccd doctor`.
 - Behind a gateway, Claude Code budgets 200K context unless the model ID carries the `[1m]` hint. ccd applies `[1m]` automatically at launch when fresh cached OpenRouter endpoint data confirms every eligible default-pool provider serves >200K for that slug (unverified models stay at the safe 200K budget; check with `ccd doctor`). `[1m]` goes only on the conversation slots (sonnet/opus) — the haiku chore slot keeps the safe 200K budget, because Claude Code has one global auto-compact window per process and hinting a small chore-model pool would crush it for every model. The **effective window** is the smallest verified pool minimum among hinted slots with headroom (`min × 0.92`, capped at `min − 40K`), so auto-compaction fires at the model's real context ceiling (e.g. ~839K for a 912K-pool model), never at a fake 1M. Catalog Pareto/default candidates warm their metadata in the background after launch; this never delays the selected-slot gate. A later native `/model <slug>` cannot resize the already-running global window: ccd can only show whether a manual `[1m]` reselect is safe or whether restart/resume is required. `[1m]` does not enlarge the upstream model.
 - Remote Control, voice input, and fast mode are off while on the external backbone.
-- macOS-focused (the key dialog uses osascript); the core flow is plain bash + python3 + curl.
+- macOS and Linux. The core is plain bash + python3 + curl; only the key-entry dialog is macOS-specific (osascript), and elsewhere it falls back to a hidden terminal prompt.
 
 </details>
 

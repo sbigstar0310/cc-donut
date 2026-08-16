@@ -59,11 +59,11 @@ echo '{"model":{"id":"claude-opus-5"},"workspace":{"current_dir":"/tmp"}}' | ./b
 #   --name 없이 실행 → 이메일 local part가 이름이 되고 label도 자동으로 붙는다
 ```
 
-이제 **다른 터미널에서** KAIST 계정으로 로그인:
+이제 **다른 터미널에서** 두 번째 계정으로 로그인:
 
 ```sh
 claude
-# /login  → KAIST 계정 선택 → 완료되면 /exit
+# /login  → 두 번째 계정 선택 → 완료되면 /exit
 ```
 
 돌아와서:
@@ -77,14 +77,14 @@ claude
 
 ```
 Claude accounts
-  ○ sbigstar0930   p1   5h 48% · 7d 77%   sbigstar0930@gmail.com
-  ● <kaist-id>     p2   5h 3% · 7d 12%    <...>@kaist.ac.kr
+  ○ personal       p1   5h 48% · 7d 77%   personal@example.com
+  ● work           p2   5h  3% · 7d 12%   work@example.com
 ```
 
 확인 포인트:
 
 - 이름과 label이 **자동으로** 붙었나 (`--name`, `--label` 안 줬다)
-- `●`가 방금 로그인한 KAIST에 있나
+- `●`가 방금 로그인한 두 번째 계정에 있나
 - 두 계정의 쿼타가 각각 다르게 나오나 → **비활성 계정 쿼타 조회가 실제로 된다는 증거**
 
 ```sh
@@ -107,7 +107,7 @@ ls -la ~/.claude/ccd/accounts/     # 디렉터리 700, 파일 600
 
 ```sh
 ./bin/ccd-account current
-#   기대: 개인 계정 이름. (KAIST가 나오면 실패)
+#   기대: 첫 번째 계정 이름. (두 번째 계정이 나오면 실패)
 
 cat ~/.claude/ccd/accounts/.active
 #   기대: 같은 값. 포인터가 스스로 고쳐졌다.
