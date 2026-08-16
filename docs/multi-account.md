@@ -142,7 +142,7 @@ User-Agent: anthropic
     "checked_at": 1755300000,
     "status": "ok"                      // ok | stale | dead | error
   },
-  "kaist": { … }
+  "work": { … }
 }
 ```
 
@@ -160,7 +160,7 @@ User-Agent: anthropic
   "armed": true,
   "token": "<32 hex>",
   "direction": "to_account",        // ← 신규
-  "account": "kaist",               // ← 신규. to_account 일 때만
+  "account": "work",                // ← 신규. to_account 일 때만
   "session_id": "…",
   "cwd": "…",
   "armed_at": 1755300000
