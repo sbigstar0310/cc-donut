@@ -143,8 +143,8 @@ PY
 # shared file, a second session exiting 129 for any reason would consume the
 # first session's handoff, resume the WRONG conversation, and leave the session
 # that was actually signalled with nothing to bring it back.
-write_handoff() {  # $1=armed(true|false) $2=direction $3=session_id $4=cwd
-  CCD_ARMED="$1" CCD_DIR_TO="$2" CCD_SID="$3" CCD_CWD="$4" CCD_HF="$HANDOFF" \
+write_handoff() {  # $1=armed(true|false) $2=direction $3=session_id $4=cwd [$5=account]
+  CCD_ARMED="$1" CCD_DIR_TO="$2" CCD_SID="$3" CCD_CWD="$4" CCD_ACCT="${5:-}" CCD_HF="$HANDOFF" \
   CCD_TOKEN="${CCD_HANDOFF:-}" \
     python3 - <<'PY'
 import json, os, tempfile, time
@@ -152,11 +152,16 @@ p = os.environ["CCD_HF"]
 state = {
     "armed": os.environ["CCD_ARMED"] == "true",
     "token": os.environ.get("CCD_TOKEN", ""),
-    "direction": os.environ["CCD_DIR_TO"],      # to_fallback | to_subscription
+    # to_fallback | to_subscription | to_account
+    "direction": os.environ["CCD_DIR_TO"],
     "session_id": os.environ["CCD_SID"],
     "cwd": os.environ["CCD_CWD"],
     "armed_at": int(time.time()),
 }
+# Only meaningful for to_account; absent otherwise so the launcher's existing
+# two directions read exactly the state shape they always have.
+if os.environ.get("CCD_ACCT"):
+    state["account"] = os.environ["CCD_ACCT"]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".handoff.")
 try:
     with os.fdopen(fd, "w") as f:
@@ -300,11 +305,55 @@ PY
 # Everything that must hold before a session may be ended. Checked BEFORE arming,
 # not after: an armed file left behind by an unsupervised or unready session
 # would be consumed by a later launcher and resume the wrong conversation.
-handoff_ready() {
+#
+# Split by destination, because the readiness conditions genuinely differ. A hop
+# to another Claude account needs no OpenRouter key — requiring one would strand
+# a user who has two subscriptions and no intention of ever paying OpenRouter,
+# which is exactly the case this feature exists to serve.
+handoff_ready_account() {
   launcher_present || return 1
   valid_session_id "$SESSION_ID" || return 1
-  have_key || return 1
   claude_pid >/dev/null || return 1
+}
+
+handoff_ready() {
+  handoff_ready_account || return 1
+  have_key || return 1
+}
+
+# Is the multi-account feature in use at all? This hook fires on every prompt AND
+# every tool use, so the paths below must cost nothing for the many users who
+# never register an account. A shell glob forks nothing; asking ccd-account would
+# spawn a Python interpreter several times a minute to be told "none".
+# Positional parameters are function-local, so this clobbers nothing.
+has_accounts() {
+  set -- "$CCD_DIR/accounts"/*.json
+  [ -e "$1" ]
+}
+
+# Locate ccd-account. The hook runs from the plugin, so a sibling lookup off
+# CLAUDE_PLUGIN_ROOT is the direct answer; the glob covers a hook invoked by hand.
+ccd_account_bin() {
+  local t
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/bin/ccd-account" ]; then
+    printf '%s' "$CLAUDE_PLUGIN_ROOT/bin/ccd-account"; return 0
+  fi
+  t=$(ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd-account 2>/dev/null | sort -V | tail -1)
+  [ -n "$t" ] && { printf '%s' "$t"; return 0; }
+  return 1
+}
+
+# Name of a registered account with quota left, or empty. Excludes the launcher's
+# per-burst visited set so an account already tried in this burst is not offered
+# again (see docs/multi-account.md §5.2).
+#
+# Silent and cheap when the feature is unused: no accounts registered means
+# ccd-account exits 1 immediately without touching the network.
+pick_account() {
+  local ab
+  has_accounts || return 1
+  ab=$(ccd_account_bin) || return 1
+  "$ab" --no-color pick --exclude "${CCD_BURST_VISITED:-}" 2>/dev/null
 }
 
 # StopFailure fires when a turn ends on an API error. Its output is ignored by
@@ -313,18 +362,28 @@ if [ "$EVENT" = "StopFailure" ]; then
   # Corroborate: the error says rate_limit AND the dashboard agrees we are spent.
   # Either alone is not enough — a rate_limit can be transient, and a high
   # reading alone does not mean the request actually failed.
-  if [ "$ERROR_TYPE" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ] && handoff_ready; then
+  if [ "$ERROR_TYPE" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ] && handoff_ready_account; then
     peak=$(quota_peak)
     case "$peak" in
       ''|*[!0-9]*) : ;;   # no trustworthy reading → stay disarmed
       *) if [ "$peak" -ge "$ARM_THRESHOLD" ]; then
+           # Prefer another subscription over paying. Only when every registered
+           # account is spent (or none are registered) do we fall to OpenRouter.
+           direction=""; account=""
+           if account=$(pick_account) && [ -n "$account" ]; then
+             direction=to_account
+           elif have_key; then
+             direction=to_fallback; account=""
+           fi
            # Arm first, then signal: the launcher must find the file when the
            # session exits. If the write fails, do NOT signal — ending a session
            # whose handoff was never recorded leaves nothing to bring it back.
-           if write_handoff true to_fallback "$SESSION_ID" "$HOOK_CWD"; then
-             request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
-           else
-             rm -f "$HANDOFF" 2>/dev/null || true
+           if [ -n "$direction" ]; then
+             if write_handoff true "$direction" "$SESSION_ID" "$HOOK_CWD" "$account"; then
+               request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
+             else
+               rm -f "$HANDOFF" 2>/dev/null || true
+             fi
            fi
          fi ;;
     esac
@@ -344,9 +403,14 @@ except Exception:
     raise SystemExit(0)
 if not s.get("armed"):
     raise SystemExit(0)
-msg = ("[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다"
-       if s.get("direction") == "to_fallback"
-       else "[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다")
+direction = s.get("direction")
+if direction == "to_fallback":
+    msg = "[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다"
+elif direction == "to_account":
+    msg = (f"[ccd] ✓ {s.get('account') or '다른'} 계정으로 갈아탑니다 "
+           "— 구독 그대로, 대화 그대로 이어집니다")
+else:
+    msg = "[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다"
 print(json.dumps({"systemMessage": msg}, ensure_ascii=False))
 PY
   fi
@@ -470,6 +534,36 @@ if [ -n "${CCD_ACTIVE:-}" ]; then
   update_ccd_state
   [ -f "$RUN_STATE" ] || exit 0
 
+  # Every minute on the external backbone costs real money, and a spare
+  # subscription costs nothing — so do not wait for the account we left to
+  # recover if another one already has room. This fires before the recovery
+  # logic below and is otherwise entirely additive.
+  #
+  # Decide from cache and warm it in the background: this runs on UserPromptSubmit,
+  # where a blocking probe would freeze the user's prompt for seconds.
+  if has_accounts && handoff_ready_account; then
+    ab=$(ccd_account_bin) || ab=""
+    if [ -n "$ab" ]; then
+      ("$ab" --no-color pick --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &) || true
+      esc=$("$ab" --no-color pick --no-probe --exclude "${CCD_BURST_VISITED:-}" 2>/dev/null) || esc=""
+      if [ -n "$esc" ]; then
+        if write_handoff true to_account "$SESSION_ID" "$HOOK_CWD" "$esc"; then
+          printf '%s\n' "$(ESC="$esc" EVENT="$EVENT" python3 -c '
+import json, os
+msg = (f"[ccd] A Claude subscription with quota is available again ({os.environ[\"ESC\"]}). "
+       "This conversation is moving off the paid OpenRouter backbone and back onto the "
+       "subscription now. Nothing to type.")
+print(json.dumps({"hookSpecificOutput": {"hookEventName": os.environ["EVENT"],
+                  "additionalContext": msg}}, ensure_ascii=False))')"
+          request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
+        else
+          rm -f "$HANDOFF" 2>/dev/null || true
+        fi
+        exit 0
+      fi
+    fi
+  fi
+
   # AUTO is on only when the launcher is supervising this process; without it the
   # advice below must keep naming the manual commands, since nothing will relaunch.
   # Auto return needs the same readiness as the outbound trip: a supervising
@@ -548,6 +642,16 @@ PY
     request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
   fi
   exit 0
+fi
+
+# Keep spare accounts alive. A refresh token lasts ~8.5 days and every refresh
+# mints a new one, so a daily touch keeps an unused account usable indefinitely.
+# Without it the spare dies quietly and the user discovers it at the exact moment
+# they needed it — the failure ccd exists to prevent. Backgrounded: this must
+# never add latency to a prompt, and it is a no-op on all but one tick a day.
+if [ -z "${CCD_ACTIVE:-}" ] && has_accounts; then
+  ka=$(ccd_account_bin) || ka=""
+  [ -n "$ka" ] && ("$ka" --no-color keepalive >/dev/null 2>&1 &) || true
 fi
 
 [ -f "$CACHE" ] || exit 0

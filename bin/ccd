@@ -12,8 +12,13 @@
 #   ccd pick               Choose models for the haiku/sonnet/opus slots (saved)
 #   ccd models             Model catalog (slugs to paste into /model in a session)
 #   ccd key                Enter the OpenRouter API key (no editor needed)
+#   ccd account list       Registered Claude accounts and their quota
+#   ccd account add        Register the currently signed-in account as a spare
 #   ccd doctor [key]       Validate with one API round trip before starting claude
 #   ccd off                Run with the subscription again
+#
+# With two or more accounts registered, quota exhaustion moves the conversation to
+# a spare subscription first and only reaches OpenRouter when every one is spent.
 #
 # Switching back costs nothing. ANTHROPIC_AUTH_TOKEN masks the claude.ai login only
 # in that process. Run `claude` in a new terminal to return to the subscription automatically.
@@ -533,6 +538,65 @@ doctor() {
     fi
   else
     printf '  %s· off%s — turn it on with: ccd setup --auto\n' "$d" "$r"
+  fi
+
+  # Spare subscriptions. A dead spare is worth reporting loudly: it looks fine in
+  # every other view, and its failure only surfaces at the moment of the handoff.
+  printf '\n%sSpare Claude accounts%s\n' "$b" "$r"
+  if [ ! -x "$SELF_DIR/ccd-account" ]; then
+    printf '  %s· unavailable%s — ccd-account is missing from this install\n' "$d" "$r"
+  else
+    local acct_json
+    acct_json=$("$SELF_DIR/ccd-account" --no-color list --json 2>/dev/null)
+    ACCT_JSON="$acct_json" ACCT_DIR="$CCD_DIR/accounts" python3 - <<'PY'
+import json, os, stat
+try:
+    d = json.loads(os.environ.get("ACCT_JSON") or "")
+except Exception:
+    d = None
+G, Y, R, DIM, RS = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+if not isinstance(d, dict) or not d.get("accounts"):
+    print(f"  {DIM}· none registered{RS} — with a second Claude subscription, "
+          f"quota exhaustion moves there before OpenRouter")
+    print(f"      {DIM}Register the current login:  ccd account add{RS}")
+    raise SystemExit(0)
+accounts = d["accounts"]
+for a in accounts:
+    q = a.get("quota") or {}
+    st = q.get("status")
+    mark = f"{G}●{RS}" if a.get("active") else f"{DIM}○{RS}"
+    if st == "ok":
+        parts = [f"{lbl} {q[k]}%" for k, lbl in
+                 (("five_hour_percent", "5h"), ("seven_day_percent", "7d"))
+                 if isinstance(q.get(k), (int, float))]
+        tint = G if a.get("headroom") else Y
+        body = f"{tint}{' · '.join(parts)}{RS}"
+    elif st == "dead":
+        body = f"{R}needs re-login — cannot receive a handoff{RS}"
+    else:
+        body = f"{DIM}quota unreadable{RS}"
+    role = "active" if a.get("active") else "spare"
+    print(f"  {mark} {a['name']:<14} {DIM}{role:<6}{RS} {body}")
+spares = [a for a in accounts if not a.get("active")]
+if not spares:
+    print(f"      {DIM}Only one account registered — sign in to another "
+          f"(/login) and run `ccd account add`.{RS}")
+elif not any(a.get("headroom") for a in spares):
+    print(f"      {DIM}No spare has room right now; a handoff would go to "
+          f"OpenRouter.{RS}")
+# The store holds refresh tokens good for days. Loose permissions matter.
+p = os.environ["ACCT_DIR"]
+try:
+    mode = stat.S_IMODE(os.stat(p).st_mode)
+    if mode & 0o077:
+        print(f"  {R}✗{RS} {p} is mode {mode:o} — should be 700. Fix: chmod 700 {p}")
+    bad = [f for f in os.listdir(p) if f.endswith(".json")
+           and stat.S_IMODE(os.stat(os.path.join(p, f)).st_mode) & 0o077]
+    if bad:
+        print(f"  {R}✗{RS} world/group-readable account files: {', '.join(bad)}")
+except OSError:
+    pass
+PY
   fi
 
   local model="$ANTHROPIC_MODEL"
@@ -1194,6 +1258,10 @@ case "${1:-}" in
   key)    set_key; exit 0 ;;
   models) [ -f "$CATALOG" ] || die "Catalog not found: $CATALOG"; show_models; exit 0 ;;
   pick)   pick; exit 0 ;;
+  account)
+          shift
+          [ -x "$SELF_DIR/ccd-account" ] || die "ccd-account is missing from this install"
+          exec "$SELF_DIR/ccd-account" "$@" ;;
   doctor) shift; doctor "$@"; exit 0 ;;
   off)    shift
           unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \

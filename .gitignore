@@ -2,3 +2,11 @@
 *.env
 !templates/openrouter.env
 keys.env
+
+# Account credential store. It normally lives in ~/.claude/ccd/accounts/ and never
+# inside the repo, but these files hold OAuth refresh tokens that stay valid for
+# days — the cost of one stray copy being committed is far higher than the cost of
+# this rule existing.
+accounts/
+.credentials.json
+claude-creds-backup.json

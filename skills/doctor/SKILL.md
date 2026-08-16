@@ -31,14 +31,26 @@ Run everything yourself and report tersely; never send the user to a terminal.
    `⬆ v<latest> available — run /ccd:update`; if the fetch failed (offline),
    say the version check was skipped, never guess.
 
-3. On failure, map the code to the fix and offer to do it now:
+3. `ccd doctor` also prints a **Spare Claude accounts** block. Report it in one
+   line, and treat two cases as findings rather than status:
+   - any account marked `needs re-login` → surface it even if everything else is
+     `✓ OK`. That spare cannot receive a handoff, and nothing else in the system
+     will reveal it until the handoff itself fails. Offer the fix: `claude` →
+     `/login` as that account → `ccd account add --force --name <name>`.
+   - a `✗` on store permissions → the file holds a refresh token good for days.
+     Offer to run the `chmod` it names.
+
+   If no accounts are registered, mention once that a second Claude subscription
+   would be used before OpenRouter, and drop it if they have only one.
+
+4. On failure, map the code to the fix and offer to do it now:
    - 401/403 → key invalid/expired → offer the `key` skill paths (paste in
      chat with consent, or native dialog/terminal)
    - 402 → OpenRouter balance empty → link openrouter.ai/credits
    - 400/404 → model slug stale → show the failing slug, check
      openrouter.ai/models, offer to fix the catalog after approval
    - network → retry once, then report
-4. If the user asks about a specific model/slot, run `~/.local/bin/ccd doctor <key>`
+5. If the user asks about a specific model/slot, run `~/.local/bin/ccd doctor <key>`
    for that slot (e.g. `flash`, `terra`).
 
 Never print the key file's contents; only ever state whether the key is set.

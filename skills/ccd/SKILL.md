@@ -47,6 +47,33 @@ ccd doctor
 If it doesn't print `✓ OK`, relay the per-HTTP-code cause verbatim to the user.
 401/403 is a key problem, 402 is insufficient balance, 400/404 is a model-slug problem.
 
+### 3.5 Ask whether they have a second Claude subscription
+
+Do this before talking about models — a second subscription is strictly better
+than any OpenRouter model, because it is free and it is real Claude.
+
+```sh
+ccd account list
+```
+
+- **Nothing registered:** ask whether they have another Claude account (a work,
+  lab, or personal one). If yes, walk them through it: `ccd account add` registers
+  whoever is signed in now; then they run `claude`, `/login` as the other account,
+  and `ccd account add` again. After that, quota exhaustion hops to the spare
+  subscription and only reaches OpenRouter when every account is spent.
+- **One registered:** that alone does nothing. Say so plainly and offer to finish
+  the second one.
+- **Any account shows `needs re-login`:** this is urgent and easy to miss. That
+  spare cannot receive a handoff, and the failure is invisible until the moment
+  it is needed. Fix it now: `claude` → `/login` as that account →
+  `ccd account add --force --name <name>`.
+
+Registering requires signing in, so it is impossible once quota is at zero — this
+belongs in the preparation phase, same as the key.
+
+Do not push this on someone with a single subscription; for them the OpenRouter
+path is the whole answer and a second account is not something to go buy.
+
 ### 4. Adjust slot assignments if needed
 
 ```sh
@@ -111,6 +138,14 @@ prices move and new models ship), do this:
 
 - The emergency switch is one command in a terminal: **`ccd -c`**. It resumes the
   conversation they were in.
+- **If a second Claude account is registered, OpenRouter is no longer the first
+  stop.** Quota exhaustion moves the conversation to the spare subscription —
+  free, still real Claude — and only reaches OpenRouter when every registered
+  account is spent. `ccd account list` shows which account is active and whether
+  a spare has room; the statusline shows the same as `● claude:<name> │ spare …`.
+- A spare account that reports `needs re-login` is the one failure worth raising
+  unprompted. It looks healthy in every other view and only surfaces at the
+  moment of the handoff, which is the moment the user cannot fix it.
 - After switching, models change in-session via `/model haiku|sonnet|opus`, or a
   direct `/model <slug>`. Selection needs no restart. A direct model is outside
   ccd's launch-time context budget until the statusline evaluates fresh provider
