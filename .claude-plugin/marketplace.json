@@ -1,6 +1,6 @@
 {
   "name": "cc-donut",
-  "description": "The donut spare for Claude quota exhaustion: emergency OpenRouter backbone, same conversation",
+  "description": "The donut spare for Claude quota exhaustion: hop to your other Claude subscription first, OpenRouter as the last resort — same conversation throughout",
   "owner": {
     "name": "sbigstar"
   },
@@ -8,9 +8,9 @@
     {
       "name": "ccd",
       "source": "./",
-      "description": "The donut spare for Claude quota exhaustion: emergency OpenRouter backbone, same conversation",
-      "version": "0.3.0"
+      "description": "The donut spare for Claude quota exhaustion: hop to your other Claude subscription first, OpenRouter as the last resort — same conversation throughout",
+      "version": "0.4.0"
     }
   ],
-  "version": "0.3.0"
+  "version": "0.4.0"
 }

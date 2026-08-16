@@ -1,0 +1,1238 @@
+#!/usr/bin/env python3
+"""ccd account store — multi-account quota handoff.
+
+Single owner of everything account-related: the credential store, quota polling,
+OAuth refresh, and the swap itself. quota-guard.sh and ccd-handoff both shell out
+to this script rather than sharing bash functions, because they run in different
+processes at different moments.
+
+Design notes live in docs/multi-account.md. The three facts this file is built on:
+
+  1. GET https://api.anthropic.com/api/oauth/usage answers for ANY token, so a
+     stored account's quota can be read without making it active. Without this
+     the whole feature collapses into "swap and hope".
+  2. The credential blob also holds `mcpOAuth` (Notion/Slack logins), which is
+     account-INDEPENDENT. A swap replaces only the `claudeAiOauth` subtree; a
+     wholesale overwrite would log the user out of their MCP servers on every hop.
+  3. Access tokens live ~8h, refresh tokens ~8.5 DAYS and rotate on every use.
+     So: refresh rarely, serialize it, write the rotated token to disk BEFORE
+     using the new access token, and never refresh the account Claude Code owns.
+
+Commands:
+  ccd account add [--name N] [--label L] [--priority P]
+  ccd account list [--json]
+  ccd account rm <name>
+  ccd account use <name> [--json]
+  ccd account refresh [--all] [--inactive-only] [<name>]
+  ccd account pick [--exclude a,b] [--json]
+  ccd account keepalive          (internal: called by the hook, at most daily)
+  ccd account current [--json]   (internal: statusline / doctor)
+"""
+
+import argparse
+import errno
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Anthropic has been moving token exchange from console.anthropic.com to
+# platform.claude.com. Try both, remember which one answered.
+TOKEN_URLS = (
+    "https://console.anthropic.com/v1/oauth/token",
+    "https://platform.claude.com/v1/oauth/token",
+)
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+USER_AGENT = "ccd"
+
+# An account is a candidate only if EVERY window it reports is below this.
+# Deliberately lower than quota-guard's ARM_THRESHOLD (95): escaping a 95% account
+# onto a 92% one just means hopping again in a few minutes.
+HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
+CANDIDATE_TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
+KEEPALIVE_INTERVAL = int(os.environ.get("CCD_KEEPALIVE_INTERVAL", "86400"))
+# Refresh a stored token this long before it actually expires.
+REFRESH_SKEW = 300
+# Overridable so the test suite can drive it to ~1s. A test that reaches the real
+# network is a bug in the test, but it must fail fast and loudly rather than hang
+# the suite for ten seconds per account while quietly calling Anthropic.
+HTTP_TIMEOUT = int(os.environ.get("CCD_HTTP_TIMEOUT", "10"))
+LOCK_TIMEOUT = 5
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+# Derived from HOME only — never from a CCD_DIR override. bin/ccd, quota-guard.sh
+# and ccd-handoff all hardcode $HOME/.claude/ccd, and the handoff interlock
+# compares a path string computed independently on each side: an override honored
+# here but not there would silently disable the whole handoff. HOME is also what
+# the test suite swaps, so this stays testable.
+CCD_DIR = os.path.join(os.path.expanduser("~"), ".claude", "ccd")
+ACCOUNTS_DIR = os.path.join(CCD_DIR, "accounts")
+ACTIVE_FILE = os.path.join(ACCOUNTS_DIR, ".active")
+# When ccd itself last set the pointer, so a profile read can be judged stale
+# or fresh relative to our own swap. See active_name().
+ACTIVE_AT_FILE = os.path.join(ACCOUNTS_DIR, ".active-at")
+LOCK_FILE = os.path.join(ACCOUNTS_DIR, ".lock")
+ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
+QUOTA_FILE = os.path.join(CCD_DIR, "accounts-quota.json")
+KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
+
+
+def claude_config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude"
+    )
+
+
+def credentials_file():
+    return os.path.join(claude_config_dir(), ".credentials.json")
+
+
+# ── Small utilities ──────────────────────────────────────────────────────────
+
+C_RESET, C_DIM, C_BOLD = "\033[0m", "\033[2m", "\033[1m"
+C_GRN, C_YLW, C_RED, C_CYN = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
+
+
+def color(on):
+    if not on:
+        for k in ("C_RESET", "C_DIM", "C_BOLD", "C_GRN", "C_YLW", "C_RED", "C_CYN"):
+            globals()[k] = ""
+
+
+def warn(msg):
+    sys.stderr.write(f"{C_YLW}ccd account: {msg}{C_RESET}\n")
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"{C_RED}ccd account: {msg}{C_RESET}\n")
+    raise SystemExit(code)
+
+
+def now():
+    return int(time.time())
+
+
+def ensure_dirs():
+    os.makedirs(ACCOUNTS_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(ACCOUNTS_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def write_atomic(path, text, mode=0o600):
+    """Write via a temp file in the same directory, then rename. A crash leaves
+    either the old file or the new one, never a truncated blend."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".ccd-acct.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def write_json(path, obj, mode=0o600):
+    write_atomic(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n", mode)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+class Lock:
+    """flock around every mutation of the store or the live blob.
+
+    fcntl is absent on some platforms; degrade to no locking rather than refusing
+    to run, since the alternative is the feature simply not working there."""
+
+    def __init__(self, path, timeout=LOCK_TIMEOUT):
+        self.path = path
+        self.timeout = timeout
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+        except ImportError:
+            return self
+        ensure_dirs()
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.time() >= deadline:
+                    os.close(self.fd)
+                    self.fd = None
+                    die("another ccd account operation is in progress — try again")
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+# ── Live credential blob (owned by Claude Code) ──────────────────────────────
+#
+# NOTE: this is NOT the ccd account store. The store is a file on every platform
+# (docs/multi-account.md §9.1). The LIVE blob has to live wherever Claude Code
+# actually reads it, and that location is platform-dependent — an external
+# contract, not a design choice. It is confined to these two functions.
+
+
+def _keychain_read():
+    try:
+        p = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        d = json.loads(p.stdout.strip())
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _keychain_write(blob):
+    account = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not account:
+        try:
+            import getpass
+
+            account = getpass.getuser()
+        except Exception:
+            return False
+    payload = json.dumps(blob, ensure_ascii=False)
+    # The secret goes through argv, which is briefly visible in the process table
+    # on a multi-user machine. `security` offers no stdin path for the value, and
+    # this is the same trade every Claude Code account switcher makes. The window
+    # is one exec; the alternative is not being able to swap at all.
+    try:
+        p = subprocess.run(
+            [
+                "security",
+                "add-generic-password",
+                "-U",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+                "-w",
+                payload,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return False
+    return p.returncode == 0
+
+
+def use_keychain():
+    """The keychain is the only part of this program that reaches outside HOME.
+
+    The test suite isolates everything by swapping HOME, which cannot contain a
+    keychain write — so without this switch, running the suite on a Mac would
+    overwrite the developer's own Claude login. Set CCD_CREDENTIALS_BACKEND=file
+    to keep every credential operation inside $HOME. Test-only; production never
+    sets it."""
+    if os.environ.get("CCD_CREDENTIALS_BACKEND") == "file":
+        return False
+    return sys.platform == "darwin"
+
+
+def live_read():
+    """Return (blob, sources). sources lists every place the blob was found, so
+    live_write can keep all of them in step."""
+    sources = []
+    blob = None
+    if use_keychain():
+        blob = _keychain_read()
+        if blob is not None:
+            sources.append("keychain")
+    filed = read_json(credentials_file())
+    if filed is not None:
+        sources.append("file")
+        if blob is None:
+            blob = filed
+    return (blob if blob is not None else {}), sources
+
+
+def live_write(blob, sources):
+    """Write the blob everywhere Claude Code might read it.
+
+    On macOS a stale ~/.claude/.credentials.json is a real hazard: Claude Code
+    falls back to it when the keychain read fails, so updating only the keychain
+    can silently resurrect the previous account — the worst possible outcome of a
+    swap, since the UI would claim one account while the API served another."""
+    ok = False
+    targets = set(sources)
+    if use_keychain():
+        targets.add("keychain")
+    else:
+        targets.discard("keychain")
+        targets.add("file")
+    if "keychain" in targets:
+        ok = _keychain_write(blob) or ok
+    if "file" in targets:
+        try:
+            write_json(credentials_file(), blob, 0o600)
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+
+# ── Account store ────────────────────────────────────────────────────────────
+
+
+def valid_name(name):
+    return bool(name) and bool(NAME_RE.match(name))
+
+
+def account_path(name):
+    return os.path.join(ACCOUNTS_DIR, f"{name}.json")
+
+
+def account_load(name):
+    if not valid_name(name):
+        return None
+    return read_json(account_path(name))
+
+
+def account_save(name, obj):
+    obj.setdefault("storage", "file")
+    write_json(account_path(name), obj, 0o600)
+
+
+def account_names():
+    try:
+        entries = os.listdir(ACCOUNTS_DIR)
+    except OSError:
+        return []
+    names = [e[:-5] for e in entries if e.endswith(".json") and not e.startswith(".")]
+    return sorted(n for n in names if valid_name(n))
+
+
+def accounts_all():
+    out = []
+    for n in account_names():
+        a = account_load(n)
+        if a:
+            a["name"] = n
+            out.append(a)
+    out.sort(key=lambda a: (a.get("priority", 999), a.get("added_at", 0), a["name"]))
+    return out
+
+
+def _pointer_name():
+    try:
+        with open(ACTIVE_FILE) as f:
+            n = f.read().strip()
+        if valid_name(n) and os.path.exists(account_path(n)):
+            return n
+    except OSError:
+        pass
+    return None
+
+
+def _active_at():
+    """When ccd last set the pointer, in ms epoch. 0 when never."""
+    try:
+        with open(ACTIVE_AT_FILE) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def active_name():
+    """Which registered account is signed in RIGHT NOW.
+
+    Two sources, and which one wins is decided by age, not by preference:
+
+      - the pointer file records what ccd last installed
+      - ~/.claude.json records who Claude Code last saw itself as
+
+    The pointer is stale after the user runs /login themselves. The profile is
+    stale for a short window after ccd swaps, because Claude Code does not
+    re-read it until it restarts. Comparing profileFetchedAt against the time of
+    our own swap tells us which staleness we are looking at, so neither one can
+    overwrite the other's correct answer.
+
+    Returns None when the signed-in account is registered nowhere. That is a real
+    answer, not a failure: callers must not fall back to the pointer then, or
+    they would attribute this session's tokens to an account that does not own
+    them."""
+    uuid, _, fetched_at = live_identity()
+    if uuid and fetched_at >= _active_at():
+        for a in accounts_all():
+            if a.get("account_uuid") == uuid:
+                if _pointer_name() != a["name"]:
+                    try:
+                        active_set(a["name"])   # self-heal: the user used /login
+                    except OSError:
+                        pass
+                return a["name"]
+        return None            # signed into an account ccd does not know
+
+    # Either no identity is available (older Claude Code, unreadable config) or
+    # the profile predates our swap and would answer with the account we just
+    # left. The pointer is the better source in both cases.
+    return _pointer_name()
+
+
+def active_set(name):
+    write_atomic(ACTIVE_FILE, f"{name}\n", 0o600)
+    write_atomic(ACTIVE_AT_FILE, f"{int(time.time() * 1000)}\n", 0o600)
+
+
+def live_identity():
+    """Who is Claude Code signed in as right now — (accountUuid, email, fetched_at).
+
+    Claude Code keeps this in ~/.claude.json under `oauthAccount`, refreshed at
+    login. It is the one identifier that SURVIVES TOKEN ROTATION: access and
+    refresh tokens change constantly, so "the token differs" can never
+    distinguish an ordinary refresh from the user signing into a different
+    account. accountUuid can, and reading it costs no network call.
+
+    Everything that could otherwise corrupt the store depends on this: without it
+    a manual /login is undetectable, and banking the outgoing session's tokens
+    would file them under whatever name the stale pointer happened to hold."""
+    seen = []
+    for p in (os.path.join(claude_config_dir(), ".claude.json"),
+              os.path.join(os.path.expanduser("~"), ".claude.json")):
+        if p in seen:
+            continue
+        seen.append(p)
+        acc = (read_json(p) or {}).get("oauthAccount")
+        if isinstance(acc, dict):
+            uuid = acc.get("accountUuid")
+            if isinstance(uuid, str) and uuid:
+                email = acc.get("emailAddress")
+                # ms epoch of the last profile fetch. This is what makes the
+                # identity usable right after a swap: Claude Code does not re-read
+                # the profile until it next starts, so for a short window this
+                # block still describes the account we just swapped AWAY from.
+                fetched = acc.get("profileFetchedAt")
+                fetched = fetched if isinstance(fetched, (int, float)) else 0
+                return uuid, (email if isinstance(email, str) else ""), int(fetched)
+    return None, "", 0
+
+
+# ── OAuth ────────────────────────────────────────────────────────────────────
+
+
+def _http_json(url, data=None, headers=None, timeout=HTTP_TIMEOUT):
+    """Return (status, parsed_json_or_None). Never raises for HTTP errors —
+    the caller needs the status to distinguish 401 (dead) from 503 (retry)."""
+    req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", USER_AGENT)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+            try:
+                return r.status, json.loads(body)
+            except Exception:
+                return r.status, None
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return e.code, None
+    except Exception:
+        return 0, None
+
+
+def usage_fetch(access_token):
+    status, body = _http_json(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA,
+        },
+    )
+    return status, body
+
+
+def _window(body, key):
+    w = (body or {}).get(key)
+    if not isinstance(w, dict):
+        return None, None
+    u = w.get("utilization")
+    if not isinstance(u, (int, float)) or isinstance(u, bool):
+        return None, None
+    reset = w.get("resets_at")
+    return int(round(u)), (reset if isinstance(reset, str) else None)
+
+
+def token_endpoint_order():
+    """Remember which endpoint answered last time so the common case is one call."""
+    try:
+        with open(ENDPOINT_FILE) as f:
+            pref = f.read().strip()
+        if pref in TOKEN_URLS:
+            return (pref,) + tuple(u for u in TOKEN_URLS if u != pref)
+    except OSError:
+        pass
+    return TOKEN_URLS
+
+
+def token_refresh(refresh_token):
+    """Exchange a refresh token. Returns (new_oauth_dict, status).
+
+    The response ROTATES the refresh token: the value we sent is dead afterwards.
+    Callers must persist the result before doing anything else with it."""
+    payload = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID,
+        }
+    ).encode()
+    last = 0
+    for url in token_endpoint_order():
+        status, body = _http_json(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "anthropic"},
+        )
+        last = status
+        if status == 200 and isinstance(body, dict) and body.get("access_token"):
+            try:
+                write_atomic(ENDPOINT_FILE, url + "\n", 0o600)
+            except Exception:
+                pass
+            expires_in = body.get("expires_in")
+            oauth = {
+                "accessToken": body["access_token"],
+                # Anthropic always returns a new one, but fall back rather than
+                # writing a null and bricking the account.
+                "refreshToken": body.get("refresh_token") or refresh_token,
+            }
+            if isinstance(expires_in, (int, float)):
+                oauth["expiresAt"] = int((time.time() + expires_in) * 1000)
+            return oauth, status
+        # 400/401 means this refresh token is dead; another endpoint will not
+        # revive it. Only keep trying when the endpoint itself looks wrong.
+        if status in (400, 401, 403):
+            return None, status
+    return None, last
+
+
+def token_expired(oauth, skew=REFRESH_SKEW):
+    exp = (oauth or {}).get("expiresAt")
+    if not isinstance(exp, (int, float)):
+        return True
+    return (exp / 1000.0) <= (time.time() + skew)
+
+
+def refresh_token_dead(oauth):
+    exp = (oauth or {}).get("refreshTokenExpiresAt")
+    if not isinstance(exp, (int, float)):
+        return False
+    return (exp / 1000.0) <= time.time()
+
+
+def account_refresh(name, acct):
+    """Refresh one stored account in place. Returns (ok, status_string).
+
+    Ordering matters: the rotated refresh token is written to disk BEFORE the new
+    access token is used for anything. Crashing between the two costs one wasted
+    access token; the reverse order costs the whole account."""
+    oauth = acct.get("claudeAiOauth") or {}
+    rt = oauth.get("refreshToken")
+    if not rt:
+        return False, "dead"
+    if refresh_token_dead(oauth):
+        return False, "dead"
+    new_oauth, status = token_refresh(rt)
+    if not new_oauth:
+        return False, ("dead" if status in (400, 401, 403) else "error")
+    merged = dict(oauth)
+    merged.update(new_oauth)
+    # Anthropic does not echo refreshTokenExpiresAt; a successful rotation issues
+    # a fresh ~8.5-day window, so advance it ourselves. Without this the account
+    # would look dead to refresh_token_dead() forever after the original expiry.
+    merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
+    acct["claudeAiOauth"] = merged
+    acct["refreshed_at"] = now()
+    account_save(name, acct)
+    return True, "ok"
+
+
+# ── Quota ────────────────────────────────────────────────────────────────────
+
+
+def quota_cache():
+    return read_json(QUOTA_FILE) or {}
+
+
+def quota_cache_save(cache):
+    write_json(QUOTA_FILE, cache, 0o600)
+
+
+def probe_account(name, acct, allow_refresh=True):
+    """Read one account's quota, refreshing its token first if needed.
+
+    Returns a record shaped like the accounts-quota.json entries."""
+    rec = {"checked_at": now(), "status": "error"}
+    oauth = acct.get("claudeAiOauth") or {}
+
+    if token_expired(oauth):
+        if not allow_refresh:
+            rec["status"] = "stale"
+            return rec
+        ok, why = account_refresh(name, acct)
+        if not ok:
+            rec["status"] = why
+            return rec
+        oauth = acct.get("claudeAiOauth") or {}
+
+    status, body = usage_fetch(oauth.get("accessToken", ""))
+    if status == 401 and allow_refresh:
+        # The stored expiry lied (clock skew, or a token revoked early). One
+        # refresh, one retry — never a loop.
+        ok, why = account_refresh(name, acct)
+        if not ok:
+            rec["status"] = why
+            return rec
+        status, body = usage_fetch(
+            (acct.get("claudeAiOauth") or {}).get("accessToken", "")
+        )
+    if status != 200 or not isinstance(body, dict):
+        rec["status"] = "dead" if status in (401, 403) else "error"
+        rec["http_status"] = status
+        return rec
+
+    fh, fhr = _window(body, "five_hour")
+    sd, sdr = _window(body, "seven_day")
+    if fh is None and sd is None:
+        return rec  # unusable payload — stays "error", never treated as headroom
+    rec.update(
+        {
+            "status": "ok",
+            "five_hour_percent": fh,
+            "seven_day_percent": sd,
+            "five_hour_reset": fhr,
+            "seven_day_reset": sdr,
+        }
+    )
+    return rec
+
+
+def cache_ttl_for(status, ttl):
+    """Negative caching. Without it a dead or unreachable account is re-probed on
+    every hook tick — the hook fires on each prompt and each tool use, so that is
+    a network round trip several times a minute for an account that needs a manual
+    re-login anyway."""
+    if status == "ok":
+        return ttl
+    if status == "dead":
+        return ttl * 4  # only a human re-login changes this
+    return 60  # stale/error: transient, retry soon but not every tick
+
+
+def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True, cache=None):
+    cache = quota_cache() if cache is None else cache
+    rec = cache.get(name)
+    if isinstance(rec, dict) and isinstance(rec.get("checked_at"), (int, float)):
+        if (now() - rec["checked_at"]) < cache_ttl_for(rec.get("status"), ttl):
+            return rec, cache
+    rec = probe_account(name, acct, allow_refresh=allow_refresh)
+    cache[name] = rec
+    return rec, cache
+
+
+def has_headroom(rec):
+    """Every window the account reports must be below HEADROOM.
+
+    The 7-day window is not optional: an account whose 5h just reset but whose
+    weekly is at 99% dies again within minutes, burning a hop and showing the
+    user two unexplained screen changes on the way to the same destination."""
+    if rec.get("status") != "ok":
+        return False
+    vals = [
+        rec.get("five_hour_percent"),
+        rec.get("seven_day_percent"),
+    ]
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    if not vals:
+        return False
+    return max(vals) < HEADROOM
+
+
+def worst(rec):
+    vals = [rec.get("five_hour_percent"), rec.get("seven_day_percent")]
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    return max(vals) if vals else 100
+
+
+# ── The swap ─────────────────────────────────────────────────────────────────
+
+
+def swap_to(name, force=False):
+    """Replace only the claudeAiOauth subtree of the live blob.
+
+    Called by ccd-handoff between sessions — after claude exited and before the
+    relaunch — which is the one moment no process owns the credentials. That is
+    why this needs no coordination with a running Claude Code."""
+    target = account_load(name)
+    if not target:
+        die(f"no such account: {name}")
+    oauth = target.get("claudeAiOauth")
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        die(f"account '{name}' has no usable credentials — re-add it")
+
+    with Lock(LOCK_FILE):
+        blob, sources = live_read()
+        if not blob:
+            die("could not read the current Claude credentials")
+
+        # Back up whatever Claude Code rotated into the live blob during the
+        # session that just ended. Skipping this throws away every token refresh
+        # the outgoing account accumulated, and coming back to it later would use
+        # a stale — possibly already-rotated-away — refresh token.
+        # active_name() resolves by accountUuid, so this is the account that was
+        # genuinely signed in — even if the user reached it with /login rather
+        # than through ccd. When it returns None the session belongs to an
+        # unregistered account and there is nothing to bank; writing anywhere
+        # would file these tokens under a name that does not own them.
+        cur = active_name()
+        live_oauth = blob.get("claudeAiOauth")
+        if cur and cur != name and isinstance(live_oauth, dict):
+            prev = account_load(cur)
+            if prev:
+                prev["claudeAiOauth"] = live_oauth
+                prev["refreshed_at"] = now()
+                account_save(cur, prev)
+
+        new_blob = dict(blob)
+        new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
+        if not live_write(new_blob, sources):
+            die("failed to write the credential store")
+        active_set(name)
+
+    if not force:
+        others = claude_processes()
+        if others:
+            warn(
+                f"{others} other Claude Code session(s) are running — they will "
+                "move to this account on their next token refresh"
+            )
+    return target
+
+
+def claude_processes():
+    try:
+        p = subprocess.run(
+            ["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=5
+        )
+    except Exception:
+        return 0
+    if p.returncode != 0:
+        return 0
+    return len([x for x in p.stdout.split() if x.strip()])
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+
+def cmd_add(args):
+    ensure_dirs()
+    blob, _ = live_read()
+    oauth = blob.get("claudeAiOauth")
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        die("no Claude login found — run `claude` and sign in first")
+
+    uuid, email, _ = live_identity()
+
+    # Re-registering an account ccd already knows is the normal repair for an
+    # expired spare, so update it in place instead of demanding --force.
+    known = None
+    if uuid:
+        known = next((a for a in accounts_all() if a.get("account_uuid") == uuid), None)
+
+    name = args.name or (known or {}).get("name")
+    if not name:
+        # The email local part is the name people would pick anyway; fall back to
+        # the plan when no identity is available.
+        base = email.split("@")[0] if email else (oauth.get("subscriptionType") or "account")
+        base = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "account"
+        name = base
+        i = 2
+        while os.path.exists(account_path(name)):
+            name = f"{base}{i}"
+            i += 1
+    if not valid_name(name):
+        die("account name must be letters, digits, dot, dash or underscore (max 64)")
+
+    existing = account_load(name)
+    if existing and not args.force and not (known and known["name"] == name):
+        die(f"account '{name}' already exists — use --force to replace it")
+
+    # One account, one entry. Two names for the same login would present a spare
+    # that is really the account that just ran out.
+    if known and known["name"] != name and not args.force:
+        die(
+            f"this login is already registered as '{known['name']}' — "
+            f"sign in to the other account first, then run add again"
+        )
+    if not uuid:
+        rt = oauth.get("refreshToken")
+        for other in accounts_all():
+            if other["name"] == name or not rt:
+                continue
+            if (other.get("claudeAiOauth") or {}).get("refreshToken") == rt:
+                die(
+                    f"this login is already registered as '{other['name']}' — "
+                    "sign in to the other account first, then run add again"
+                )
+
+    priority = args.priority
+    if priority is None:
+        used = [a.get("priority", 0) for a in accounts_all() if a["name"] != name]
+        priority = (max(used) + 1) if used else 1
+
+    acct = {
+        "name": name,
+        # The email is the label people would type anyway, and Claude Code already
+        # knows it — so nobody has to supply one.
+        "label": args.label or email or (existing or {}).get("label", ""),
+        "account_uuid": uuid,
+        "priority": priority,
+        "storage": "file",
+        "claudeAiOauth": oauth,
+        "added_at": (existing or {}).get("added_at") or now(),
+        "refreshed_at": now(),
+        "subscription_type": oauth.get("subscriptionType"),
+        "rate_limit_tier": oauth.get("rateLimitTier"),
+    }
+    with Lock(LOCK_FILE):
+        account_save(name, acct)
+        active_set(name)
+
+    plan = acct["subscription_type"] or "unknown"
+    print(f"{C_GRN}✓{C_RESET} registered {C_BOLD}{name}{C_RESET} ({plan}), priority {priority}")
+    total = len(account_names())
+    if total < 2:
+        print(
+            f"{C_DIM}  Sign in to your other account (`claude` → /login), then run "
+            f"`ccd account add` again.{C_RESET}"
+        )
+    else:
+        print(f"{C_DIM}  {total} accounts registered. `ccd account list` to check quota.{C_RESET}")
+    return 0
+
+
+def cmd_list(args):
+    accounts = accounts_all()
+    cur = active_name()
+    if not accounts:
+        if args.json:
+            print(json.dumps({"accounts": [], "active": None}))
+        else:
+            print(f"{C_DIM}No accounts registered. Run `ccd account add`.{C_RESET}")
+        return 0
+
+    cache = quota_cache()
+    rows = []
+    for a in accounts:
+        name = a["name"]
+        if name == cur:
+            # Claude Code owns the live token; never refresh it from here.
+            rec, cache = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=False, cache=cache)
+        else:
+            rec, cache = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=True, cache=cache)
+        rows.append((a, rec))
+    quota_cache_save(cache)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "active": cur,
+                    "accounts": [
+                        {
+                            "name": a["name"],
+                            "label": a.get("label", ""),
+                            "priority": a.get("priority"),
+                            "subscription_type": a.get("subscription_type"),
+                            "active": a["name"] == cur,
+                            "quota": rec,
+                            "headroom": has_headroom(rec),
+                        }
+                        for a, rec in rows
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    print(f"\n{C_BOLD}Claude accounts{C_RESET}")
+    for a, rec in rows:
+        mark = f"{C_GRN}●{C_RESET}" if a["name"] == cur else f"{C_DIM}○{C_RESET}"
+        label = a.get("label") or a.get("subscription_type") or ""
+        st = rec.get("status")
+        if st == "ok":
+            fh = rec.get("five_hour_percent")
+            sd = rec.get("seven_day_percent")
+            parts = []
+            if isinstance(fh, (int, float)):
+                parts.append(f"5h {fh}%")
+            if isinstance(sd, (int, float)):
+                parts.append(f"7d {sd}%")
+            usage = " · ".join(parts)
+            tint = C_GRN if has_headroom(rec) else C_YLW
+            body = f"{tint}{usage}{C_RESET}"
+        elif st == "dead":
+            body = f"{C_RED}needs re-login{C_RESET}"
+        elif st == "stale":
+            body = f"{C_DIM}token stale{C_RESET}"
+        else:
+            body = f"{C_DIM}unreachable{C_RESET}"
+        print(
+            f"  {mark} {a['name']:<14} {C_DIM}p{a.get('priority', '?'):<3}{C_RESET} "
+            f"{body}   {C_DIM}{label}{C_RESET}"
+        )
+    dead = [a["name"] for a, rec in rows if rec.get("status") == "dead"]
+    if dead:
+        print(
+            f"\n{C_YLW}!{C_RESET} re-login needed for: {', '.join(dead)}\n"
+            f"{C_DIM}  `claude` → /login as that account → `ccd account add --force "
+            f"--name {dead[0]}`{C_RESET}"
+        )
+    return 0
+
+
+def cmd_rm(args):
+    name = args.name
+    acct = account_load(name)
+    if not acct:
+        die(f"no such account: {name}")
+    path = account_path(name)
+    with Lock(LOCK_FILE):
+        # Overwrite before unlinking: the file holds a refresh token that is good
+        # for days, and a plain unlink leaves it recoverable on many filesystems.
+        try:
+            size = os.path.getsize(path)
+            with open(path, "r+b") as f:
+                f.write(os.urandom(size))
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError as e:
+            die(f"could not remove {path}: {e}")
+        cache = quota_cache()
+        cache.pop(name, None)
+        quota_cache_save(cache)
+        if active_name() == name:
+            try:
+                os.unlink(ACTIVE_FILE)
+            except OSError:
+                pass
+    print(f"{C_GRN}✓{C_RESET} removed {name}")
+    return 0
+
+
+def cmd_use(args):
+    target = swap_to(args.name, force=args.force)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "account": args.name,
+                    "label": target.get("label", ""),
+                    "subscription_type": target.get("subscription_type"),
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        label = target.get("label") or target.get("subscription_type") or ""
+        print(f"{C_GRN}✓{C_RESET} switched to {C_BOLD}{args.name}{C_RESET} {C_DIM}{label}{C_RESET}")
+    return 0
+
+
+def cmd_refresh(args):
+    cur = active_name()
+    if args.name:
+        names = [args.name]
+    else:
+        names = account_names()
+    if not names:
+        die("no accounts registered")
+
+    rc = 0
+    for name in names:
+        if args.inactive_only and name == cur:
+            continue
+        if name == cur and not args.name:
+            # Claude Code owns the live token. Refreshing it here would rotate the
+            # refresh token out from under a running session.
+            continue
+        acct = account_load(name)
+        if not acct:
+            continue
+        with Lock(LOCK_FILE):
+            ok, why = account_refresh(name, acct)
+        if ok:
+            print(f"{C_GRN}✓{C_RESET} {name}")
+        else:
+            rc = 1
+            hint = "needs re-login" if why == "dead" else "unreachable"
+            print(f"{C_RED}✗{C_RESET} {name} — {hint}")
+    return rc
+
+
+def cmd_pick(args):
+    """Choose the best account to hand off to. Exit 0 with a pick, 1 without.
+
+    `--exclude` carries the launcher's per-burst visited set (docs §5.2), which is
+    what keeps the ladder finite without hardcoding a hop count."""
+    excluded = {
+        x.strip() for x in (args.exclude or "").replace(",", " ").split() if x.strip()
+    }
+    cur = active_name()
+    if cur:
+        excluded.add(cur)
+
+    candidates = [a for a in accounts_all() if a["name"] not in excluded]
+    if not candidates:
+        if args.json:
+            print(json.dumps({"account": None, "reason": "no_candidate"}))
+        return 1
+
+    cache = quota_cache()
+    scored = []
+    for a in candidates:
+        if args.no_probe:
+            # Cached-only mode for latency-sensitive callers (the prompt hook).
+            # Never opens a socket: a stale answer that costs nothing beats a
+            # fresh one that freezes the user's prompt for seconds.
+            rec = cache.get(a["name"])
+            if not isinstance(rec, dict) or rec.get("status") != "ok":
+                continue
+            ts = rec.get("checked_at")
+            if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
+                continue
+        else:
+            rec, cache = quota_for(a["name"], a, cache=cache)
+        if has_headroom(rec):
+            scored.append((a.get("priority", 999), worst(rec), a, rec))
+    if not args.no_probe:
+        quota_cache_save(cache)
+
+    if not scored:
+        if args.json:
+            print(json.dumps({"account": None, "reason": "all_exhausted"}))
+        return 1
+
+    scored.sort(key=lambda t: (t[0], t[1]))
+    _, _, a, rec = scored[0]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "account": a["name"],
+                    "label": a.get("label", ""),
+                    "subscription_type": a.get("subscription_type"),
+                    "five_hour_percent": rec.get("five_hour_percent"),
+                    "seven_day_percent": rec.get("seven_day_percent"),
+                    "reason": "headroom",
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(a["name"])
+    return 0
+
+
+def cmd_keepalive(args):
+    """Keep stored refresh tokens alive.
+
+    A refresh token lasts ~8.5 days and each successful refresh mints a new one,
+    so a daily touch keeps an unused account usable indefinitely. Without this the
+    spare account dies quietly and the user finds out at the exact moment they
+    needed it — precisely the failure ccd exists to prevent."""
+    if len(account_names()) < 2:
+        return 0
+    try:
+        age = time.time() - os.path.getmtime(KEEPALIVE_MARK)
+    except OSError:
+        age = KEEPALIVE_INTERVAL + 1
+    if age < KEEPALIVE_INTERVAL and not args.force:
+        return 0
+    try:
+        write_atomic(KEEPALIVE_MARK, "", 0o600)
+    except Exception:
+        return 0
+
+    cur = active_name()
+    warnings = []
+    for name in account_names():
+        if name == cur:
+            continue
+        acct = account_load(name)
+        if not acct:
+            continue
+        oauth = acct.get("claudeAiOauth") or {}
+        if not token_expired(oauth, skew=KEEPALIVE_INTERVAL):
+            continue
+        with Lock(LOCK_FILE):
+            ok, why = account_refresh(name, acct)
+        if not ok and why == "dead":
+            warnings.append(name)
+    if warnings and args.report:
+        print(
+            "[ccd] These spare Claude accounts need a re-login and cannot receive a "
+            f"quota handoff: {', '.join(warnings)}. Fix it while quota remains: run "
+            "`claude`, /login as that account, then `ccd account add --force --name "
+            f"{warnings[0]}`."
+        )
+    return 0
+
+
+def cmd_current(args):
+    """What backbone and account is this session on? Used by the statusline and
+    doctor, both of which must answer without touching the network."""
+    cur = active_name()
+    acct = account_load(cur) if cur else None
+    total = len(account_names())
+    on_fallback = bool(os.environ.get("CCD_ACTIVE"))
+    info = {
+        "backbone": "openrouter" if on_fallback else "subscription",
+        "account": cur,
+        "label": (acct or {}).get("label", "") or "",
+        "subscription_type": (acct or {}).get("subscription_type"),
+        "registered": total,
+    }
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False))
+    else:
+        if on_fallback:
+            print("openrouter")
+        else:
+            print(cur or "unknown")
+    return 0
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="ccd account", add_help=True)
+    p.add_argument("--no-color", action="store_true")
+    sub = p.add_subparsers(dest="cmd")
+
+    a = sub.add_parser("add", help="register the currently signed-in account")
+    a.add_argument("--name")
+    a.add_argument("--label", default="")
+    a.add_argument("--priority", type=int)
+    a.add_argument("--force", action="store_true")
+    a.set_defaults(fn=cmd_add)
+
+    a = sub.add_parser("list", help="show accounts and quota")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_list)
+
+    a = sub.add_parser("rm", help="remove an account")
+    a.add_argument("name")
+    a.set_defaults(fn=cmd_rm)
+
+    a = sub.add_parser("use", help="switch the active account")
+    a.add_argument("name")
+    a.add_argument("--json", action="store_true")
+    a.add_argument("--force", action="store_true")
+    a.set_defaults(fn=cmd_use)
+
+    a = sub.add_parser("refresh", help="refresh stored tokens")
+    a.add_argument("name", nargs="?")
+    a.add_argument("--all", action="store_true")
+    a.add_argument("--inactive-only", action="store_true")
+    a.set_defaults(fn=cmd_refresh)
+
+    a = sub.add_parser("pick", help="choose the best handoff target")
+    a.add_argument("--exclude", default="")
+    a.add_argument("--json", action="store_true")
+    a.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="decide from cached quota only; never make a network call",
+    )
+    a.set_defaults(fn=cmd_pick)
+
+    a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
+    a.add_argument("--force", action="store_true")
+    a.add_argument("--report", action="store_true")
+    a.set_defaults(fn=cmd_keepalive)
+
+    a = sub.add_parser("current", help="active backbone and account (internal)")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_current)
+
+    args = p.parse_args(argv)
+    color(not args.no_color and sys.stdout.isatty())
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return 0
+    ensure_dirs()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

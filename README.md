@@ -54,6 +54,9 @@ AFTER    quota dies    → /exit → ccd -c       same conversation, spare on
 
 AUTO     quota dies    → 🍩 donut goes on by itself      (ccd setup --auto)
          quota resets  → back on the subscription        nothing to type
+
+2 ACCTS  quota dies    → your other subscription         free, nothing billed
+         both spent    → 🍩 donut                        (ccd account add)
 ```
 
 Set it up **while you still have quota** — after zero, Claude can't walk you through it:
@@ -65,6 +68,62 @@ ccd setup --auto  # optional: hand off by itself, both ways
 ```
 
 That's everything you need. Details below when you want them.
+
+<a name="multi-account"></a>
+
+<details>
+<summary><b>More than one Claude subscription? Use it before you pay</b></summary>
+
+If you have a second Claude subscription, paying OpenRouter while it sits idle
+makes no sense. Register both and quota exhaustion moves the conversation to the
+one that still has room — same conversation, still on the subscription, nothing
+billed. OpenRouter becomes what it should be: the last resort, not the first.
+
+```sh
+ccd account add                  # registers whoever is signed in right now
+claude                           # /login as your other account
+ccd account add                  # register that one too
+ccd account list                 # both accounts, with live quota
+```
+
+```text
+quota dies on A  →  B has room?  →  B     free, same conversation
+                 →  B spent too? →  🍩    OpenRouter, the real last resort
+```
+
+Nothing else changes. The launcher swaps the credential between sessions — the
+one moment nothing holds it — so there is no fight with a running Claude Code,
+and your Notion/Slack MCP logins are untouched by the switch.
+
+The statusline names the account you are on and whether a spare is ready:
+
+```text
+● claude:personal │ spare kaist 20%
+```
+
+Ordering is by priority (registration order, or `--priority`), so your main
+account is preferred while it has room. An account is only offered when **both**
+its 5-hour and 7-day windows have headroom — a weekly window at 99% would die
+again within minutes of arriving.
+
+`ccd doctor` reports each account's quota and, importantly, any that needs a
+re-login: a spare whose token has lapsed looks fine everywhere else and only
+reveals itself at the moment you needed it. ccd refreshes idle accounts once a
+day to keep that from happening at all.
+
+> **On multiple accounts.** Anthropic has said holding more than one subscription
+> is not a terms violation; what is prohibited is sharing an account and reselling
+> access. This feature is for subscriptions *you* hold. Registering an account
+> several people share is your call and your risk.
+
+Account tokens live in `~/.claude/ccd/accounts/` as mode-600 files, one store on
+every platform so the behaviour does not vary by OS. On Linux and Windows that is
+exactly where Claude Code already keeps them; on macOS it is a step down from the
+Keychain, which is the price of that portability. `ccd doctor` fails if the
+permissions ever loosen. Remove one with `ccd account rm <name>` — the file is
+overwritten before it is unlinked.
+
+</details>
 
 <a name="automatic-handoff"></a>
 

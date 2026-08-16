@@ -29,6 +29,48 @@ Skip this and you will be stuck at exactly the moment you need it. `ccd doctor`
 makes one API round trip before launching claude, validating the key, URL, and
 model names — so you don't burn emergency time debugging.
 
+## If you have a second Claude subscription
+
+Register it and quota exhaustion goes there **before** it ever reaches OpenRouter.
+Same conversation, still on the subscription, nothing billed. Do this while quota
+remains — registering requires signing in, and you cannot sign in from a dead
+session.
+
+```sh
+ccd account add          # registers whoever is signed in right now
+claude                   # then /login as your other account
+ccd account add          # register that one too
+ccd account list         # both accounts with live quota — verify before you need it
+```
+
+The ladder becomes:
+
+```text
+account A spent  →  account B has room?  →  B      free
+                 →  B spent too?         →  🍩     OpenRouter (paid)
+```
+
+With automatic handoff on (`ccd setup --auto`) this needs nothing typed at all.
+Without it, switch by hand between sessions:
+
+```sh
+# in a terminal, with Claude Code closed
+ccd account use B
+claude --resume
+```
+
+**The one thing that can quietly rot:** a registered account you never use. Its
+refresh token lasts about 8.5 days. ccd refreshes idle accounts once a day to keep
+them alive, but if your machine was off for a couple of weeks the spare may need a
+re-login. `ccd account list` and `ccd doctor` both say `needs re-login` when that
+has happened. Check it *before* you need it — after quota is gone you cannot ask
+Claude for help fixing it.
+
+```sh
+claude                                     # /login as that account
+ccd account add --force --name <name>      # re-register it
+```
+
 ## After switching — three ways to change models
 
 Claude Code ships with model aliases `haiku`/`sonnet`/`opus`. Each slot is

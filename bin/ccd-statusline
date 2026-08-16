@@ -257,7 +257,145 @@ PY
   exit 0
 fi
 
-# ── Normal (subscription) session: append the escape hatch only above the threshold
+# ── Normal (subscription) session ────────────────────────────────────────────
+# WHICH ACCOUNT IS ANSWERING? Always shown, even with nothing registered — after a
+# swap the single most important thing to know is whose quota is being spent, and
+# a row that appears only sometimes is a row you learn not to look at. The ccd row
+# above covers the "not the subscription" case; this covers the rest.
+#
+# Reads files directly instead of shelling out to ccd-account (~50ms per render):
+# this path must never spawn a keychain read, a subprocess, or an HTTP call.
+acct_seg=$(python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
+import json, os, sys
+adir, qfile = sys.argv[1], sys.argv[2]
+
+def load(p):
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+try:
+    names = sorted(f[:-5] for f in os.listdir(adir)
+                   if f.endswith(".json") and not f.startswith("."))
+except OSError:
+    names = []
+accounts = {n: load(os.path.join(adir, n + ".json")) for n in names}
+
+# Who Claude Code currently believes it is. Same two-source rule as ccd-account's
+# active_name(), inlined because the statusline may not call it: whichever of the
+# pointer and the profile was observed LAST wins, so a manual /login and a fresh
+# ccd swap each win in their own window. ccd-account stays the authority; this is
+# a read-only mirror of that rule.
+ident_uuid, ident_email, fetched = "", "", 0
+cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+for p in (os.path.join(cfg, ".claude.json"), os.path.expanduser("~/.claude.json")):
+    acc = load(p).get("oauthAccount")
+    if isinstance(acc, dict) and acc.get("accountUuid"):
+        ident_uuid = acc["accountUuid"]
+        ident_email = acc.get("emailAddress") or ""
+        f = acc.get("profileFetchedAt")
+        fetched = int(f) if isinstance(f, (int, float)) else 0
+        break
+
+def pointer():
+    try:
+        n = open(os.path.join(adir, ".active")).read().strip()
+    except OSError:
+        return ""
+    return n if n in accounts else ""
+
+def pointer_at():
+    try:
+        return int(open(os.path.join(adir, ".active-at")).read().strip())
+    except Exception:
+        return 0
+
+active, unregistered = "", False
+if ident_uuid and fetched >= pointer_at():
+    active = next((n for n, a in accounts.items()
+                   if a.get("account_uuid") == ident_uuid), "")
+    unregistered = not active
+else:
+    active = pointer()
+
+# Name it even when it is not in the store: knowing you are on
+# someone@example.com beats a bare "?" that tells you nothing.
+display = active or (ident_email.split("@")[0] if ident_email else "")
+if not display:
+    raise SystemExit(0)
+if len(display) > 18:            # long email local parts must not eat the row
+    display = display[:17] + "…"
+
+quota = load(qfile)
+
+def pct(name):
+    q = quota.get(name) or {}
+    if q.get("status") != "ok":
+        return None
+    vals = [q.get(k) for k in ("five_hour_percent", "seven_day_percent")]
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    return max(vals) if vals else None
+
+G, Y, R, DIM, RS, C = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m", "\033[36m"
+mark = f"{Y}●{RS}" if unregistered else f"{G}●{RS}"
+head = f"{mark} {C}claude:{display}{RS}"
+if unregistered:
+    head += f" {DIM}(unregistered){RS}"
+
+# With nothing else registered there is no spare to talk about, so stop here
+# rather than printing "spare none" at someone who never asked for the feature.
+if len(names) < 2:
+    print(head, end="")
+    raise SystemExit(0)
+
+# The spare is the whole point of registering a second account, so say whether one
+# is actually ready. "needs re-login" has to be visible here: it is invisible
+# everywhere else until the handoff fails.
+#
+# ONE spare is named, never a list. The statusline shares a line with the
+# dashboard's own segments and is truncated at terminal width, so a row that grows
+# with the number of registered accounts would push the quota numbers off screen
+# for exactly the people who registered the most. The extras become a "+N" count:
+# the question this answers is "do I have a net?", not "what is my whole roster".
+ready, dead, unknown = [], [], 0
+for n in names:
+    if n == active:
+        continue
+    q = quota.get(n) or {}
+    if q.get("status") == "dead":
+        dead.append(n)
+        continue
+    p = pct(n)
+    if p is None:
+        unknown += 1          # never yet probed, or the reading failed
+    elif p < 90:
+        ready.append((p, n))
+ready.sort()
+
+def short(n, w=14):
+    return n if len(n) <= w else n[: w - 1] + "…"
+
+if ready:
+    p, n = ready[0]
+    more = f"{DIM} +{len(ready) - 1}{RS}" if len(ready) > 1 else ""
+    tail = f"{DIM}spare{RS} {G}{short(n)} {p}%{RS}{more}"
+elif dead:
+    more = f" +{len(dead) - 1}" if len(dead) > 1 else ""
+    tail = f"{R}spare {short(dead[0])} needs re-login{more}{RS}"
+elif unknown:
+    # Not the same as having no spare. Saying "none" here would be a claim we
+    # cannot support, and it is the claim that matters most to get right.
+    tail = f"{DIM}spare ?{RS}"
+else:
+    tail = f"{DIM}spare none{RS}"
+print(f"{head} {DIM}│{RS} {tail}", end="")
+PY
+)
+
+# ── Append the escape hatch only above the threshold
 suffix=""
 if [ -f "$CACHE" ]; then
   suffix=$(THRESHOLD="$THRESHOLD" python3 - "$CACHE" 2>/dev/null <<'PY'
@@ -277,9 +415,19 @@ PY
 fi
 
 # The warning gets its own row — appended to the dashboard's last line it is
-# cut off by terminal-width truncation.
-if [ -n "$base" ] && [ -n "$suffix" ]; then
-  printf '%s\n%s' "$base" "$suffix"
+# cut off by terminal-width truncation. The account segment shares that row when
+# both are present, so multi-account never costs more than one extra line.
+row="$acct_seg"
+if [ -n "$suffix" ]; then
+  if [ -n "$row" ]; then
+    row="$row $(printf '\033[2m│\033[0m') $suffix"
+  else
+    row="$suffix"
+  fi
+fi
+
+if [ -n "$base" ] && [ -n "$row" ]; then
+  printf '%s\n%s' "$base" "$row"
 else
-  printf '%s%s' "$base" "$suffix"
+  printf '%s%s' "$base" "$row"
 fi

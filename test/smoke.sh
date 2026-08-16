@@ -1063,8 +1063,9 @@ esac
 rm -f "$HSTATE" "$FAKE/.tries" "$FAKE/.claude/projects/-tmp/sess-bad.jsonl"
 
 # Worst case: something keeps re-arming the handoff while every launch exits 129.
-# Disarm alone cannot stop that, so MAX_HOPS is the backstop being tested here —
-# the fake claude re-arms on every run, exactly as a stuck quota signal would.
+# Disarm alone cannot stop that, so the burst's visited set is the backstop being
+# tested here — the fake claude re-arms on every run, exactly as a stuck quota
+# signal would.
 rm -f "$FAKE/.hops"
 fake_real '#!/bin/sh
 printf "%s\n" x >> "$HOME/.hops"
@@ -1080,12 +1081,16 @@ chmod +x "$HB/ccd"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 PATH="$SHIMPATH" shim_run "$SHIM" >/dev/null 2>&1
 hops=$(wc -l < "$FAKE/.hops" 2>/dev/null | tr -d ' ')
-# Exactly MAX_HOPS=3 launches: the third increment hits the cap and stops. An
-# exact count matters — a loose range would also pass if the loop stopped early
-# for an unrelated reason (a token mismatch, say) and never exercised the cap.
-[ "${hops:-0}" -eq 3 ] \
-  && ok "relaunch loop stops at the hop cap even when re-armed (ran $hops times)" \
-  || bad "hop cap" "expected 3 launches, ran ${hops:-0}"
+# Exactly 2 launches. Every arming here points at the SAME destination
+# (fallback), and a destination may be entered once per burst — so the second
+# 129 is refused rather than relaunched. This is stricter than the old hop
+# counter, which allowed a third launch before tripping: repeating a destination
+# is a loop by definition, no matter how high a numeric cap is set.
+# An exact count matters — a loose range would also pass if the loop stopped
+# early for an unrelated reason (a token mismatch, say).
+[ "${hops:-0}" -eq 2 ] \
+  && ok "a destination is never entered twice in one burst (ran $hops times)" \
+  || bad "burst loop guard" "expected 2 launches, ran ${hops:-0}"
 rm -f "$HSTATE"
 
 # The cap must not count LEGITIMATE transitions. Quota dying, recovering, and
@@ -1857,6 +1862,339 @@ case "$out" in
 esac
 rm -f "$FAKE/.claude/ccd"/handoff-*.json
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+
+head_ "21. multi-account: the store"
+# Every credential operation stays inside $HOME. Without this the suite would
+# overwrite the developer's real Claude login on macOS.
+export CCD_CREDENTIALS_BACKEND=file
+# No test may reach the real network. If one does, fail in ~1s rather than
+# stalling for the full timeout on every account.
+export CCD_HTTP_TIMEOUT=1
+ACCT="$ROOT/bin/ccd-account"
+ADIR="$FAKE/.claude/ccd/accounts"
+CREDS="$FAKE/.claude/.credentials.json"
+rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-quota.json"
+
+# ── The regression that matters most ────────────────────────────────────────
+# Sections 1-20 all ran with no account store at all, which covers the upgrade
+# path for existing users. This covers the shape production actually has after an
+# update: ccd-account IS installed, but nobody has registered anything. It must
+# stay silent, make no network call, and leave the OpenRouter route untouched.
+cp "$ACCT" "$HB/ccd-account"; chmod +x "$HB/ccd-account"
+"$ACCT" --no-color pick >/dev/null 2>&1 \
+  && bad "empty store" "offered an account when none are registered" \
+  || ok "an empty store offers nothing, without touching the network"
+out=$("$ACCT" --no-color list 2>&1)
+case "$out" in
+  *"No accounts registered"*) ok "...and says so plainly" ;;
+  *) bad "empty store list" "got: $out" ;;
+esac
+[ -z "$("$ACCT" --no-color keepalive 2>&1)" ] \
+  && ok "...and keepalive is a no-op below two accounts" \
+  || bad "keepalive" "did something with an empty store"
+
+# A live blob carrying BOTH an account login and account-independent MCP logins.
+write_creds() { # $1=token marker
+  cat > "$CREDS" <<EOF
+{"mcpOAuth":{"notion|abc":{"serverName":"notion","accessToken":"MCP-NOTION"},
+ "slack|def":{"serverName":"slack","accessToken":"MCP-SLACK"}},
+ "claudeAiOauth":{"accessToken":"AT-$1","refreshToken":"RT-$1",
+ "expiresAt":$(( ($(date +%s) + 99999) * 1000 )),"subscriptionType":"max"}}
+EOF
+}
+write_creds one
+"$ACCT" --no-color add --name one --label "first@example.com" >/dev/null 2>&1 \
+  && ok "add registers the signed-in account" || bad "account add" "failed"
+
+perm=$(python3 -c 'import os,stat,sys;print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$ADIR/one.json" 2>/dev/null)
+[ "$perm" = "0o600" ] && ok "account files are written 600" || bad "account perms" "got $perm"
+dperm=$(python3 -c 'import os,stat,sys;print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$ADIR" 2>/dev/null)
+[ "$dperm" = "0o700" ] && ok "the account directory is 700" || bad "account dir perms" "got $dperm"
+
+# The same login must never be registered twice under two names: it would look
+# like a spare, then hand off to the account that just ran out.
+"$ACCT" --no-color add --name dup >/dev/null 2>&1 \
+  && bad "duplicate guard" "registered the same login twice" \
+  || ok "the same login cannot be registered under a second name"
+
+write_creds two
+"$ACCT" --no-color add --name two --label "second@example.com" >/dev/null 2>&1
+[ -f "$ADIR/two.json" ] && ok "a second account registers" || bad "second add" "missing"
+
+# ── The regression that must never come back ────────────────────────────────
+# A swap replaces ONLY claudeAiOauth. Overwriting the whole blob would log the
+# user out of every MCP server on every hop.
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+python3 - "$CREDS" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+mcp = d.get("mcpOAuth") or {}
+ok = (mcp.get("notion|abc", {}).get("accessToken") == "MCP-NOTION"
+      and mcp.get("slack|def", {}).get("accessToken") == "MCP-SLACK")
+sys.exit(0 if ok else 1)
+PY
+[ $? -eq 0 ] && ok "a swap preserves mcpOAuth (Notion/Slack stay logged in)" \
+  || bad "surgical merge" "the swap destroyed account-independent OAuth state"
+
+grep -q 'AT-one' "$CREDS" && ok "a swap installs the target account's token" \
+  || bad "swap" "the live blob does not carry the target token"
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "one" ] \
+  && ok "the active pointer follows the swap" || bad "active pointer" "wrong"
+
+# Swapping away must bank whatever Claude Code rotated in during the session,
+# or the outgoing account comes back with a dead refresh token.
+python3 - "$CREDS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["claudeAiOauth"]["refreshToken"] = "RT-rotated"      # as a live session would
+json.dump(d, open(p, "w"))
+PY
+"$ACCT" --no-color use two --force >/dev/null 2>&1
+grep -q 'RT-rotated' "$ADIR/one.json" \
+  && ok "swapping away banks the tokens the live session rotated" \
+  || bad "token banking" "rotated refresh token was discarded"
+
+head_ "22. multi-account: identity, not bookkeeping"
+# Claude Code records who it is signed in as in ~/.claude.json. That accountUuid
+# is the only identifier that survives token rotation, so it — not ccd's own
+# pointer — is what decides which account a session belongs to.
+set_identity() { # $1=uuid $2=email $3=profileFetchedAt(ms)
+  printf '{"oauthAccount":{"accountUuid":"%s","emailAddress":"%s","profileFetchedAt":%s}}\n' \
+    "$1" "$2" "$3" > "$FAKE/.claude.json"
+}
+rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-quota.json" "$FAKE/.claude.json"
+
+NOWMS=$(( $(date +%s) * 1000 ))
+set_identity uuid-A a@example.com "$NOWMS"
+write_creds A
+"$ACCT" --no-color add >/dev/null 2>&1
+# The email is the obvious name and Claude Code already knows it — nobody should
+# have to invent one or type a label.
+[ -f "$ADIR/a.json" ] && ok "add names the account from the signed-in email" \
+  || bad "auto-name" "expected a.json, got: $(ls "$ADIR" 2>/dev/null | tr '\n' ' ')"
+grep -q 'a@example.com' "$ADIR/a.json" && ok "...and labels it with that email" \
+  || bad "auto-label" "no email recorded"
+
+set_identity uuid-B b@example.com "$((NOWMS + 1000))"
+write_creds B
+"$ACCT" --no-color add >/dev/null 2>&1
+[ -f "$ADIR/b.json" ] && ok "a second identity registers separately" || bad "second add" "missing"
+
+# Re-running add for an account already known is the normal repair for an expired
+# spare. It must update in place, not demand --force or make a duplicate.
+"$ACCT" --no-color add >/dev/null 2>&1 \
+  && ok "re-adding a known account updates it in place" \
+  || bad "re-add" "refused a re-registration of the same account"
+[ "$(ls "$ADIR"/*.json | wc -l | tr -d ' ')" = "2" ] \
+  && ok "...without creating a duplicate entry" \
+  || bad "re-add" "left $(ls "$ADIR"/*.json | wc -l | tr -d ' ') entries"
+
+# ── The UX this replaces ─────────────────────────────────────────────────────
+# The user signs in with /login, entirely outside ccd. Nothing may be required of
+# them afterwards: ccd notices on its own, because the profile is now newer than
+# ccd's last swap and names a different account.
+"$ACCT" --no-color use a --force >/dev/null 2>&1
+[ "$(cat "$ADIR/.active")" = "a" ] || bad "setup" "swap to a failed"
+write_creds B
+set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 + 60000 ))"
+[ "$("$ACCT" --no-color current)" = "b" ] \
+  && ok "a manual /login is detected with no command from the user" \
+  || bad "login detection" "still reports $("$ACCT" --no-color current)"
+[ "$(cat "$ADIR/.active")" = "b" ] \
+  && ok "...and the stale pointer repairs itself" || bad "self-heal" "pointer not updated"
+
+# The mirror image: right after ccd swaps, ~/.claude.json still describes the
+# account we just LEFT, because Claude Code only re-reads it on restart. The
+# pointer must win there, or the swap would appear to undo itself.
+# The profile here was fetched BEFORE the swap — which is the whole point.
+set_identity uuid-B b@example.com "$(( ($(date +%s) - 3600) * 1000 ))"
+"$ACCT" --no-color use a --force >/dev/null 2>&1
+[ "$("$ACCT" --no-color current)" = "a" ] \
+  && ok "a profile older than the swap does not override it" \
+  || bad "stale profile" "reported $("$ACCT" --no-color current) right after swapping to a"
+
+# Banking the outgoing tokens must follow identity, never the pointer. This is
+# the corruption case: signed in as B while the pointer still said A, a swap
+# would file B's tokens under A and make "spare" a lie.
+write_creds B
+set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 + 60000 ))"
+python3 - "$CREDS" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["refreshToken"] = "RT-B-rotated"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+"$ACCT" --no-color use a --force >/dev/null 2>&1
+grep -q 'RT-B-rotated' "$ADIR/b.json" \
+  && ok "outgoing tokens are banked under the account that owns them" \
+  || bad "banking" "tokens went to the wrong file"
+grep -q 'RT-B-rotated' "$ADIR/a.json" \
+  && bad "banking" "another account's tokens were written into a.json" \
+  || ok "...and never into the account the pointer happened to name"
+
+# Signed into something ccd has never seen: there is no right file to bank into,
+# so nothing must be written anywhere.
+write_creds Z
+set_identity uuid-Z z@example.com "$(( $(date +%s) * 1000 + 120000 ))"
+[ -z "$("$ACCT" --no-color current)" ] || [ "$("$ACCT" --no-color current)" = "unknown" ] \
+  && ok "an unregistered login resolves to no account" \
+  || bad "unknown identity" "claimed $("$ACCT" --no-color current)"
+"$ACCT" --no-color use b --force >/dev/null 2>&1
+grep -q 'RT-Z' "$ADIR/a.json" "$ADIR/b.json" 2>/dev/null \
+  && bad "banking" "an unregistered account's tokens were stored" \
+  || ok "...and its tokens are not banked into anyone"
+
+rm -f "$FAKE/.claude.json"     # later sections exercise the no-identity fallback
+
+head_ "23. multi-account: choosing where to go"
+seed_quota() { printf '%s' "$1" > "$FAKE/.claude/ccd/accounts-quota.json"; }
+NOW=$(date +%s)
+q() { printf '"%s":{"status":"ok","checked_at":%s,"five_hour_percent":%s,"seven_day_percent":%s}' "$1" "$NOW" "$2" "$3"; }
+
+# Rebuild the store this section talks about instead of inheriting whatever the
+# previous one left. Every account here must also have a seeded quota entry: a
+# cache miss makes pick probe for real, and these tokens are fake, so the suite
+# would sit through HTTP timeouts while quietly calling Anthropic.
+rm -rf "$ADIR"
+for n in one two; do write_creds "$n"; "$ACCT" --no-color add --name "$n" >/dev/null 2>&1; done
+"$ACCT" --no-color use one --force >/dev/null 2>&1   # 'one' is spent, 'two' is the spare
+seed_quota "{$(q one 99 99),$(q two 10 20)}"
+[ "$("$ACCT" --no-color pick)" = "two" ] \
+  && ok "pick returns the spare with room" || bad "pick" "wrong account"
+
+# The account currently in use is never its own escape route.
+seed_quota "{$(q one 10 10),$(q two 10 20)}"
+[ "$("$ACCT" --no-color pick)" = "two" ] \
+  && ok "the active account is never offered as its own spare" \
+  || bad "active exclusion" "picked the account already in use"
+
+# The 7-day window is not optional: an account whose 5h just reset but whose week
+# is spent dies again within minutes.
+seed_quota "{$(q one 99 99),$(q two 5 99)}"
+"$ACCT" --no-color pick >/dev/null 2>&1 \
+  && bad "7d gate" "offered an account with a saturated weekly window" \
+  || ok "an account with a spent 7-day window is not offered"
+
+# An unreadable account is not an available one. Treating "unknown" as "has room"
+# would hand off into a dead end.
+seed_quota "{$(q one 99 99),\"two\":{\"status\":\"error\",\"checked_at\":$NOW}}"
+"$ACCT" --no-color pick >/dev/null 2>&1 \
+  && bad "error handling" "treated an unreadable account as having room" \
+  || ok "an unreadable account is never treated as having room"
+
+seed_quota "{$(q one 99 99),\"two\":{\"status\":\"dead\",\"checked_at\":$NOW}}"
+"$ACCT" --no-color pick >/dev/null 2>&1 \
+  && bad "dead handling" "offered an account that needs re-login" \
+  || ok "an account needing re-login is not offered"
+
+# The exclusion list is how the launcher's visited set reaches the picker.
+seed_quota "{$(q one 99 99),$(q two 10 20)}"
+"$ACCT" --no-color pick --exclude two >/dev/null 2>&1 \
+  && bad "exclude" "returned an excluded account" \
+  || ok "--exclude removes an account already visited this burst"
+
+# Priority decides, not raw usage: the primary account is preferred while it has
+# room, even when a lower-priority one is emptier.
+write_creds three
+"$ACCT" --no-color add --name three --priority 5 >/dev/null 2>&1
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+seed_quota "{$(q one 99 99),$(q two 40 40),$(q three 1 1)}"
+[ "$("$ACCT" --no-color pick)" = "two" ] \
+  && ok "priority wins over lower usage" || bad "priority" "picked by usage instead"
+
+# --no-probe is what the prompt hook uses; it must never open a socket, so stale
+# cache entries simply stop counting.
+seed_quota "{$(q one 99 99),\"two\":{\"status\":\"ok\",\"checked_at\":1,\"five_hour_percent\":1,\"seven_day_percent\":1}}"
+"$ACCT" --no-color pick --no-probe >/dev/null 2>&1 \
+  && bad "--no-probe" "used a long-stale cache entry" \
+  || ok "--no-probe ignores stale cache instead of reaching for the network"
+
+# Names become filenames. A traversing name must never escape the store.
+"$ACCT" --no-color add --name "../../evil" >/dev/null 2>&1 \
+  && bad "name validation" "accepted a traversing account name" \
+  || ok "a path-traversing account name is refused"
+
+head_ "24. multi-account: handoff to another subscription"
+cp "$ACCT" "$HB/ccd-account"; chmod +x "$HB/ccd-account"
+mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-m.jsonl"
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+
+# The cheap hop: quota dies, another subscription has room, the conversation
+# continues on the subscription backbone with nothing billed.
+seed_quota "{$(q one 99 99),$(q two 10 20)}"
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+fake_real '#!/bin/sh
+echo "SUB:$*"
+exit 0'
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"two","session_id":"sess-m","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+cat > "$FAKE/realbin/claude" <<'EOF'
+#!/bin/sh
+if [ -f "$HOME/.hopped" ]; then echo "SUB2:$*"; exit 0; fi
+: > "$HOME/.hopped"
+exit 129
+EOF
+chmod +x "$FAKE/realbin/claude"
+rm -f "$FAKE/.hopped"
+out=$(PATH="$SHIMPATH" CCD_CREDENTIALS_BACKEND=file shim_run "$SHIM" 2>/dev/null)
+case "$out" in
+  *"SUB2:--resume sess-m"*) ok "a quota handoff to another account resumes the same conversation" ;;
+  *) bad "to_account relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 110)" ;;
+esac
+grep -q 'AT-two' "$CREDS" \
+  && ok "...on the other account's credentials" || bad "to_account swap" "credentials unchanged"
+case "$out" in
+  *"무과금"*) ok "...and says plainly that nothing is being billed" ;;
+  *) bad "to_account message" "no free-of-charge signal" ;;
+esac
+rm -f "$HSTATE" "$FAKE/.hopped"
+
+# THE ladder test. Five accounts, every one spent: the run must traverse all of
+# them and still reach OpenRouter. A hardcoded hop cap of 3 would have stopped
+# this two accounts short of the escape it exists to provide.
+for n in a b c d e; do
+  write_creds "$n"
+  "$ACCT" --no-color add --name "acct$n" >/dev/null 2>&1
+done
+rm -f "$ADIR/one.json" "$ADIR/two.json" "$ADIR/three.json"
+"$ACCT" --no-color use accta --force >/dev/null 2>&1
+rm -f "$FAKE/.ladder"
+# Each leg arms the next rung; the last one has nowhere left but the fallback.
+cat > "$FAKE/realbin/claude" <<'EOF'
+#!/bin/sh
+n=$(cat "$HOME/.rung" 2>/dev/null || echo 0)
+n=$((n + 1)); printf '%s' "$n" > "$HOME/.rung"
+printf 'L%s\n' "$n" >> "$HOME/.ladder"
+case "$n" in
+  1) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctb","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
+  2) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctc","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
+  3) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctd","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
+  4) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"accte","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
+  *) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
+esac
+printf '%s' "$d" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129
+EOF
+chmod +x "$FAKE/realbin/claude"
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf 'FALLBACK\n' >> "$HOME/.ladder"
+exit 0
+EOF
+chmod +x "$HB/ccd"
+rm -f "$FAKE/.rung"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctb","session_id":"sess-m","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+PATH="$SHIMPATH" CCD_CREDENTIALS_BACKEND=file shim_run "$SHIM" >/dev/null 2>&1
+rungs=$(grep -c '^L' "$FAKE/.ladder" 2>/dev/null || echo 0)
+[ "$rungs" -eq 5 ] \
+  && ok "five spent accounts are all traversed (ran $rungs legs)" \
+  || bad "ladder length" "expected 5 account legs, ran $rungs"
+grep -q FALLBACK "$FAKE/.ladder" \
+  && ok "...and the run still reaches OpenRouter at the end" \
+  || bad "ladder end" "never reached the final fallback"
+rm -f "$HSTATE" "$FAKE/.rung" "$FAKE/.ladder"
+"$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+unset CCD_CREDENTIALS_BACKEND
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
