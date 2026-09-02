@@ -52,6 +52,10 @@ TOKEN_URLS = (
     "https://console.anthropic.com/v1/oauth/token",
     "https://platform.claude.com/v1/oauth/token",
 )
+# Test-only, like CCD_CREDENTIALS_BACKEND: lets the suite stand up a local token
+# endpoint and count what a refresh pass actually sends.
+if os.environ.get("CCD_TOKEN_URL"):
+    TOKEN_URLS = (os.environ["CCD_TOKEN_URL"],)
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 USER_AGENT = "ccd"
 
@@ -61,6 +65,14 @@ USER_AGENT = "ccd"
 HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
 CANDIDATE_TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
 KEEPALIVE_INTERVAL = int(os.environ.get("CCD_KEEPALIVE_INTERVAL", "86400"))
+# First retry after a failed keepalive pass, doubling per consecutive failure up
+# to KEEPALIVE_INTERVAL. A flat daily cadence gave a spare ~8 one-shot tries in
+# its token's life; it backs off rather than retrying fast because the failure
+# may itself be the endpoint refusing us.
+KEEPALIVE_RETRY_MIN = int(os.environ.get("CCD_KEEPALIVE_RETRY_MIN", "900"))
+# Warn once a spare's stored token has gone unrefreshed this long. Deliberately
+# well inside the ~8.5-day refresh token life so there is room to act.
+STALE_WARN_AFTER = int(os.environ.get("CCD_STALE_WARN_AFTER", str(3 * 86400)))
 # Refresh a stored token this long before it actually expires.
 REFRESH_SKEW = 300
 # Overridable so the test suite can drive it to ~1s. A test that reaches the real
@@ -88,6 +100,9 @@ LOCK_FILE = os.path.join(ACCOUNTS_DIR, ".lock")
 ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
 QUOTA_FILE = os.path.join(CCD_DIR, "accounts-quota.json")
 KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
+# Breadcrumb for the hook. keepalive runs backgrounded with its output discarded,
+# so anything it prints is lost; the hook picks this up on a later tick.
+STALE_FILE = os.path.join(CCD_DIR, "accounts-stale")
 
 
 def claude_config_dir():
@@ -164,15 +179,22 @@ def read_json(path):
         return None
 
 
+class LockBusy(Exception):
+    pass
+
+
 class Lock:
     """flock around every mutation of the store or the live blob.
 
     fcntl is absent on some platforms; degrade to no locking rather than refusing
     to run, since the alternative is the feature simply not working there."""
 
-    def __init__(self, path, timeout=LOCK_TIMEOUT):
+    def __init__(self, path, timeout=LOCK_TIMEOUT, wait=True):
         self.path = path
         self.timeout = timeout
+        # wait=False raises LockBusy instead of dying: a background pass that
+        # finds another one running has nothing to do and nobody to tell.
+        self.wait = wait
         self.fd = None
 
     def __enter__(self):
@@ -190,9 +212,11 @@ class Lock:
             except OSError as e:
                 if e.errno not in (errno.EAGAIN, errno.EACCES):
                     raise
-                if time.time() >= deadline:
+                if not self.wait or time.time() >= deadline:
                     os.close(self.fd)
                     self.fd = None
+                    if not self.wait:
+                        raise LockBusy()
                     die("another ccd account operation is in progress — try again")
                 time.sleep(0.1)
 
@@ -524,6 +548,36 @@ def token_endpoint_order():
     return TOKEN_URLS
 
 
+def claude_ua():
+    """User-Agent of the installed Claude Code build, e.g. "claude-cli/2.1.258
+    (external, cli)".
+
+    The token endpoint's front door throttles anything that does not present as
+    the official client to a trickle — a request/day failed with 429 for weeks
+    (anthropics/claude-code#38248 reports the same for other tools). The tokens
+    being refreshed ARE Claude Code logins on Claude Code's client_id, so present
+    them as the client they belong to, at whatever version is installed."""
+    is_ver = lambda s: re.fullmatch(r"\d+(\.\d+)+", s) is not None
+    # The native installer makes `claude` a symlink to .../versions/<x.y.z>, so
+    # the binary on PATH names the version actually in use — including after a
+    # downgrade, when the store still holds newer directories.
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, "claude")
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            ver = os.path.basename(os.path.realpath(p))
+            if is_ver(ver):
+                return f"claude-cli/{ver} (external, cli)"
+            break
+    # No claude on the hook's PATH: newest in the version store is the best guess.
+    store = os.path.join(os.path.expanduser("~"), ".local", "share", "claude", "versions")
+    try:
+        versions = [v for v in os.listdir(store) if is_ver(v)]
+    except OSError:
+        versions = []
+    ver = max(versions, key=lambda v: [int(x) for x in v.split(".")], default="2.1.0")
+    return f"claude-cli/{ver} (external, cli)"
+
+
 def token_refresh(refresh_token):
     """Exchange a refresh token. Returns (new_oauth_dict, status).
 
@@ -541,7 +595,7 @@ def token_refresh(refresh_token):
         status, body = _http_json(
             url,
             data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "anthropic"},
+            headers={"Content-Type": "application/json", "User-Agent": claude_ua()},
         )
         last = status
         if status == 200 and isinstance(body, dict) and body.get("access_token"):
@@ -1108,40 +1162,129 @@ def cmd_keepalive(args):
     needed it — precisely the failure ccd exists to prevent."""
     if len(account_names()) < 2:
         return 0
+    # One transaction under the lock: the due check, every account read, the
+    # refresh, and the stamp. The hook fires on each prompt AND each tool use, so
+    # several of these start within the same second; checked outside the lock
+    # they would all pass the gate, all read the same refresh token, and every
+    # one after the first would submit a token the first had just rotated away.
+    try:
+        with Lock(LOCK_FILE, wait=False):
+            due, fails = keepalive_due()
+            if not due and not args.force:
+                return 0
+            cur = active_name()
+            failed = []
+            for name in account_names():
+                if name == cur:
+                    continue
+                acct = account_load(name)
+                if not acct:
+                    continue
+                oauth = acct.get("claudeAiOauth") or {}
+                if not token_expired(oauth, skew=KEEPALIVE_INTERVAL):
+                    continue
+                ok, why = account_refresh(name, acct)
+                if not ok:
+                    failed.append(name)
+            # Stamp the outcome AFTER the pass, never before it. Stamping first
+            # meant a failed attempt still consumed the whole interval, so the
+            # spare got one all-or-nothing try per day and a run of bad windows
+            # killed it in silence.
+            try:
+                write_json(KEEPALIVE_MARK, {"fails": fails + 1 if failed else 0}, 0o600)
+            except Exception:
+                pass
+            stale = stale_spares()
+            stale_breadcrumb(stale)
+    except LockBusy:
+        return 0
+    if stale and args.report:
+        print(stale_message(stale))
+    return 0
+
+
+def keepalive_due():
+    """(is a pass due now, consecutive failures so far).
+
+    The wait grows with consecutive failures so a transient outage is retried
+    within minutes while a persistent one settles back to the daily cadence
+    instead of hammering an endpoint that is already refusing us."""
     try:
         age = time.time() - os.path.getmtime(KEEPALIVE_MARK)
     except OSError:
-        age = KEEPALIVE_INTERVAL + 1
-    if age < KEEPALIVE_INTERVAL and not args.force:
-        return 0
-    try:
-        write_atomic(KEEPALIVE_MARK, "", 0o600)
-    except Exception:
-        return 0
+        return True, 0
+    # Older ccd wrote this file empty; read_json turns that into None, which is
+    # the same "no failures recorded" the first successful pass writes.
+    fails = (read_json(KEEPALIVE_MARK) or {}).get("fails")
+    fails = fails if isinstance(fails, int) and fails > 0 else 0
+    if fails:
+        wait = min(KEEPALIVE_RETRY_MIN * (2 ** (fails - 1)), KEEPALIVE_INTERVAL)
+    else:
+        wait = KEEPALIVE_INTERVAL
+    return age >= wait, fails
 
+
+def stale_spares():
+    """Spare accounts whose stored token has gone too long without a refresh.
+
+    Keyed on age, not on the last error. The user's exposure is identical
+    whether the refresh failed with 429, 500, or a dropped connection, and
+    keying on the error class is exactly what let a 429 pass unreported."""
     cur = active_name()
-    warnings = []
+    out = []
     for name in account_names():
         if name == cur:
             continue
         acct = account_load(name)
         if not acct:
             continue
-        oauth = acct.get("claudeAiOauth") or {}
-        if not token_expired(oauth, skew=KEEPALIVE_INTERVAL):
+        ts = acct.get("refreshed_at") or acct.get("added_at")
+        if not isinstance(ts, (int, float)):
             continue
-        with Lock(LOCK_FILE):
-            ok, why = account_refresh(name, acct)
-        if not ok and why == "dead":
-            warnings.append(name)
-    if warnings and args.report:
-        print(
-            "[ccd] These spare Claude accounts need a re-login and cannot receive a "
-            f"quota handoff: {', '.join(warnings)}. Fix it while quota remains: run "
-            "`claude`, /login as that account, then `ccd account add --force --name "
-            f"{warnings[0]}`."
-        )
-    return 0
+        age = now() - ts
+        if age < STALE_WARN_AFTER:
+            continue
+        rt = (acct.get("claudeAiOauth") or {}).get("refreshTokenExpiresAt")
+        left = None
+        if isinstance(rt, (int, float)):
+            left = int((rt / 1000.0 - time.time()) // 86400)
+        out.append({"name": name, "days": int(age // 86400), "days_left": left})
+    return out
+
+
+def stale_message(stale):
+    parts = []
+    for s in stale:
+        left = s["days_left"]
+        if left is None:
+            when = "re-login window unknown"
+        elif left < 0:
+            when = "already past re-login"
+        else:
+            when = f"{left}d before it needs a re-login"
+        parts.append(f"{s['name']} (last refreshed {s['days']}d ago, {when})")
+    return (
+        "[ccd] Tell the user now: these spare Claude accounts stopped refreshing "
+        "and cannot receive a quota handoff — " + "; ".join(parts)
+        + ". Recover while the window is open: `ccd account refresh --all` needs no "
+        "re-login. If that fails, run `claude`, /login as that account, then "
+        f"`ccd account add --force --name {stale[0]['name']}`."
+    )
+
+
+def stale_breadcrumb(stale):
+    """Hand the warning to the hook, or clear it once the accounts recover.
+
+    The rendered text is what gets stored, not the accounts behind it: the hook
+    only ever forwards this verbatim, and rebuilding the sentence there would be
+    the same wording maintained in two languages."""
+    try:
+        if stale:
+            write_json(STALE_FILE, {"message": stale_message(stale)}, 0o600)
+        else:
+            os.unlink(STALE_FILE)
+    except Exception:
+        pass
 
 
 def cmd_current(args):

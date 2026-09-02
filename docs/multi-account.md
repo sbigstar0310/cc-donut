@@ -101,12 +101,20 @@ Linux: `${CLAUDE_CONFIG_DIR:-~/.claude}/.credentials.json`
 ```
 POST https://console.anthropic.com/v1/oauth/token
 Content-Type: application/json
-User-Agent: anthropic
+User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 
 {"grant_type":"refresh_token","refresh_token":"…","client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"}
 ```
 
 응답: `access_token`, `refresh_token`, `expires_in`.
+
+**User-Agent가 전부다.** 정문이 공식 클라이언트 UA가 아닌 요청을 429로 조인다 — 하루
+1회도 막히고, 같은 IP·같은 client_id·같은 파이썬 스택에서 UA만 바꾸면 통과한다
+(2026-03부터, anthropics/claude-code#38248 등 다른 도구도 동일). 0.4.0은 `anthropic`
+이라고 보내서 16일간 매 갱신이 죽었다. 갱신하는 토큰도 client_id도 Claude Code 것이니
+그 클라이언트로 자기소개한다. 버전은 PATH의 `claude` 심링크가 가리키는 이름(네이티브
+설치는 `versions/<x.y.z>`), PATH에 없으면 버전 저장소의 최신. 하드코딩하지 않는다 —
+버전은 매주 바뀐다.
 
 주의: Anthropic이 토큰 교환을 `https://platform.claude.com/v1/oauth/token` 으로 옮기는 중이라는 보고가 있다. **두 엔드포인트를 순차 시도**하고, 성공한 쪽을 캐시한다.
 
@@ -280,9 +288,13 @@ refresh token 이 회전하므로 refresh 는 **파괴적 연산**이다. 두 �
 
 refresh token 8.5일 만료 때문에, 등록만 해두고 안 쓰는 계정은 조용히 죽는다. 사용자는 정작 필요한 순간에 그걸 발견한다 — ccd가 존재 이유로 삼는 실패 모드 그 자체.
 
-`quota-guard.sh` 가 하루 1회(파일 mtime 기준) 비활성 계정들을 refresh 한다. 매 refresh 가 새 8.5일짜리 토큰을 발급하므로 무기한 살아 있다. 훅은 어차피 매 프롬프트마다 도니 별도 데몬이 필요 없다.
+`quota-guard.sh` 가 비활성 계정들을 refresh 한다. 매 refresh 가 새 8.5일짜리 토큰을 발급하므로 무기한 살아 있다. 훅은 어차피 매 프롬프트마다 도니 별도 데몬이 필요 없다.
 
-만료가 48시간 이내로 임박했는데 refresh 가 실패하면 `additionalContext` 로 사용자에게 알린다 — 쿼타가 남아 있는 동안에.
+한 패스는 락 안의 한 트랜잭션이다 — due 판정, 계정 읽기, refresh, 도장까지. 훅은 프롬프트와 툴 틱마다 뜨니 패스 여럿이 같은 초에 시작하는데, 락 밖에서 판정하면 전부 게이트를 통과해 같은 refresh token을 읽고, 첫 놈이 회전시킨 뒤 나머지는 죽은 토큰을 제출한다. 이미 진행 중이면 조용히 물러난다.
+
+도장은 시도 **후**에, 결과와 함께 찍는다. 성공이면 24시간, 실패면 15분부터 2배씩 늘려 24시간 상한. 시도 전에 찍으면 실패한 패스가 하루치를 통째로 태워서, 토큰 수명 8.5일 동안 기회가 8번뿐이다 — 0.4.0이 정확히 그렇게 죽었다.
+
+경고는 에러 종류가 아니라 **나이**로 낸다. 3일 이상 갱신이 안 된 계정이 있으면 `accounts-stale` 에 문장을 남기고, 다음 프롬프트 틱이 `additionalContext` 로 전달한다(4시간에 1회, flock으로 동시 프롬프트에서도 한 번만). 429든 500이든 끊긴 연결이든 사용자 노출은 같고, 에러 종류로 걸렀던 0.4.0은 429를 한 마디도 안 하고 삼켰다. 회복되면 파일이 사라지고 경고도 사라진다.
 
 ## 8. 실패 모드
 

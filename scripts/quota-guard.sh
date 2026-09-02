@@ -7,6 +7,9 @@ EVENT="${1:-UserPromptSubmit}"
 CCD_DIR="$HOME/.claude/ccd"
 CACHE="$CCD_DIR/quota-cache.json"
 WARN_MARK="$CCD_DIR/last-warn"
+# keepalive leaves its verdict here; the next prompt tick forwards it.
+STALE_FILE="$CCD_DIR/accounts-stale"
+STALE_MARK="$CCD_DIR/last-stale-warn"
 RUN_STATE="$CCD_DIR/run-state.json"
 OUTAGE_STATE="$CCD_DIR/outage-state.json"
 # The launcher names its own state file and passes the path down; a fixed name
@@ -14,6 +17,8 @@ OUTAGE_STATE="$CCD_DIR/outage-state.json"
 HANDOFF="${CCD_HANDOFF_STATE:-$CCD_DIR/handoff.json}"
 mkdir -p "$CCD_DIR"
 TTL=600
+# Staleness moves in days, so this warning repeats far more slowly than the quota one.
+STALE_TTL=14400
 THRESHOLD=85
 # Arming needs the quota reading to corroborate the API error: a bare rate_limit
 # can be transient throttling, and a handoff on that would be a false alarm.
@@ -101,6 +106,18 @@ if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   # in-flight write and the refresh silently fails forever under load — use a
   # per-process tmp and install it only when it parses as JSON.
   tmp="$CACHE.tmp.$$"
+  # Claude Code kills a hook that outruns its timeout, and the kill lands between
+  # the redirect that creates $tmp and the branch below that removes it. Without
+  # this trap every such kill strands a 0-byte file in CCD_DIR permanently.
+  # The signal handlers must exit, not just clean up: bash resumes the script
+  # after a handler returns, and the resumed `mv` would chase a file the handler
+  # just deleted.
+  trap 'rm -f "$tmp"' EXIT
+  trap 'rm -f "$tmp"; exit 130' INT
+  trap 'rm -f "$tmp"; exit 143' TERM
+  # SIGKILL cannot be trapped, so sweep what an earlier hard kill already left.
+  # The age floor is what keeps this from deleting a live sibling's in-flight tmp.
+  find "$CCD_DIR" -maxdepth 1 -name "$(basename "$CACHE").tmp.*" -mmin +60 -delete 2>/dev/null || true
   if [ -n "$script" ] && [ -n "$node_bin" ] && "$node_bin" "$script" --json > "$tmp" 2>/dev/null \
      && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$tmp" 2>/dev/null; then
     mv "$tmp" "$CACHE"
@@ -112,6 +129,7 @@ if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
     { [ -n "$script" ] || echo "claude-dashboard not installed"
       [ -n "$node_bin" ] || echo "node not found in hook PATH"; } > "$CCD_DIR/refresh-failed" 2>/dev/null
   fi
+  trap - EXIT INT TERM
 fi
 
 # ── Automatic handoff ────────────────────────────────────────────────────────
@@ -652,6 +670,46 @@ fi
 if [ -z "${CCD_ACTIVE:-}" ] && has_accounts; then
   ka=$(ccd_account_bin) || ka=""
   [ -n "$ka" ] && ("$ka" --no-color keepalive >/dev/null 2>&1 &) || true
+fi
+
+# Deliver keepalive's verdict. It runs backgrounded with its output discarded, so
+# it leaves a breadcrumb and a later tick surfaces it; before this, a spare that
+# stopped refreshing was announced to /dev/null and the user met the failure at
+# the moment of the handoff. On prompts only, and at most every four hours:
+# staleness moves in days, so tool-use ticks would be pure noise. This preempts
+# the quota warning below — that one repeats every ten minutes anyway, and two
+# JSON objects on stdout would not parse as one hook result.
+if [ "$EVENT" = "UserPromptSubmit" ] && [ -f "$STALE_FILE" ] \
+   && [ "$(file_age "$STALE_MARK")" -gt "$STALE_TTL" ]; then
+  # The shell check above is only a cheap pre-filter. Prompts from several
+  # sessions can land together, and a check-then-touch would let each of them
+  # emit; the claim is made under flock so exactly one does.
+  OUT=$(python3 - "$STALE_FILE" "$EVENT" "$STALE_MARK" "$STALE_TTL" <<'EOF'
+import json, os, sys, time
+try:
+    msg = json.load(open(sys.argv[1]))["message"]
+except Exception:
+    sys.exit(0)
+fd = os.open(sys.argv[3], os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX)
+except Exception:
+    pass
+# An empty file is one O_CREAT just made, not a claim: its mtime is "now" and
+# would otherwise silence every first warning. A claim writes the time.
+st = os.fstat(fd)
+if st.st_size and time.time() - st.st_mtime <= int(sys.argv[4]):
+    sys.exit(0)
+os.ftruncate(fd, 0); os.write(fd, str(int(time.time())).encode())
+print(json.dumps({"hookSpecificOutput": {"hookEventName": sys.argv[2],
+                                         "additionalContext": msg}}, ensure_ascii=False))
+EOF
+)
+  if [ -n "$OUT" ]; then
+    echo "$OUT"
+    exit 0
+  fi
 fi
 
 [ -f "$CACHE" ] || exit 0
