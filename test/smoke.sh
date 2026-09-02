@@ -2391,8 +2391,11 @@ rm -rf "$ADIR"; mkdir -p "$ADIR"
 ka mk active-acct 0 8; ka mk lone-spare 0 8
 printf 'active-acct\n' > "$ADIR/.active"
 rm -f "$FAKE/.claude/ccd/accounts-keepalive" "$FAKE/.port" "$FAKE/.hits"
-python3 - "$FAKE/.port" "$FAKE/.hits" <<'PY' &
-import http.server, json, sys, time
+# The server is a file, not a heredoc on a backgrounded command: bash 3.2 (the
+# macOS CI runner) never started the latter, and its stderr is kept so a CI
+# failure says why instead of "never came up".
+cat > "$FAKE/tokserver.py" <<'PY'
+import http.server, json, os, sys, time
 port_file, hits = sys.argv[1], sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -2406,14 +2409,16 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
     def log_message(self, *a): pass
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-open(port_file, "w").write(str(srv.server_address[1]))
+with open(port_file + ".tmp", "w") as f: f.write(str(srv.server_address[1]))
+os.replace(port_file + ".tmp", port_file)
 srv.serve_forever()
 PY
+python3 "$FAKE/tokserver.py" "$FAKE/.port" "$FAKE/.hits" </dev/null >/dev/null 2>"$FAKE/tokserver.err" &
 srv_pid=$!
 # A cold python3 on the macOS CI runner takes seconds to start; an empty port
 # here would send every pass to an invalid URL and read as a client failure.
 n=0; while [ ! -s "$FAKE/.port" ] && [ $n -lt 75 ]; do sleep 0.2; n=$((n+1)); done
-[ -s "$FAKE/.port" ] || bad "keepalive race" "local token endpoint never came up"
+[ -s "$FAKE/.port" ] || bad "keepalive race" "local token endpoint never came up: $(head -c 300 "$FAKE/tokserver.err" 2>/dev/null)"
 TOK="http://127.0.0.1:$(cat "$FAKE/.port" 2>/dev/null)/token"
 # The suite shortens CCD_HTTP_TIMEOUT elsewhere; the endpoint's deliberate delay
 # must not read as a client-side timeout here.
