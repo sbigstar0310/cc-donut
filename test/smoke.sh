@@ -2422,10 +2422,13 @@ srv.serve_forever()
 PY
 python3 "$FAKE/tokserver.py" "$FAKE/.port" "$FAKE/.hits" </dev/null >/dev/null 2>"$FAKE/tokserver.err" &
 srv_pid=$!
-# A cold python3 on the macOS CI runner takes seconds to start; an empty port
-# here would send every pass to an invalid URL and read as a client failure.
+# Measured, not assumed: this is the reverse-DNS lookup HTTPServer.server_bind
+# performs by default, and the reason the server above skips it. Printed on
+# every platform so a CI log shows the number, not a guess.
+printf '  · getfqdn(127.0.0.1) on this runner: %s\n' \
+  "$(python3 -c 'import socket,time;t=time.time();socket.getfqdn("127.0.0.1");print(f"{time.time()-t:.2f}s")' 2>&1)"
 n=0; while [ ! -s "$FAKE/.port" ] && [ $n -lt 75 ]; do sleep 0.2; n=$((n+1)); done
-[ -s "$FAKE/.port" ] || bad "keepalive race" "local token endpoint never came up: $(head -c 300 "$FAKE/tokserver.err" 2>/dev/null)"
+[ -s "$FAKE/.port" ] || bad "keepalive race" "local token endpoint never came up after ${n}00ms; server: $(ps -o stat=,etime= -p "$srv_pid" 2>/dev/null | tr -s ' '); stderr: $(head -c 300 "$FAKE/tokserver.err" 2>/dev/null)"
 TOK="http://127.0.0.1:$(cat "$FAKE/.port" 2>/dev/null)/token"
 # The suite shortens CCD_HTTP_TIMEOUT elsewhere; the endpoint's deliberate delay
 # must not read as a client-side timeout here.
