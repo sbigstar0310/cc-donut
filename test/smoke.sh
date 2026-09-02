@@ -2410,8 +2410,11 @@ open(port_file, "w").write(str(srv.server_address[1]))
 srv.serve_forever()
 PY
 srv_pid=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$FAKE/.port" ] && break; sleep 0.2; done
-TOK="http://127.0.0.1:$(cat "$FAKE/.port")/token"
+# A cold python3 on the macOS CI runner takes seconds to start; an empty port
+# here would send every pass to an invalid URL and read as a client failure.
+n=0; while [ ! -s "$FAKE/.port" ] && [ $n -lt 75 ]; do sleep 0.2; n=$((n+1)); done
+[ -s "$FAKE/.port" ] || bad "keepalive race" "local token endpoint never came up"
+TOK="http://127.0.0.1:$(cat "$FAKE/.port" 2>/dev/null)/token"
 # The suite shortens CCD_HTTP_TIMEOUT elsewhere; the endpoint's deliberate delay
 # must not read as a client-side timeout here.
 for _ in 1 2 3 4 5; do
