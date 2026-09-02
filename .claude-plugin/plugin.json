@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ccd",
   "displayName": "ccd — the donut spare for Claude Code",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "The donut spare for Claude quota exhaustion: hop to your other Claude subscription first, OpenRouter as the last resort — same conversation throughout",
   "author": {
     "name": "sbigstar"

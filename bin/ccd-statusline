@@ -266,7 +266,7 @@ fi
 # Reads files directly instead of shelling out to ccd-account (~50ms per render):
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
 acct_seg=$(python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
-import json, os, sys
+import hashlib, json, os, sys
 adir, qfile = sys.argv[1], sys.argv[2]
 
 def load(p):
@@ -314,7 +314,9 @@ def pointer_at():
         return 0
 
 active, unregistered = "", False
-if ident_uuid and fetched >= pointer_at():
+# Strictly after, mirroring ccd-account's active_name(): a tie leaves the order
+# undecidable, and the two must not disagree about who is signed in.
+if ident_uuid and fetched > pointer_at():
     active = next((n for n, a in accounts.items()
                    if a.get("account_uuid") == ident_uuid), "")
     unregistered = not active
@@ -330,6 +332,36 @@ if len(display) > 18:            # long email local parts must not eat the row
     display = display[:17] + "…"
 
 quota = load(qfile)
+
+
+def cred_fp(acct):
+    at = ((acct or {}).get("claudeAiOauth") or {}).get("accessToken")
+    if not isinstance(at, str) or not at:
+        return ""
+    return hashlib.sha256(at.encode()).hexdigest()[:16]
+
+
+def row_valid(rec, acct):
+    """Same rule as ccd-account's _cache_row_valid(), inlined for the same reason
+    as the identity rule above: this path may not spawn a subprocess.
+
+    A cached row belongs to the account AND the credential it measured. Without
+    this the row survives `add --force` pointing a name at a different account,
+    so the statusline shows the previous owner's quota — or keeps announcing a
+    `needs re-login` the user has already fixed by signing in."""
+    if not isinstance(rec, dict):
+        return False
+    uuid = acct.get("account_uuid")
+    if not uuid:
+        return rec.get("cred") == cred_fp(acct)
+    if rec.get("uuid") != uuid:
+        return False
+    if rec.get("status") != "ok" and rec.get("cred") != cred_fp(acct):
+        return False
+    return True
+
+
+quota = {n: r for n, r in quota.items() if row_valid(r, accounts.get(n) or {})}
 
 def pct(name):
     q = quota.get(name) or {}

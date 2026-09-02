@@ -2045,12 +2045,323 @@ grep -q 'RT-Z' "$ADIR/a.json" "$ADIR/b.json" 2>/dev/null \
   && bad "banking" "an unregistered account's tokens were stored" \
   || ok "...and its tokens are not banked into anyone"
 
+# ── The command the user must never have to remember ────────────────────────
+# A refresh token is single-use. /login mints a new one and ccd's stored snapshot
+# dies in that instant, so signing in has to be enough on its own. The rule it
+# replaces was "then run `ccd account add --force`" — and forgetting it is
+# precisely how a healthy account comes to report `needs re-login`.
+#
+# Profile timestamps here are REAL: `date`, never `date + minutes`. A profile
+# stamped in the future hides the defect these tests exist for — banking that
+# works once and then stops, because the pointer self-heal dated ccd's install
+# after the login.
+#
+# What must be moved instead is the INSTALL. In production a swap always predates
+# a later /login, but `date +%s` is second-granular while ccd stamps in
+# milliseconds, so a swap in the same second looks newer and the gate correctly
+# refuses. Age the stamp to model the real ordering.
+age_install() {
+  python3 - "$ADIR/.active-at" <<'PY'
+import sys, time
+open(sys.argv[1], "w").write(f"{int((time.time() - 60) * 1000)}\n")
+PY
+}
+"$ACCT" --no-color use a --force >/dev/null 2>&1; age_install
+write_creds B-relogin
+set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 ))"
+"$ACCT" --no-color current >/dev/null 2>&1
+grep -q 'RT-B-relogin' "$ADIR/b.json" \
+  && ok "a /login to a registered account is banked with no command from the user" \
+  || bad "auto-banking" "b.json still holds the token /login had already replaced"
+grep -q 'RT-B-relogin' "$ADIR/a.json" \
+  && bad "auto-banking" "the new token was filed under the account the pointer named" \
+  || ok "...and not under the account the stale pointer still named"
+
+# The half that a future-dated profile concealed. The first command above healed
+# the pointer; if that counted as a ccd install, every rotation after it is
+# dropped and the account rots again within hours.
+write_creds B-rotated-later
+"$ACCT" --no-color current >/dev/null 2>&1
+grep -q 'RT-B-rotated-later' "$ADIR/b.json" \
+  && ok "...and every later rotation is banked too, not just the login" \
+  || bad "auto-banking" "the pointer self-heal stopped banking after one pass"
+write_creds B-rotated-again
+"$ACCT" --no-color list --json >/dev/null 2>&1
+grep -q 'RT-B-rotated-again' "$ADIR/b.json" \
+  && ok "...on any subcommand, not only the cheap one" \
+  || bad "auto-banking" "banking is wired to one command instead of dispatch"
+
+# `add` records who is signed in but installs no credentials, so it must not
+# stamp either — stamping dates ccd's "install" after the /login that preceded it
+# and kills banking for everything that follows, exactly as the self-heal did.
+rm -f "$ADIR/.active-at"
+set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 ))"
+write_creds B-readded
+"$ACCT" --no-color add --name b --force >/dev/null 2>&1
+write_creds B-after-add
+"$ACCT" --no-color current >/dev/null 2>&1
+grep -q 'RT-B-after-add' "$ADIR/b.json" \
+  && ok "registering an account leaves later rotations bankable" \
+  || bad "auto-banking" "add stamped an install it never performed"
+
+# `use` on the account already signed in used to install the stored copy over a
+# fresher live one — repairing an account by throwing away the repair. It only
+# bites when banking did not run first, so take the identity away: with no
+# profile, active_name() answers from the pointer and banking correctly refuses.
+"$ACCT" --no-color use b --force >/dev/null 2>&1
+rm -f "$FAKE/.claude.json"                     # every later case sets it again
+write_creds B-newest
+"$ACCT" --no-color use b --force >/dev/null 2>&1
+grep -q 'RT-B-newest' "$CREDS" \
+  && ok "switching to the account already active keeps the live token" \
+  || bad "self-swap" "a stale stored copy was installed over the live token"
+grep -q 'RT-B-newest' "$ADIR/b.json" \
+  && ok "...and banks it under that account instead of dropping it" \
+  || bad "self-swap" "the rotation was discarded"
+grep -q 'MCP-NOTION' "$CREDS" \
+  && ok "...and still leaves mcpOAuth alone" || bad "self-swap" "mcpOAuth destroyed"
+
+# Ownership is proven by accountUuid, but the live blob is shared by every Claude
+# Code process. A blob already on file under a DIFFERENT account means some other
+# session wrote it, so the profile is not describing it.
+python3 - "$ADIR/a.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["refreshToken"] = "RT-belongs-to-A"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+python3 - "$CREDS" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["refreshToken"] = "RT-belongs-to-A"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+age_install
+set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 ))"
+"$ACCT" --no-color current >/dev/null 2>&1
+grep -q 'RT-belongs-to-A' "$ADIR/b.json" \
+  && bad "auto-banking" "filed another account's token under b" \
+  || ok "a token already on file under another account is refused"
+
+# Why banking is gated on the profile timestamp. For a window after a swap the
+# profile still names the account we LEFT; banking on it would file the incoming
+# account's tokens under the outgoing one — the §12.0 corruption, reintroduced.
+"$ACCT" --no-color use a --force >/dev/null 2>&1
+set_identity uuid-B b@example.com "$(( ($(date +%s) - 3600) * 1000 ))"
+python3 - "$CREDS" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["refreshToken"] = "RT-must-not-bank"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+"$ACCT" --no-color current >/dev/null 2>&1
+grep -q 'RT-must-not-bank' "$ADIR"/*.json \
+  && bad "auto-banking" "banked on a profile older than our own swap" \
+  || ok "a profile older than the install banks nothing"
+
+# An identical stamp leaves the order undecidable, so a tie is not proof. (A
+# MISSING stamp reads as zero and deliberately passes: ccd installed nothing, so
+# there is no swap for the profile to be stale against — see §12.0.1.)
+python3 - "$ADIR/.active-at" "$FAKE/.claude.json" <<'PY'
+import json, sys
+stamp = int(json.load(open(sys.argv[2]))["oauthAccount"]["profileFetchedAt"])
+open(sys.argv[1], "w").write(f"{stamp}\n")
+PY
+"$ACCT" --no-color current >/dev/null 2>&1
+grep -q 'RT-must-not-bank' "$ADIR"/*.json \
+  && bad "auto-banking" "an equal timestamp was accepted as proof" \
+  || ok "...and a profile stamped at the very moment of the install banks nothing"
+
+# The same tie reaching the other writer. swap_to banks from active_name(), so if
+# that one accepts a tie the profile can name B while the blob still belongs to A,
+# and the swap files A's token under B — §12.0 corruption through a second door.
+"$ACCT" --no-color use a --force >/dev/null 2>&1
+python3 - "$ADIR/.active-at" "$FAKE/.claude.json" <<'PY'
+import json, sys
+stamp = int(open(sys.argv[1]).read().strip())
+json.dump({"oauthAccount": {"accountUuid": "uuid-B", "emailAddress": "b@example.com",
+                            "profileFetchedAt": stamp}}, open(sys.argv[2], "w"))
+PY
+python3 - "$CREDS" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["refreshToken"] = "RT-tie-belongs-to-A"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+"$ACCT" --no-color use b --force >/dev/null 2>&1
+grep -q 'RT-tie-belongs-to-A' "$ADIR/b.json" \
+  && bad "tie" "a tied profile let the swap file A's token under b" \
+  || ok "...and a tie does not let a swap bank across accounts either"
+
+# A `dead` verdict is cached for 20 minutes, so it must not outlive the token it
+# was measured against — otherwise the account the user just repaired keeps
+# reporting `needs re-login` and the /login looks inert. Retired by comparing
+# identity rather than by deleting the row, so an unlocked cache writer cannot
+# bring it back — the row is judged by which account and which credential it
+# describes, not by a second-granular clock. The quota reading itself has to
+# survive: it describes the account, not the credential.
+"$ACCT" --no-color use b --force >/dev/null 2>&1; age_install
+# Capture the credential BEFORE the bank: the seeded verdict has to name the token
+# it measured, or the row would be retired merely for lacking a `cred` field.
+cred_fp() {
+  python3 -c 'import hashlib,json,sys
+at = (json.load(open(sys.argv[1])).get("claudeAiOauth") or {}).get("accessToken") or ""
+print(hashlib.sha256(at.encode()).hexdigest()[:16])' "$1"
+}
+acct_uuid() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("account_uuid") or "")' "$1"
+}
+# A live blob whose access token has already expired, so a verdict about it is
+# reached from the clock instead of a probe. Reaching Anthropic from the suite
+# with a fake token is a bug in the test, not a pass.
+write_creds_expired() {
+  cat > "$CREDS" <<EOF
+{"mcpOAuth":{"notion|abc":{"serverName":"notion","accessToken":"MCP-NOTION"}},
+ "claudeAiOauth":{"accessToken":"AT-$1","refreshToken":"RT-$1",
+ "expiresAt":$(( ($(date +%s) - 10) * 1000 ))}}
+EOF
+}
+FP_OLD=$(cred_fp "$ADIR/b.json")
+write_creds_expired B-repaired
+set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 ))"
+"$ACCT" --no-color current >/dev/null 2>&1     # banks, so refreshed_at is now
+printf '{"b":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"},"a":{"status":"ok","checked_at":%s,"uuid":"%s","cred":"%s","five_hour_percent":7,"seven_day_percent":8}}' \
+  "$(( $(date +%s) - 60 ))" "$(acct_uuid "$ADIR/b.json")" "$FP_OLD" \
+  "$(( $(date +%s) - 60 ))" "$(acct_uuid "$ADIR/a.json")" "$(cred_fp "$ADIR/a.json")" \
+  > "$FAKE/.claude/ccd/accounts-quota.json"
+out=$("$ACCT" --no-color list --json 2>/dev/null)
+python3 - "$out" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+by = {a["name"]: a for a in d["accounts"]}
+# b's `dead` predates the token now on file, so it must have been recomputed —
+# `stale` proves that. a's `ok` reading is about the account and must survive.
+sys.exit(0 if by["b"]["quota"].get("status") == "stale"
+         and by["a"]["quota"].get("five_hour_percent") == 7 else 1)
+PY
+[ $? -eq 0 ] \
+  && ok "a re-login verdict measured against a replaced token is retired" \
+  || bad "cache supersession" "stale dead verdict served, or a good reading dropped"
+
+# The other direction: a failure still measured against the token on file has to
+# survive, or negative caching is gone and every tick re-probes a dead account.
+printf '{"b":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"}}' \
+  "$(date +%s)" "$(acct_uuid "$ADIR/b.json")" "$(cred_fp "$ADIR/b.json")" \
+  > "$FAKE/.claude/ccd/accounts-quota.json"
+out=$("$ACCT" --no-color list --json 2>/dev/null)
+python3 - "$out" <<'PY'
+import json, sys
+by = {a["name"]: a for a in json.loads(sys.argv[1])["accounts"]}
+sys.exit(0 if by["b"]["quota"].get("status") == "dead" else 1)
+PY
+[ $? -eq 0 ] \
+  && ok "...while one still measured against that token keeps its cache entry" \
+  || bad "cache supersession" "negative caching was discarded wholesale"
+
+# The statusline resolves identity itself rather than shelling out to
+# ccd-account (~50ms per render), so the rule is written twice and the two must
+# stay the same rule. A tie accepted in one and refused in the other means they
+# disagree about who is signed in — and swap_to banks credentials from that.
+grep -q 'fetched > pointer_at()' "$ROOT/bin/ccd-statusline" \
+  && grep -q 'fetched_at > _active_at()' "$ROOT/bin/ccd-account" \
+  && ok "the statusline mirrors ccd-account's identity rule, ties included" \
+  || bad "identity mirror" "the two resolvers disagree on a tied timestamp"
+# It reads the quota cache directly too, so the row rule is written twice as well.
+grep -q 'def row_valid' "$ROOT/bin/ccd-statusline" \
+  && grep -q 'if row_valid(r, accounts.get(n) or {})' "$ROOT/bin/ccd-statusline" \
+  && ok "...and validates cached rows before showing anyone's quota" \
+  || bad "cache mirror" "the statusline trusts cache rows ccd-account would refuse"
+
+# `--force` can point an existing name at a DIFFERENT account. Its cached quota
+# describes the account being replaced, and an `ok` row is exempt from the
+# credential check, so it would follow the name onto its successor and offer a
+# handoff on somebody else's headroom.
+OLD_UUID=$(acct_uuid "$ADIR/b.json")
+write_creds_expired C-newowner
+set_identity uuid-C c@example.com "$(( $(date +%s) * 1000 ))"
+"$ACCT" --no-color add --force --name b >/dev/null 2>&1
+# Written back AFTER the re-registration, exactly as a writer holding an older
+# copy of the whole cache would. Correctness must not rest on having deleted it.
+printf '{"b":{"status":"ok","checked_at":%s,"uuid":"%s","cred":"deadbeefdeadbeef","five_hour_percent":3,"seven_day_percent":4}}' \
+  "$(date +%s)" "$OLD_UUID" > "$FAKE/.claude/ccd/accounts-quota.json"
+out=$("$ACCT" --no-color list --json 2>/dev/null)
+python3 - "$out" <<'PY'
+import json, sys
+by = {a["name"]: a for a in json.loads(sys.argv[1])["accounts"]}
+sys.exit(0 if by["b"]["quota"].get("five_hour_percent") != 3 else 1)
+PY
+[ $? -eq 0 ] \
+  && ok "quota cached for a replaced account is never used, even if written back" \
+  || bad "add cache" "a stale reading followed the name onto a different account"
+
+# The same row reaching `pick --no-probe`, which is where it does the most harm:
+# that path hands off on a cached `ok` without opening a socket, so a row left by
+# a name that now points elsewhere spends an account whose real quota nobody
+# checked. Asserted in both directions, or "offers nothing" proves nothing.
+seed_pick_row() { # $1=uuid to claim
+  printf '{"a":{"status":"ok","checked_at":%s,"uuid":"%s","cred":"%s","five_hour_percent":1,"seven_day_percent":1}}' \
+    "$(date +%s)" "$1" "$(cred_fp "$ADIR/a.json")" > "$FAKE/.claude/ccd/accounts-quota.json"
+}
+seed_pick_row "$(acct_uuid "$ADIR/a.json")"
+[ "$("$ACCT" --no-color pick --no-probe 2>/dev/null)" = "a" ] \
+  && ok "--no-probe offers an account whose cached row still matches it" \
+  || bad "no-probe" "a valid cached row was not offered"
+seed_pick_row "uuid-SOMEONE-ELSE"
+[ -z "$("$ACCT" --no-color pick --no-probe 2>/dev/null)" ] \
+  && ok "...and refuses one cached under a different account, without probing" \
+  || bad "no-probe" "handed off on quota belonging to another account"
+
+# The same replacement with NO identity to bind to. Claude Code did not always
+# publish one, and those accounts store no account_uuid, so the credential has to
+# answer for the account as well — otherwise an `ok` row skips every check and the
+# quota simply follows the name onto its successor.
+python3 - "$ADIR/a.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["account_uuid"] = None
+json.dump(d, open(sys.argv[1], "w"))
+PY
+printf '{"a":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":2,"seven_day_percent":2}}' \
+  "$(date +%s)" "$(cred_fp "$ADIR/a.json")" > "$FAKE/.claude/ccd/accounts-quota.json"
+[ "$("$ACCT" --no-color pick --no-probe 2>/dev/null)" = "a" ] \
+  && ok "an identity-less account is trusted while its credential still matches" \
+  || bad "no-uuid" "a valid row was retired for want of a uuid"
+python3 - "$ADIR/a.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["accessToken"] = "AT-different-owner"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+[ -z "$("$ACCT" --no-color pick --no-probe 2>/dev/null)" ] \
+  && ok "...and refused once the credential under that name changed hands" \
+  || bad "no-uuid" "quota followed a name with no identity to bind it"
+
+# The instruction printed beside a dead account has to be the one that works,
+# and must not name ANY follow-up ccd command — that was the whole bug.
+# Each row names the token it measured, or supersession retires it and `list`
+# probes Anthropic for real with fake credentials — a bug in the test, not a pass.
+printf '{"a":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"},"b":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"}}' \
+  "$(date +%s)" "$(acct_uuid "$ADIR/a.json")" "$(cred_fp "$ADIR/a.json")" \
+  "$(date +%s)" "$(acct_uuid "$ADIR/b.json")" "$(cred_fp "$ADIR/b.json")" \
+  > "$FAKE/.claude/ccd/accounts-quota.json"
+out=$("$ACCT" --no-color list 2>&1)
+hint=$(printf '%s' "$out" | grep -A2 're-login needed for')
+case "$hint" in
+  *"ccd account"*|*"--force"*) bad "dead-account hint" "still names a ccd follow-up command" ;;
+  *"/login"*) ok "the dead-account hint asks for /login and names no follow-up command" ;;
+  *) bad "dead-account hint" "got: $(printf '%s' "$hint" | tr '\n' ' ' | head -c 90)" ;;
+esac
+rm -f "$FAKE/.claude/ccd/accounts-quota.json"
 rm -f "$FAKE/.claude.json"     # later sections exercise the no-identity fallback
 
 head_ "23. multi-account: choosing where to go"
 seed_quota() { printf '%s' "$1" > "$FAKE/.claude/ccd/accounts-quota.json"; }
 NOW=$(date +%s)
-q() { printf '"%s":{"status":"ok","checked_at":%s,"five_hour_percent":%s,"seven_day_percent":%s}' "$1" "$NOW" "$2" "$3"; }
+# These accounts are registered without an identity, so a cached row is bound to
+# the credential alone. Omitting `cred` would retire every row and send `pick`
+# to Anthropic with fake tokens.
+q() { printf '"%s":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":%s,"seven_day_percent":%s}' \
+        "$1" "$NOW" "$(cred_fp "$ADIR/$1.json")" "$2" "$3"; }
 
 # Rebuild the store this section talks about instead of inheriting whatever the
 # previous one left. Every account here must also have a seeded quota entry: a
@@ -2322,7 +2633,7 @@ ka quiet
 rm -f "$FAKE/.claude/ccd/last-stale-warn"
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
 case "$out" in
-  *stale-spare*"refresh --all"*) ok "...and the prompt hook delivers it, with the recovery command" ;;
+  *stale-spare*"account refresh"*) ok "...and the prompt hook delivers it, with the recovery command" ;;
   *) bad "stale warning" "got: ${out:-<nothing>}" ;;
 esac
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
