@@ -17,6 +17,10 @@ Design notes live in docs/multi-account.md. The three facts this file is built o
   3. Access tokens live ~8h, refresh tokens ~8.5 DAYS and rotate on every use.
      So: refresh rarely, serialize it, write the rotated token to disk BEFORE
      using the new access token, and never refresh the account Claude Code owns.
+     The corollary is bank_live_oauth(): because the stored token is a snapshot
+     of a rotating key, every command starts by copying the live blob back into
+     the account that owns it. Reading the live blob is free; spending the stored
+     one is not.
 
 Commands:
   ccd account add [--name N] [--label L] [--priority P]
@@ -31,6 +35,7 @@ Commands:
 
 import argparse
 import errno
+import hashlib
 import json
 import os
 import re
@@ -93,8 +98,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CCD_DIR = os.path.join(os.path.expanduser("~"), ".claude", "ccd")
 ACCOUNTS_DIR = os.path.join(CCD_DIR, "accounts")
 ACTIVE_FILE = os.path.join(ACCOUNTS_DIR, ".active")
-# When ccd itself last set the pointer, so a profile read can be judged stale
-# or fresh relative to our own swap. See active_name().
+# When ccd last INSTALLED credentials, so a profile read can be judged stale or
+# fresh relative to our own swap. Written by swap_to() alone — see active_set().
+# Absent means ccd has never installed anything, and the profile is unopposed.
 ACTIVE_AT_FILE = os.path.join(ACCOUNTS_DIR, ".active-at")
 LOCK_FILE = os.path.join(ACCOUNTS_DIR, ".lock")
 ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
@@ -405,7 +411,9 @@ def _pointer_name():
 
 
 def _active_at():
-    """When ccd last set the pointer, in ms epoch. 0 when never."""
+    """When ccd last INSTALLED credentials, in ms epoch. 0 when it never has —
+    which leaves the profile unopposed, because there is no swap to be stale
+    against. Not the same as when the pointer was last written; see active_set."""
     try:
         with open(ACTIVE_AT_FILE) as f:
             return int(f.read().strip())
@@ -432,12 +440,17 @@ def active_name():
     they would attribute this session's tokens to an account that does not own
     them."""
     uuid, _, fetched_at = live_identity()
-    if uuid and fetched_at >= _active_at():
+    # Strictly after, matching _bank_target(): equal stamps leave the order
+    # undecidable, and swap_to() banks CREDENTIALS from this answer, so a tie
+    # accepted here files one account's tokens under another.
+    if uuid and fetched_at > _active_at():
         for a in accounts_all():
             if a.get("account_uuid") == uuid:
                 if _pointer_name() != a["name"]:
                     try:
-                        active_set(a["name"])   # self-heal: the user used /login
+                        # Self-heal: the user used /login. Pointer only — ccd
+                        # installed nothing, so it must not claim it did.
+                        active_set(a["name"], stamp=False)
                     except OSError:
                         pass
                 return a["name"]
@@ -449,9 +462,17 @@ def active_name():
     return _pointer_name()
 
 
-def active_set(name):
+def active_set(name, stamp=True):
+    """Record which account is signed in; with `stamp`, also when ccd installed
+    its credentials.
+
+    Only a real credential write may stamp. Marking a pointer-only correction as
+    an install dates ccd's "swap" AFTER the user's own /login, which makes the
+    profile look stale forever and silently stops banking every later rotation —
+    so the fix appears to work once and then rots."""
     write_atomic(ACTIVE_FILE, f"{name}\n", 0o600)
-    write_atomic(ACTIVE_AT_FILE, f"{int(time.time() * 1000)}\n", 0o600)
+    if stamp:
+        write_atomic(ACTIVE_AT_FILE, f"{int(time.time() * 1000)}\n", 0o600)
 
 
 def live_identity():
@@ -485,6 +506,88 @@ def live_identity():
                 fetched = fetched if isinstance(fetched, (int, float)) else 0
                 return uuid, (email if isinstance(email, str) else ""), int(fetched)
     return None, "", 0
+
+
+def _bank_target():
+    """(account name, live oauth) when the live blob provably belongs to a
+    registered account and differs from what is stored. None otherwise.
+
+    Ordered cheapest-first and every gate fails closed, so a user who registered
+    nothing returns before live_read() reaches the keychain."""
+    uuid, _, fetched_at = live_identity()
+    # `<=`, not `<`: equal stamps leave the order undecidable, so a tie is not
+    # proof. active_name() applies the same rule, and must — swap_to() banks from
+    # its answer. A missing .active-at reads as 0, which passes: ccd has installed
+    # nothing, so there is no swap for the profile to be stale against.
+    if not uuid or fetched_at <= _active_at():
+        return None
+    accounts = accounts_all()
+    owner = next((a for a in accounts if a.get("account_uuid") == uuid), None)
+    if not owner:
+        return None            # signed into an account ccd does not know
+    blob, _ = live_read()
+    live = blob.get("claudeAiOauth")
+    if not isinstance(live, dict) or not live.get("accessToken"):
+        return None
+    rt = live.get("refreshToken")
+    if rt and any(
+        a["name"] != owner["name"]
+        and (a.get("claudeAiOauth") or {}).get("refreshToken") == rt
+        for a in accounts
+    ):
+        # This token is already on file under a DIFFERENT account, so the profile
+        # is not describing the blob — another account's session wrote it while
+        # this one was signing in. Banking would hand this account a credential
+        # that answers as somebody else, which is worse than a dead one.
+        return None
+    if (owner.get("claudeAiOauth") or {}) == live:
+        return None            # the snapshot is already current
+    return owner["name"], live
+
+
+def bank_live_oauth():
+    """Copy the live credentials into the account file that provably owns them.
+
+    ccd stores a snapshot of a ONE-TIME key: Claude Code rotates the refresh
+    token on every use and a `/login` mints a new one, so the snapshot dies the
+    moment either happens outside a swap, and only spending it reveals that. The
+    asymmetry is the whole design — writing the live blob back costs nothing,
+    while testing the stored one costs the very rotation that killed it. So ccd
+    copies rather than probes, before every command, which is what makes `/login`
+    the only thing the user ever has to do.
+
+    Two conditions must hold, and both are re-checked under the lock because the
+    live blob is shared with every Claude Code process on the machine:
+
+        owner  accountUuid names a registered account
+        proof  the profile was fetched strictly after our last credential
+               install; before that it still names the account a swap left, and
+               banking on it would file the incoming tokens under the outgoing
+               account
+
+    Rationale, and the residual cases this cannot cover, live in
+    docs/multi-account.md §12.0.1 through §12.0.5."""
+    if _bank_target() is None:
+        return                 # cheap pre-check: keeps the lock uncontended
+    try:
+        with Lock(LOCK_FILE, wait=False):
+            target = _bank_target()
+            if target is None:
+                return         # the blob moved while we waited
+            name, live = target
+            # Re-read under the lock: a concurrent rm or add must not be undone
+            # by a record we loaded before taking it.
+            acct = account_load(name)
+            if not acct:
+                return         # removed while we waited
+            acct["claudeAiOauth"] = live
+            # stale_spares() keys on this, and the snapshot really is this fresh.
+            # quota_for() retires failure verdicts by credential identity, not
+            # by this, so the two never race on second-granular clocks.
+            acct["refreshed_at"] = now()
+            account_save(name, acct)
+    except LockBusy:
+        return                 # another ccd holds the store; it banks on its own
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
@@ -664,6 +767,50 @@ def account_refresh(name, acct):
 # ── Quota ────────────────────────────────────────────────────────────────────
 
 
+def _cred_fingerprint(acct):
+    """A short, non-secret id for the credential on file, so a cached verdict can
+    name the token it measured. A truncated digest because the quota cache is no
+    place to keep a token, and cannot be turned back into one."""
+    at = ((acct or {}).get("claudeAiOauth") or {}).get("accessToken")
+    if not isinstance(at, str) or not at:
+        return ""           # no credential to name; every verdict about it is suspect
+    return hashlib.sha256(at.encode()).hexdigest()[:16]
+
+
+def _cache_row_valid(rec, acct):
+    """Is this cached verdict still about THIS account's current credential?
+
+    Two independent questions, and both have bitten:
+
+      uuid  `add --force` can point an existing name at a DIFFERENT account. The
+            quota cached under that name describes whoever held it before, and
+            offering a handoff on it spends somebody else's headroom. Checked for
+            every status, `ok` included — cmd_pick --no-probe trusts an `ok` row
+            with no network call at all.
+      cred  a failure verdict measured against a token that banking has since
+            replaced is about a credential that no longer exists; serving it is
+            what made a repaired account keep reporting `needs re-login`. Only
+            asked of a failure while a uuid is available: a quota reading survives
+            a token change, because quota belongs to the account rather than to
+            the credential.
+
+    Neither is a deletion, so a concurrent writer holding an older copy of the
+    whole cache cannot undo them by writing it back."""
+    if not isinstance(rec, dict):
+        return False
+    uuid = acct.get("account_uuid")
+    if not uuid:
+        # Registered from a Claude Code that published no identity. Nothing
+        # durable distinguishes one holder of this name from the next, so the
+        # credential has to answer for the account too, `ok` rows included.
+        return rec.get("cred") == _cred_fingerprint(acct)
+    if rec.get("uuid") != uuid:
+        return False
+    if rec.get("status") != "ok" and rec.get("cred") != _cred_fingerprint(acct):
+        return False
+    return True
+
+
 def quota_cache():
     return read_json(QUOTA_FILE) or {}
 
@@ -737,9 +884,20 @@ def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True, cache=None):
     cache = quota_cache() if cache is None else cache
     rec = cache.get(name)
     if isinstance(rec, dict) and isinstance(rec.get("checked_at"), (int, float)):
-        if (now() - rec["checked_at"]) < cache_ttl_for(rec.get("status"), ttl):
+        # Identity before age: a row can be fresh and still be about the wrong
+        # account or a replaced token. Clocks cannot answer either question —
+        # now() is second-granular, so a bank and a probe in the same second are
+        # a tie, and probe_account may refresh mid-probe, which would make a
+        # verdict look older than the very token it measured.
+        if _cache_row_valid(rec, acct) and (
+            (now() - rec["checked_at"]) < cache_ttl_for(rec.get("status"), ttl)
+        ):
             return rec, cache
     rec = probe_account(name, acct, allow_refresh=allow_refresh)
+    # Stamped after the probe: it may have refreshed the token, and the verdict
+    # belongs to whichever credential it ended up measuring.
+    rec["cred"] = _cred_fingerprint(acct)
+    rec["uuid"] = acct.get("account_uuid")
     cache[name] = rec
     return rec, cache
 
@@ -782,7 +940,10 @@ def swap_to(name, force=False):
         die(f"no such account: {name}")
     oauth = target.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("accessToken"):
-        die(f"account '{name}' has no usable credentials — re-add it")
+        die(
+            f"account '{name}' has no usable credentials — run `claude` and sign "
+            f"in with /login as that account"
+        )
 
     with Lock(LOCK_FILE):
         blob, sources = live_read()
@@ -793,25 +954,39 @@ def swap_to(name, force=False):
         # session that just ended. Skipping this throws away every token refresh
         # the outgoing account accumulated, and coming back to it later would use
         # a stale — possibly already-rotated-away — refresh token.
-        # active_name() resolves by accountUuid, so this is the account that was
-        # genuinely signed in — even if the user reached it with /login rather
-        # than through ccd. When it returns None the session belongs to an
-        # unregistered account and there is nothing to bank; writing anywhere
-        # would file these tokens under a name that does not own them.
+        # active_name() prefers accountUuid but falls back to the pointer when
+        # Claude Code publishes no identity, and that fallback is the only source
+        # on such an install — which is why bank_live_oauth() cannot replace this.
+        # When it returns None the session belongs to an unregistered account and
+        # there is nothing to bank; writing anywhere would file these tokens
+        # under a name that does not own them.
         cur = active_name()
         live_oauth = blob.get("claudeAiOauth")
-        if cur and cur != name and isinstance(live_oauth, dict):
+        if cur and isinstance(live_oauth, dict):
             prev = account_load(cur)
             if prev:
                 prev["claudeAiOauth"] = live_oauth
                 prev["refreshed_at"] = now()
                 account_save(cur, prev)
 
-        new_blob = dict(blob)
-        new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
-        if not live_write(new_blob, sources):
-            die("failed to write the credential store")
-        active_set(name)
+        # Already signed in as the target: the live blob is this account's own and
+        # newer than `oauth`, which was read before that backup. Installing it
+        # would trade a working token for the stale copy the user asked us to
+        # repair. The two live sources must still be put back in step, though —
+        # that is the whole reason live_write exists, and a stale
+        # ~/.credentials.json beside a good keychain resurrects the old account.
+        if cur == name:
+            if not live_write(blob, sources):
+                # Not fatal: nothing was supposed to change and the credential in
+                # use is still good. But a silent failure here is how a stale
+                # fallback file survives to resurrect the previous account.
+                warn("could not reconcile the credential stores")
+        else:
+            new_blob = dict(blob)
+            new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
+            if not live_write(new_blob, sources):
+                die("failed to write the credential store")
+            active_set(name)
 
     if not force:
         others = claude_processes()
@@ -910,7 +1085,8 @@ def cmd_add(args):
     }
     with Lock(LOCK_FILE):
         account_save(name, acct)
-        active_set(name)
+        # Registering records who is signed in; it installs no credentials.
+        active_set(name, stamp=False)
 
     plan = acct["subscription_type"] or "unknown"
     print(f"{C_GRN}✓{C_RESET} registered {C_BOLD}{name}{C_RESET} ({plan}), priority {priority}")
@@ -1000,8 +1176,8 @@ def cmd_list(args):
     if dead:
         print(
             f"\n{C_YLW}!{C_RESET} re-login needed for: {', '.join(dead)}\n"
-            f"{C_DIM}  `claude` → /login as that account → `ccd account add --force "
-            f"--name {dead[0]}`{C_RESET}"
+            f"{C_DIM}  Run `claude` and sign in with /login as that account. ccd "
+            f"stores the new token itself — there is nothing else to run.{C_RESET}"
         )
     return 0
 
@@ -1115,7 +1291,11 @@ def cmd_pick(args):
             # Never opens a socket: a stale answer that costs nothing beats a
             # fresh one that freezes the user's prompt for seconds.
             rec = cache.get(a["name"])
-            if not isinstance(rec, dict) or rec.get("status") != "ok":
+            # The identity check earns its place most here: this path hands off
+            # on a cached `ok` without opening a socket, so a row left behind by
+            # a name that now points at another account would spend that
+            # account's quota.
+            if not _cache_row_valid(rec, a) or rec.get("status") != "ok":
                 continue
             ts = rec.get("checked_at")
             if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
@@ -1266,9 +1446,9 @@ def stale_message(stale):
     return (
         "[ccd] Tell the user now: these spare Claude accounts stopped refreshing "
         "and cannot receive a quota handoff — " + "; ".join(parts)
-        + ". Recover while the window is open: `ccd account refresh --all` needs no "
-        "re-login. If that fails, run `claude`, /login as that account, then "
-        f"`ccd account add --force --name {stale[0]['name']}`."
+        + ". Recover while the window is open: `ccd account refresh` needs no "
+        "re-login. If that fails, run `claude` and sign in with /login as that "
+        "account — ccd stores the new token itself, with no further command."
     )
 
 
@@ -1371,6 +1551,9 @@ def main(argv):
         p.print_help()
         return 0
     ensure_dirs()
+    # Make the store true before anything reads it. Without this every command
+    # below reasons about a snapshot that may have gone dead days ago.
+    bank_live_oauth()
     return args.fn(args)
 
 

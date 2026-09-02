@@ -101,6 +101,8 @@ run out again minutes after arriving.
 `ccd doctor` reports each account's quota and flags any that needs a re-login.
 Lapsed tokens look fine until the moment you need them, so ccd refreshes idle
 accounts once a day and tells you in-session if one has stopped refreshing.
+Recovering one takes a plain `/login` as that account — ccd notices and stores
+the new token itself, with nothing to re-register by hand.
 Tokens are stored in `~/.claude/ccd/accounts/` (mode 600,
 see [SECURITY.md](SECURITY.md)); `ccd account rm <name>` removes one.
 

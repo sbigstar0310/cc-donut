@@ -67,9 +67,11 @@ has happened. Check it *before* you need it — after quota is gone you cannot a
 Claude for help fixing it.
 
 ```sh
-claude                                     # /login as that account
-ccd account add --force --name <name>      # re-register it
+claude     # sign in with /login as that account — that is the whole fix
 ```
+
+ccd copies the new token into its own store the next time it runs a command, so
+there is nothing to re-register by hand.
 
 ## After switching — three ways to change models
 

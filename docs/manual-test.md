@@ -337,4 +337,4 @@ rm -f ~/.claude/ccd/accounts-quota.json
 | `/login` 후에도 `current`가 안 바뀜 | 같은 명령으로 `profileFetchedAt` 확인. 스왑 시각(`~/.claude/ccd/accounts/.active-at`)보다 커야 identity가 채택된다                                        |
 | `pick`이 계속 `all_exhausted`       | `cat ~/.claude/ccd/accounts-quota.json` — `status`가 `dead`면 재로그인 필요, `error`면 네트워크                                                           |
 | 스왑 후 MCP 로그아웃                | surgical merge 실패. Stage 4의 python 스니펫 출력을 남길 것                                                                                               |
-| 계정이 `needs re-login`             | `claude` → `/login` → `./bin/ccd-account add`(같은 계정이면 자동으로 제자리 갱신된다)                                                                     |
+| 계정이 `needs re-login`             | `claude` → `/login` 만 하면 끝. 다음 `ccd account` 명령이 라이브 토큰을 그 계정 파일로 복사한다(§12.0 배킹). `add --force` 는 필요 없다                   |

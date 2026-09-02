@@ -65,8 +65,9 @@ ccd account list
   the second one.
 - **Any account shows `needs re-login`:** this is urgent and easy to miss. That
   spare cannot receive a handoff, and the failure is invisible until the moment
-  it is needed. Fix it now: `claude` → `/login` as that account →
-  `ccd account add --force --name <name>`.
+  it is needed. It means ccd's stored copy of the refresh token is dead, not the
+  account. Fix it in one step: `claude`, then `/login` as that account. ccd banks
+  the new token on its next command — do not ask for `ccd account add --force`.
 
 Registering requires signing in, so it is impossible once quota is at zero — this
 belongs in the preparation phase, same as the key.
@@ -77,13 +78,14 @@ path is the whole answer and a second account is not something to go buy.
 ### 4. Adjust slot assignments if needed
 
 ```sh
-ccd models     # Catalog with prices and benchmark rationale
-ccd pick       # Interactive reassignment — needs direct user input, so tell them to run it in a terminal
+ccd models                                # catalog with prices and rationale
+printf 'flash\nluna\nkimi\n' | ccd pick  # haiku, sonnet, opus — a blank line keeps one
 ```
 
-`ccd pick` is interactive and doesn't work well inside Claude Code. If only the
-assignment needs changing, editing `~/.claude/ccd/providers/tiers.env` directly is
-faster. Slugs reference the keys in `models.conf`.
+`pick` reads three answers in order, so pipe them and stay in-session rather than
+sending anyone to a terminal. Use the catalog keys from `models.conf`, never the
+menu numbers, which move when the catalog changes. Command details live in
+`/ccd:help`.
 
 ### 5. Refresh the model recommendations (LLM research flow)
 
@@ -130,7 +132,9 @@ prices move and new models ship), do this:
    - If nothing should change, say so in the first line and stop there; don't
      manufacture a diff to look busy.
 6. **Write only after approval.** Update `models.conf` (keep the file format
-   and one-line rationale notes) and, if slot assignments change, `tiers.env`.
+   and one-line rationale notes) and, if slot assignments change, pipe the new
+   keys into `ccd pick` rather than writing `tiers.env` by hand — that keeps the
+   file's format in one place.
    Then run `ccd doctor <key>` once per changed slot and report the verdicts as
    one line each.
 
@@ -145,7 +149,9 @@ prices move and new models ship), do this:
   a spare has room; the statusline shows the same as `● claude:<name> │ spare …`.
 - A spare account that reports `needs re-login` is the one failure worth raising
   unprompted. It looks healthy in every other view and only surfaces at the
-  moment of the handoff, which is the moment the user cannot fix it.
+  moment of the handoff, which is the moment the user cannot fix it. Signing in
+  with `/login` is the entire repair; ccd re-reads the credential store on every
+  command and files the new token under the account that owns it.
 - After switching, models change in-session via `/model haiku|sonnet|opus`, or a
   direct `/model <slug>`. Selection needs no restart. A direct model is outside
   ccd's launch-time context budget until the statusline evaluates fresh provider

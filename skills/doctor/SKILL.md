@@ -35,8 +35,9 @@ Run everything yourself and report tersely; never send the user to a terminal.
    line, and treat two cases as findings rather than status:
    - any account marked `needs re-login` → surface it even if everything else is
      `✓ OK`. That spare cannot receive a handoff, and nothing else in the system
-     will reveal it until the handoff itself fails. Offer the fix: `claude` →
-     `/login` as that account → `ccd account add --force --name <name>`.
+     will reveal it until the handoff itself fails. The fix is one step: the
+     user runs `claude` and signs in with `/login` as that account; ccd stores
+     the new token itself. Never ask for a follow-up `ccd account add --force`.
    - a `✗` on store permissions → the file holds a refresh token good for days.
      Offer to run the `chmod` it names.
 
