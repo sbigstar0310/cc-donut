@@ -2395,7 +2395,7 @@ rm -f "$FAKE/.claude/ccd/accounts-keepalive" "$FAKE/.port" "$FAKE/.hits"
 # macOS CI runner) never started the latter, and its stderr is kept so a CI
 # failure says why instead of "never came up".
 cat > "$FAKE/tokserver.py" <<'PY'
-import http.server, json, os, sys, time
+import http.server, json, os, socketserver, sys, time
 port_file, hits = sys.argv[1], sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -2408,7 +2408,14 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
     def log_message(self, *a): pass
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+class S(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind calls socket.getfqdn(), a reverse-DNS lookup that
+    # stalls for tens of seconds on the macOS CI runner; the port file then
+    # never appears and the test reads as "endpoint never came up".
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+srv = S(("127.0.0.1", 0), H)
 with open(port_file + ".tmp", "w") as f: f.write(str(srv.server_address[1]))
 os.replace(port_file + ".tmp", port_file)
 srv.serve_forever()
