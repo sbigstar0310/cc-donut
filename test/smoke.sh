@@ -750,66 +750,78 @@ kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
 
 head_ "17b. the statusline never waits on the dashboard"
-# ccd renders the dashboard's rows above its own, by running it as a child. That
-# child is usually instant, but it refreshes its usage reading on its own
-# schedule — and while it does, waiting for it blanks the WHOLE statusline. A
-# user reported that as "the dashboard takes five seconds to appear". Serve the
-# rows we saw last and refresh behind them: slightly stale beats absent.
-mkdir -p "$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist"
-: > "$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist/index.js"
-printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+# ccd renders the dashboard's rows above its own by running it as a child. That
+# child is usually instant, but it refreshes its usage reading on its own schedule,
+# and one reported host measured 11s for that refresh: naming the Codex model
+# shells out to `codex exec` under a 10s timeout of its own. Waiting for that on
+# the render path froze the whole statusline and — when the wait lost the race, as
+# it always did at a 10s watchdog — blanked the dashboard's rows. Alternating
+# between the two is the flicker in #9. So the render never runs the dashboard at
+# all now: it reads the row it cached and hands the refresh to a background job.
+# Nothing Claude Code waits on can be made slow by another plugin's provider call.
+DASH_DIST="$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist"
+mkdir -p "$DASH_DIST"; : > "$DASH_DIST/index.js"
 cp "$FAKE/fakebin/node" "$FAKE/node.real"
-cat > "$FAKE/fakebin/node" <<'EOF'
+dash_node() { cat > "$FAKE/fakebin/node"; chmod +x "$FAKE/fakebin/node"; }
+# Move the file into the past rather than the clock into the future: production
+# only ever compares against a real now.
+age_file() { python3 -c "import os,sys,time;t=time.time()-float(sys.argv[2]);os.utime(sys.argv[1],(t,t))" "$1" "$2"; }
+render() { printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | env CCD_ACTIVE=1 "$@" "$ROOT/bin/ccd-statusline" 2>/dev/null; }
+dash_reap() { pkill -f "$FAKE/fakebin/node" 2>/dev/null; true; }
+# Refreshers are backgrounded copies of ccd-statusline, and its path is shared with
+# any real session rendering from this same checkout. Narrow to what appeared since
+# a snapshot rather than signalling everything the pattern matches. That is not
+# proof of ownership — a real refresher starting inside the same window would be
+# caught too — but it keeps the blast radius to this checkout and this moment.
+dash_refreshers() { pgrep -f "$ROOT/bin/ccd-statusline" 2>/dev/null | tr '\n' ' '; }
+dash_started_since() { # $1 = a dash_refreshers snapshot taken before the render
+  local pid
+  for pid in $(dash_refreshers); do
+    case " $1 " in *" $pid "*) ;; *) printf '%s ' "$pid" ;; esac
+  done
+}
+# Fail closed. Where pgrep is missing every assertion that counts processes counts
+# zero and passes on nothing — which is how debian:stable-slim ran this suite until
+# test/docker.sh started installing procps.
+for dash_tool in pgrep pkill; do
+  command -v "$dash_tool" >/dev/null 2>&1 \
+    || bad "test environment" "$dash_tool is missing: the process assertions below cannot run"
+done
+dash_wait() { # $1=needle — a background refresh is done when its row lands
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    grep -q "$1" "$FAKE/.claude/ccd/.dashboard-row" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# The exact shape of #9: a row past its refresh age and a dashboard slower than any
+# watchdog we would set. The render must neither wait for it nor drop its rows.
+dash_node <<'EOF'
 #!/bin/sh
-sleep 5
-echo "FRESH-DASHBOARD-ROW"
+sleep 30
+echo "SLOW-ROW"
 EOF
-chmod +x "$FAKE/fakebin/node"
+printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+age_file "$FAKE/.claude/ccd/.dashboard-row" 600
 sl_start=$(date +%s)
-row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+row=$(render)
 sl_elapsed=$(( $(date +%s) - sl_start ))
 [ "$sl_elapsed" -le 2 ] \
-  && ok "a five-second dashboard does not hold up the statusline (${sl_elapsed}s)" \
+  && ok "a stalled dashboard does not hold up the statusline (${sl_elapsed}s)" \
   || bad "statusline latency" "waited ${sl_elapsed}s for the dashboard"
 case "$row" in
-  *"CACHED-DASHBOARD-ROW"*) ok "the rows we saw last are shown meanwhile" ;;
-  *) bad "statusline" "lost the dashboard rows: $(printf '%s' "$row" | head -c 70)" ;;
+  *"CACHED-DASHBOARD-ROW"*) ok "...and its rows stay on screen while it refreshes" ;;
+  *) bad "statusline" "blanked the dashboard rows: $(printf '%s' "$row" | head -c 70)" ;;
 esac
 case "$row" in
   *"ccd"*) ok "and the ccd row is still rendered alongside them" ;;
   *) bad "statusline" "no ccd row" ;;
 esac
-# With nothing cached yet, one render pays for it so the rows exist at all.
-# Let the refresh above finish first: while one is in flight it holds the lock,
-# and a second render would correctly decline to start another.
-pkill -f "$FAKE/fakebin/node" 2>/dev/null
-rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock"
-cat > "$FAKE/fakebin/node" <<'EOF'
-#!/bin/sh
-echo "FIRST-DASHBOARD-ROW"
-EOF
-chmod +x "$FAKE/fakebin/node"
-row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
-case "$row" in
-  *"FIRST-DASHBOARD-ROW"*) ok "the very first render still fetches, so nothing is missing" ;;
-  *) bad "statusline" "first render had no dashboard rows" ;;
-esac
-[ -s "$FAKE/.claude/ccd/.dashboard-row" ] \
-  && ok "...and remembers them for next time" || bad "statusline" "nothing cached"
 # A statusline renders on every prompt and tool call. Without single-flight, a
 # stalled dashboard would leave a new `node` behind on each render, and two that
 # finished out of order would let the older row win.
-printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
-cat > "$FAKE/fakebin/node" <<'EOF'
-#!/bin/sh
-sleep 30
-echo "SLOW-ROW"
-EOF
-chmod +x "$FAKE/fakebin/node"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 \
-    "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
-done
+for _ in 1 2 3 4 5 6 7 8 9; do render >/dev/null; done
 sleep 1
 children=$(pgrep -f "$FAKE/fakebin/node" 2>/dev/null | wc -l | tr -d ' ')
 [ "${children:-0}" -le 1 ] \
@@ -817,80 +829,252 @@ children=$(pgrep -f "$FAKE/fakebin/node" 2>/dev/null | wc -l | tr -d ' ')
   || bad "statusline fan-out" "$children dashboard children alive"
 [ -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
   && ok "the refresh holds a lock while it runs" || bad "single-flight" "no lock"
-pkill -f "$FAKE/fakebin/node" 2>/dev/null
-rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
 
 # A child that hangs must not outlive the row it was fetched for.
-printf 'CACHED-DASHBOARD-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
-printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 CCD_DASH_TIMEOUT=1 \
-  "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
+age_file "$FAKE/.claude/ccd/.dashboard-row" 600
+rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+dash_reap
+render CCD_DASH_TIMEOUT=1 >/dev/null
 sleep 3
 [ "$(pgrep -f "$FAKE/fakebin/node" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
   && ok "a hung dashboard child is killed by the watchdog" \
   || bad "watchdog" "child survived its timeout"
 [ ! -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
   && ok "...and the lock is released with it" || bad "watchdog" "lock leaked"
+# The kill that leaks is not the watchdog's, though — it is the render's whole
+# process group going away with the terminal, mid-refresh. A refresh that dies that
+# way still has to clean up after itself.
+age_file "$FAKE/.claude/ccd/.dashboard-row" 600
+dash_node <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+dash_before=$(dash_refreshers)
+render >/dev/null
+sleep 1
+for dash_pid in $(dash_started_since "$dash_before"); do kill -TERM "$dash_pid" 2>/dev/null; done
+sleep 1
+[ -z "$(ls "$FAKE/.claude/ccd"/.dashboard-row.?????? 2>/dev/null)" ] \
+  && ok "a refresher killed by a signal takes its temp file with it" \
+  || bad "signal cleanup" "temp left behind"
+[ ! -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
+  && ok "...and releases its lock on the way out" || bad "signal cleanup" "lock leaked"
+[ -z "$(pgrep -f "$FAKE/fakebin/node" 2>/dev/null)" ] \
+  && ok "...and does not leave an unsupervised dashboard running behind it" \
+  || bad "signal cleanup" "dashboard survived the refresher that owned it"
+dash_reap
+# Killed refreshers used to leave their half-written temp behind — one report had
+# 203 of them, 194 empty. Whatever the kill, the next refresh sweeps the debris.
+: > "$FAKE/.claude/ccd/.dashboard-row.ZZleak"
+age_file "$FAKE/.claude/ccd/.dashboard-row.ZZleak" 300
+[ -e "$FAKE/.claude/ccd/.dashboard-row.ZZleak" ] || bad "temp sweep" "fixture vanished early"
 
-# A lock left behind by a killed refresher must not freeze refreshes forever.
-mkdir -p "$FAKE/.claude/ccd/.dashboard-row.lock"
-python3 -c "import os,sys;os.utime(sys.argv[1], (0, 0))" "$FAKE/.claude/ccd/.dashboard-row.lock"
-cat > "$FAKE/fakebin/node" <<'EOF'
+# The refresh the render declined to wait for still has to land, or the row would
+# never change again.
+dash_node <<'EOF'
 #!/bin/sh
 echo "REFRESHED-ROW"
 EOF
-chmod +x "$FAKE/fakebin/node"
-printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 \
-  "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
-# Wait for the refresh rather than guessing at it: a container can take a second
-# or two to get a detached child scheduled, and a fixed sleep turns that into a
-# flake that looks like a product bug.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  grep -q 'REFRESHED-ROW' "$FAKE/.claude/ccd/.dashboard-row" 2>/dev/null && break
-  sleep 0.5
-done
-grep -q 'REFRESHED-ROW' "$FAKE/.claude/ccd/.dashboard-row" \
-  && ok "a stale lock is reclaimed instead of blocking refreshes forever" \
-  || bad "stale lock" "refresh never ran again"
-
-# Staleness has a ceiling: past it, the render pays rather than showing a lie.
-printf 'ANCIENT-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
-python3 -c "import os,sys;os.utime(sys.argv[1], (0, 0))" "$FAKE/.claude/ccd/.dashboard-row"
-row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 \
-      "$ROOT/bin/ccd-statusline" 2>/dev/null)
-case "$row" in
-  *"REFRESHED-ROW"*) ok "a row too old to stand behind is fetched fresh instead" ;;
-  *"ANCIENT-ROW"*) bad "staleness" "served a row with no upper bound on its age" ;;
-  *) bad "staleness" "got: $(printf '%s' "$row" | head -c 60)" ;;
+age_file "$FAKE/.claude/ccd/.dashboard-row" 600
+render >/dev/null
+dash_wait REFRESHED-ROW \
+  && ok "the background refresh lands for the next render" \
+  || bad "background refresh" "the row never changed"
+case "$(render)" in
+  *"REFRESHED-ROW"*) ok "...and that render serves it" ;;
+  *) bad "background refresh" "the fresh row was not served" ;;
 esac
+[ ! -e "$FAKE/.claude/ccd/.dashboard-row.ZZleak" ] \
+  && ok "a refresh sweeps temp files leaked by killed refreshers" \
+  || bad "temp sweep" "leaked temp survived a refresh"
 
-# The cold and over-stale path fetches synchronously, and needs the same bounds:
-# a hung dashboard there would hold the statusline hostage with no cache to fall
-# back on. On timeout we render our own row without its rows rather than freeze.
+# Nothing cached yet: the render still costs nothing, and the row it could not
+# show arrives for the render after it. One row of latency, once, beats a
+# statusline that can be frozen by a plugin ccd does not control.
+dash_reap
 rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock"
-cat > "$FAKE/fakebin/node" <<'EOF'
+dash_node <<'EOF'
 #!/bin/sh
 sleep 30
 echo "NEVER-ARRIVES"
 EOF
-chmod +x "$FAKE/fakebin/node"
 sl_start=$(date +%s)
-row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 CCD_DASH_TIMEOUT=2 \
-      "$ROOT/bin/ccd-statusline" 2>/dev/null)
+row=$(render)
 sl_elapsed=$(( $(date +%s) - sl_start ))
-[ "$sl_elapsed" -le 5 ] \
-  && ok "a hung dashboard with nothing cached is bounded too (${sl_elapsed}s)" \
-  || bad "cold-path timeout" "waited ${sl_elapsed}s"
+[ "$sl_elapsed" -le 2 ] \
+  && ok "a hung dashboard with nothing cached costs the render nothing either (${sl_elapsed}s)" \
+  || bad "cold path" "waited ${sl_elapsed}s"
 case "$row" in
-  *"NEVER-ARRIVES"*) bad "cold-path timeout" "served output from a child it killed" ;;
+  *"NEVER-ARRIVES"*) bad "cold path" "served output from a child it killed" ;;
   *"ccd"*) ok "...and the ccd row is rendered without the dashboard rows" ;;
-  *) bad "cold-path timeout" "no row at all: $(printf '%s' "$row" | head -c 60)" ;;
+  *) bad "cold path" "no row at all: $(printf '%s' "$row" | head -c 60)" ;;
 esac
-[ ! -d "$FAKE/.claude/ccd/.dashboard-row.lock" ] \
-  && ok "the lock is released on the cold path as well" || bad "cold-path lock" "leaked"
-pkill -f "$FAKE/fakebin/node" 2>/dev/null
+dash_reap
+rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+dash_node <<'EOF'
+#!/bin/sh
+echo "FIRST-DASHBOARD-ROW"
+EOF
+render >/dev/null
+dash_wait FIRST-DASHBOARD-ROW \
+  && ok "the first render's refresh still fills the cache, so nothing is missing" \
+  || bad "cold path" "nothing cached"
+
+# A lock left behind by a killed refresher must not freeze refreshes forever.
+mkdir -p "$FAKE/.claude/ccd/.dashboard-row.lock"
+python3 -c "import os,sys;os.utime(sys.argv[1], (0, 0))" "$FAKE/.claude/ccd/.dashboard-row.lock"
+dash_node <<'EOF'
+#!/bin/sh
+echo "RECLAIMED-ROW"
+EOF
+age_file "$FAKE/.claude/ccd/.dashboard-row" 600
+render >/dev/null
+dash_wait RECLAIMED-ROW \
+  && ok "a stale lock is reclaimed instead of blocking refreshes forever" \
+  || bad "stale lock" "refresh never ran again"
+
+# Half of what the dashboard draws it computes from the payload of the render that
+# ran it: the context bar, the session cost, the burn rate. Refreshing only once a
+# row has aged out would freeze those at whatever the last refresh saw, so every
+# render kicks one — including a render whose row is seconds old.
+printf 'FRESH-ENOUGH-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+dash_node <<'EOF'
+#!/bin/sh
+echo "TRACKS-THE-PAYLOAD"
+EOF
+render >/dev/null
+dash_wait TRACKS-THE-PAYLOAD \
+  && ok "a row seconds old is refreshed anyway, so payload cells keep moving" \
+  || bad "refresh cadence" "a fresh row was left alone until it aged out"
+
+# Staleness has a ceiling. Serving a row beats blanking it at almost any age — but
+# ccd exists to catch a quota running out, and an hour-old percentage is not a
+# stale reading, it is a wrong one.
+printf 'ANCIENT-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+python3 -c "import os,sys;os.utime(sys.argv[1], (0, 0))" "$FAKE/.claude/ccd/.dashboard-row"
+dash_node <<'EOF'
+#!/bin/sh
+sleep 30
+echo "NEVER-ARRIVES"
+EOF
+row=$(render)
+case "$row" in
+  *"ANCIENT-ROW"*) bad "staleness" "served a row with no upper bound on its age" ;;
+  *"ccd"*) ok "a row too old to be a reading is dropped rather than shown" ;;
+  *) bad "staleness" "got: $(printf '%s' "$row" | head -c 60)" ;;
+esac
+# A row inside the ceiling but past its refresh age is the opposite call: show it.
+printf 'STALE-BUT-USABLE' > "$FAKE/.claude/ccd/.dashboard-row"
+age_file "$FAKE/.claude/ccd/.dashboard-row" 900
+case "$(render)" in
+  *"STALE-BUT-USABLE"*) ok "...while one inside the ceiling is still served" ;;
+  *) bad "staleness" "dropped a row it should have served" ;;
+esac
+dash_reap
+
+# A row dated into the future is a clock skew or a poisoned file, never a fresh
+# reading. Trusting the arithmetic would pin the row until wall time caught up.
+dash_node <<'EOF'
+#!/bin/sh
+sleep 30
+EOF
+printf 'FUTURE-ROW' > "$FAKE/.claude/ccd/.dashboard-row"
+age_file "$FAKE/.claude/ccd/.dashboard-row" -86400
+row=$(render)
+case "$row" in
+  *"FUTURE-ROW"*) bad "future mtime" "served a row dated a day ahead" ;;
+  *"ccd"*) ok "a row dated into the future is not treated as fresh" ;;
+  *) bad "future mtime" "got: $(printf '%s' "$row" | head -c 60)" ;;
+esac
+# The same arithmetic gates the lock, and a future-dated one would never be reclaimed.
+# Let the refresh above finish releasing first: its EXIT trap removes the lock, and
+# would remove the one staged here instead.
+dash_reap; sleep 1
+rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+mkdir -p "$FAKE/.claude/ccd/.dashboard-row.lock"
+age_file "$FAKE/.claude/ccd/.dashboard-row.lock" -86400
+dash_node <<'EOF'
+#!/bin/sh
+echo "UNSTUCK-ROW"
+EOF
+render >/dev/null
+dash_wait UNSTUCK-ROW \
+  && ok "...and a lock dated into the future is reclaimed, not honoured forever" \
+  || bad "future mtime" "refreshes stayed blocked behind it"
+
+# WHICH build gets run. Claude Code never prunes old versions, so the newest
+# directory in the cache is not necessarily the one it loaded: an interrupted
+# update leaves a version there that was never installed. Resolving it costs a
+# python3, which is why only the background refresh may ask.
+dash_node <<'EOF'
+#!/bin/sh
+echo "RAN:$1"
+EOF
+DASH_CACHE_ROOT="$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard"
+mkdir -p "$DASH_CACHE_ROOT/9.9.9/dist"; : > "$DASH_CACHE_ROOT/9.9.9/dist/index.js"
+ran() { cat "$FAKE/.claude/ccd/.dashboard-row" 2>/dev/null; }
+resolve_render() {
+  rm -f "$FAKE/.claude/ccd/.dashboard-row"; rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+  render >/dev/null
+  dash_wait "RAN:" || bad "build resolution" "no refresh landed at all"
+}
+# Claude Code never prunes, so 9.9.9 can sit in the cache without ever having been
+# installed. Only the registry knows which build actually was.
+cat > "$FAKE/.claude/plugins/installed_plugins.json" <<EOF
+{"version":2,"plugins":{"claude-dashboard@claude-dashboard":[
+ {"scope":"user","installPath":"$DASH_CACHE_ROOT/1.0.0","version":"1.0.0"}]}}
+EOF
+resolve_render
+case "$(ran)" in
+  *"/1.0.0/dist/index.js") ok "the installed build is run, not merely the newest in the cache" ;;
+  *"/9.9.9/"*) bad "build resolution" "ran a build that was never installed" ;;
+  *) bad "build resolution" "ran: $(ran)" ;;
+esac
+# From 1.32.0 the plugin ships a shim that makes this choice itself. Where one
+# exists, running it is running exactly what the plugin's own statusline would.
+DASH_SHIM_DIR="$FAKE/.claude/plugins/data/claude-dashboard-claude-dashboard"
+mkdir -p "$DASH_SHIM_DIR"; : > "$DASH_SHIM_DIR/statusline.mjs"
+resolve_render
+case "$(ran)" in
+  *"/statusline.mjs") ok "...and the plugin's own shim outranks every record when it is there" ;;
+  *) bad "build resolution" "ran: $(ran)" ;;
+esac
+rm -rf "$DASH_SHIM_DIR" "$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/9.9.9" \
+       "$FAKE/.claude/plugins/installed_plugins.json"
+
+# The EXIT trap deletes "$tmp" and signals "$watchdog"/"$node_pid". On a refresh that
+# fails before it owns any of them, those names must be empty rather than whatever
+# the environment happened to export — otherwise the trap reaches for a stranger's
+# file and a stranger's process group. Only meaningful as a non-root user, since the
+# containers can write through anything; they skip this one.
+if [ "$(id -u)" -ne 0 ]; then
+  # dash_present sees a build, dash_resolve finds no version it can name: the
+  # refresher exits between the lock and its first resource.
+  rm -rf "$DASH_CACHE_ROOT/1.0.0" "$DASH_CACHE_ROOT/9.9.9" \
+         "$FAKE/.claude/plugins/installed_plugins.json"
+  mkdir -p "$DASH_CACHE_ROOT/not-a-version/dist"; : > "$DASH_CACHE_ROOT/not-a-version/dist/index.js"
+  sentinel="$FAKE/not-my-temp"; : > "$sentinel"
+  set -m; sleep 3002 & victim=$!; set +m
+  rm -rf "$FAKE/.claude/ccd/.dashboard-row.lock"
+  printf '%s' '{"model":{"id":"m"}}' \
+    | env CCD_ACTIVE=1 tmp="$sentinel" watchdog="$victim" node_pid="$victim" \
+          "$ROOT/bin/ccd-statusline" >/dev/null 2>&1
+  sleep 1
+  [ -e "$sentinel" ] \
+    && ok "a refresh that owns no temp file deletes nobody else's" \
+    || bad "trap state" "deleted a file named by an inherited \$tmp"
+  kill -0 "$victim" 2>/dev/null \
+    && ok "...and signals no process group it never started" \
+    || bad "trap state" "killed a process named by an inherited \$watchdog/\$node_pid"
+  kill -9 "$victim" 2>/dev/null
+  rm -rf "$DASH_CACHE_ROOT/not-a-version"
+  mkdir -p "$DASH_DIST"; : > "$DASH_DIST/index.js"
+fi
 
 cp "$FAKE/node.real" "$FAKE/fakebin/node"; chmod +x "$FAKE/fakebin/node"
 rm -rf "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock" "$FAKE/node.real"
+unset -f dash_node age_file render dash_wait
 
 head_ "18. automatic handoff: launcher shim"
 SHIM="$FAKE/.claude/ccd/bin/claude"
