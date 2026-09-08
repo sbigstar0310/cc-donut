@@ -3188,5 +3188,208 @@ CLAUDE_CONFIG_DIR="$FAKE/altcfg" "$ACCT" --no-color use two --force >/dev/null 2
 rm -rf "$ADIR" "$FAKE/altcfg" "$CJSON" "$FAKE/use.out"
 unset CCD_CREDENTIALS_BACKEND
 
+head_ "27. multi-account: the statusline's spare row"
+# The row that answers "do I have a net?". Its states have to stay distinguishable
+# from each other, and none of them may read as "no spare" while one is registered
+# — that was the bug: an account merely out of room for the next few minutes was
+# reported as an account the user had never set up.
+SLQ="$FAKE/.claude/ccd/accounts-quota.json"
+rm -rf "$ADIR" "$SLQ" "$FAKE/.claude.json"
+mkdir -p "$ADIR"
+mk_sl_acct() { # $1=name
+  printf '{"name":"%s","label":"%s@example.com","account_uuid":"uuid-%s","priority":1,"claudeAiOauth":{"accessToken":"AT-%s"}}\n' \
+    "$1" "$1" "$1" "$1" > "$ADIR/$1.json"
+}
+mk_sl_acct main; mk_sl_acct backup
+printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+
+# Cache rows the statusline will actually accept: row_valid() binds an `ok` row to
+# the account's uuid and a failure row to its credential too, so both are written.
+# Offsets are seconds from now, which is how a reset time is really read — as a
+# distance, not a date. "-" leaves a field out entirely.
+seed_rows() { # name:status:5h:7d:5h_offset:7d_offset ...
+  python3 - "$ADIR" "$SLQ" "$@" <<'PY'
+import datetime, hashlib, json, os, sys
+adir, out, specs = sys.argv[1], sys.argv[2], sys.argv[3:]
+now = datetime.datetime.now(datetime.timezone.utc)
+rows = {}
+for s in specs:
+    name, status, fh, sd, fr, sr = s.split(":")
+    acct = json.load(open(os.path.join(adir, name + ".json")))
+    rec = {"status": status, "checked_at": int(now.timestamp()),
+           "uuid": acct["account_uuid"],
+           "cred": hashlib.sha256(
+               acct["claudeAiOauth"]["accessToken"].encode()).hexdigest()[:16]}
+    for key, val in (("five_hour_percent", fh), ("seven_day_percent", sd)):
+        if val != "-":
+            rec[key] = int(val)
+    for key, val in (("five_hour_reset", fr), ("seven_day_reset", sr)):
+        if val != "-":
+            rec[key] = (now + datetime.timedelta(seconds=float(val))).isoformat()
+    rows[name] = rec
+json.dump(rows, open(out, "w"))
+PY
+}
+# Just the account segment, without the colours the assertions do not care about.
+sl_spare() {
+  printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+    | "$ROOT/bin/ccd-statusline" 2>/dev/null \
+    | grep 'claude:' | sed $'s/\x1b\\[[0-9;]*m//g'
+}
+
+# ── The bug: registered, alive, and out of room is its own state ─────────────
+seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:780:518400
+row=$(sl_spare)
+case "$row" in
+  *"spare none"*) bad "spare row" "called a registered account absent: $row" ;;
+  *"spare backup 98%"*) ok "a spare with no room is named, not reported as absent" ;;
+  *) bad "spare row" "got: $row" ;;
+esac
+# 98% came from the 5-hour window, so the countdown must be that window's 13
+# minutes — not the weekly reset six days out, which would send the user away for
+# a week over a wait shorter than a coffee.
+case "$row" in
+  *"(13m)"*) ok "...counting down the window that is actually spent" ;;
+  *) bad "countdown" "wrong window or none: $row" ;;
+esac
+
+# The mirror image: when the weekly is the spent one, it is the weekly that gets
+# reported. Same code path, opposite answer.
+seed_rows main:ok:0:22:18000:600000 backup:ok:10:95:3600:172800
+row=$(sl_spare)
+case "$row" in
+  *"95%"*"(2d0h)"*) ok "the binding window flips to the weekly when that is the spent one" ;;
+  *) bad "binding window" "got: $row" ;;
+esac
+
+# ── With no room, the countdown is time-to-usable, not time-to-anything ──────
+# Both windows spent: the 5-hour turns over in 13 minutes, the weekly in six days,
+# and the account is unusable until the LATER one does (has_headroom needs every
+# window under the bound). Printing the 13 minutes here promises relief that does
+# not arrive — the same lie as reporting the wrong window, pointed the other way.
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:100:780:518400
+row=$(sl_spare)
+case "$row" in
+  *"(13m)"*) bad "time to usable" "counted down a window that does not free the account: $row" ;;
+  *"backup 100% (6d0h)"*) ok "a spare blocked on both windows is timed by the later one" ;;
+  *) bad "time to usable" "got: $row" ;;
+esac
+# And the ordering follows the same number, or the row names a spare that is six
+# days away over one that is back in two hours.
+mk_sl_acct sooner
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:100:780:518400 sooner:ok:91:12:7200:518400
+row=$(sl_spare)
+case "$row" in
+  *"sooner 91% (2h0m)"*"+1"*) ok "...and outranked by a spare that is actually usable sooner" ;;
+  *) bad "time to usable" "got: $row" ;;
+esac
+rm -f "$ADIR/sooner.json"
+
+# ── Countdowns we cannot stand behind are not printed ────────────────────────
+# A reset in the past means the cache predates it: the percentage beside it is
+# the stale half. Print the number, claim no timing.
+seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:-60:518400
+row=$(sl_spare)
+case "$row" in
+  *"backup 98%"*"("*) bad "past reset" "counted down a reset that has already passed: $row" ;;
+  *"backup 98%"*) ok "a reset already in the past is not counted down" ;;
+  *) bad "past reset" "got: $row" ;;
+esac
+seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:-:-
+row=$(sl_spare)
+case "$row" in
+  *"backup 98%"*"("*) bad "absent reset" "invented a countdown: $row" ;;
+  *"backup 98%"*) ok "...and a missing reset leaves the percentage to stand alone" ;;
+  *) bad "absent reset" "got: $row" ;;
+esac
+# Both windows over the bound, only one of them timed. The untimed one still has
+# to turn over, so there is no honest number for when the account comes back —
+# and the other window's 13 minutes is not it. (Without the guard this is also
+# where `max()` meets a None and takes the whole row down with it.)
+seed_rows main:ok:0:22:18000:600000 backup:ok:98:95:780:-
+row=$(sl_spare)
+case "$row" in
+  *"backup 98%"*"("*) bad "half-timed spare" "timed the account by a window that does not free it: $row" ;;
+  *"backup 98%"*) ok "...and one blocked window we cannot time leaves the whole account untimed" ;;
+  *) bad "half-timed spare" "got: $row" ;;
+esac
+
+# ── Where the ready/full line falls, and what it costs to be on each side ────
+# A dead spare needs the user to do something and this row is the only place it
+# says so, so it outranks a spare that is merely full. That makes precedence the
+# test for which side of the bound an account landed on — no colour matching.
+mk_sl_acct broken
+seed_rows main:ok:0:22:18000:600000 backup:ok:89:12:780:518400 broken:dead:-:-:-:-
+# The countdown belongs on this side of the bound too: a spare at 89% with
+# thirteen minutes left is a net that is about to have a hole in it.
+case "$(sl_spare)" in
+  *"backup 89% (13m)"*) ok "one point under the bound still counts as a spare with room, timed" ;;
+  *) bad "headroom bound" "89% did not read as ready, or lost its countdown: $(sl_spare)" ;;
+esac
+seed_rows main:ok:0:22:18000:600000 backup:ok:90:12:780:518400 broken:dead:-:-:-:-
+case "$(sl_spare)" in
+  *"needs re-login"*) ok "...and at the bound the row goes to the spare needing a re-login" ;;
+  *) bad "headroom bound" "90% still read as ready: $(sl_spare)" ;;
+esac
+# The bound has to mean the same thing to both halves of the row: an account AT
+# the bound is classified as having no room, so the window holding it there is
+# what has to turn over before it is usable.
+seed_rows main:ok:0:22:18000:600000 backup:ok:90:12:780:518400
+case "$(sl_spare)" in
+  *"backup 90% (13m)"*) ok "...and a spare exactly at the bound is timed by the window holding it there" ;;
+  *) bad "headroom bound" "the bound means two different things: $(sl_spare)" ;;
+esac
+# The bound itself is ccd-account's, not a number of the statusline's own: drawing
+# the line in a different place than the swap does would name a spare the handoff
+# then declines to use.
+seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:780:518400 broken:dead:-:-:-:-
+case "$(CCD_HEADROOM=99 sl_spare)" in
+  *"backup 98%"*) ok "...and CCD_HEADROOM moves it, the same as it moves the swap's" ;;
+  *) bad "CCD_HEADROOM" "the statusline kept its own bound: $(CCD_HEADROOM=99 sl_spare)" ;;
+esac
+rm -f "$ADIR/broken.json"
+
+# ── Among spares with no room, the one that comes back first ─────────────────
+# Not the least spent one: 91% resetting in two hours is no use to someone whose
+# next command is now, and 99% resetting in three minutes is.
+mk_sl_acct later
+seed_rows main:ok:0:22:18000:600000 backup:ok:99:12:180:518400 later:ok:91:12:7200:518400
+row=$(sl_spare)
+case "$row" in
+  *"backup 99% (3m)"*"+1"*) ok "the full spare named is the soonest to reset, with the rest as +N" ;;
+  *) bad "full ordering" "got: $row" ;;
+esac
+# A spare we cannot time loses to one we can, whatever their percentages: an
+# unknown wait is not a shorter wait.
+seed_rows main:ok:0:22:18000:600000 backup:ok:99:12:180:518400 later:ok:95:12:-:-
+row=$(sl_spare)
+case "$row" in
+  *"backup 99% (3m)"*"+1"*) ok "...and a full spare with no timing sorts behind one with it" ;;
+  *) bad "full ordering" "got: $row" ;;
+esac
+rm -f "$ADIR/later.json"
+
+# ── Never probed is not the same as never registered ────────────────────────
+seed_rows main:ok:0:22:18000:600000 backup:stale:-:-:-:-
+row=$(sl_spare)
+case "$row" in
+  *"spare none"*) bad "unprobed spare" "called an unmeasured account absent: $row" ;;
+  *"spare ?"*) ok "an unprobed spare is a question mark, never a denial" ;;
+  *) bad "unprobed spare" "got: $row" ;;
+esac
+
+# The claim itself must be unsayable, not merely unsaid: every arrangement of
+# registered accounts above reaches a state, so the string has no branch left to
+# live in. If it comes back, so does the bug.
+if [ ! -r "$ROOT/bin/ccd-statusline" ]; then
+  bad "no-spare claim" "could not read the statusline to check"   # absent must not pass
+elif grep -q 'spare none' "$ROOT/bin/ccd-statusline"; then
+  bad "no-spare claim" "the statusline can still say a registered spare is absent"
+else
+  ok "...and the row has no way left to answer \"no spare\" at a registered one"
+fi
+
+rm -rf "$ADIR" "$SLQ"
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

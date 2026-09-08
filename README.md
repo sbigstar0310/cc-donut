@@ -88,10 +88,12 @@ ccd account list                 # both accounts, with live quota
 ```
 
 Nothing else changes, and your MCP logins (Notion, Slack) are unaffected by the
-switch. The statusline names the account you are on and whether a spare is ready:
+switch. The statusline names the account you are on, how much of the spare is
+spent, and when its window turns over:
 
 ```text
-● claude:personal │ spare work 20%
+● claude:personal │ spare work 20% (2h10m)     # room to switch to, right now
+● claude:personal │ spare work 98% (13m)       # spent — but worth waiting out
 ```
 
 Accounts are tried in registration order (`--priority` to change), and only while
