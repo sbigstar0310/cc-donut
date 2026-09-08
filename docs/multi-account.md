@@ -584,6 +584,53 @@ refresh token 은 1회용이고 쓸 때마다 회전한다. 저장소가 들고 
 
 **결과: 사용자가 칠 명령은 `/login` 하나다.** `add --force` 는 복구 수단에서 사라졌다.
 
+### 12.0.5b 자격증명만 옮기면 계정의 절반만 옮긴 것이다
+
+스왑은 `claudeAiOauth` 하나를 갈아끼운다. 그런데 Claude Code 가 계정에 대해 아는 것은
+자격증명 저장소에만 있지 않다. **`~/.claude.json` 에도 있고, 계정별로 키가 나뉘어 있지
+않다.**
+
+| 키 | 무엇 | 누가 쓰는가 |
+|---|---|---|
+| `modelAccessCache` | 모델별 `{apiName, entitled}` | 시작 시 bootstrap fetch |
+| `additionalModelOptionsCache` | 추가 제공 모델 목록 | 같음 |
+| `oauthAccount` | `hasExtraUsageEnabled`, `seatTier`, `organizationUuid`, `organizationRateLimitTier` | 같음 + `/login` |
+| `additionalModelCostsCache`, `orgModelDefaultCache`, `autoCompactWindowsCache`, `clientDataCacheSlots`, `cachedUsageUtilization`, `startupPrefetchedAt` | 부수 캐시 | 같음 |
+
+`GET /api/claude_cli/bootstrap` 이 이것들을 채우는데, **계정이 바뀌었는지는 묻지 않는다.**
+
+- `oauthAccount` 는 `account_uuid` 가 캐시된 값과 다르면 병합을 **거부**하고 옛 값을
+  그대로 둔다. 이 필드를 통째로 다시 쓰는 경로는 프로필 재조회 하나뿐이고, 그건
+  **24시간 타이머**로만 돈다 — 계정 변경은 조건에 없다.
+- 나머지 모델 캐시는 기동마다 갱신되지만, prefetch 가 `await` 없이 백그라운드로 돌아
+  **한 기동 늦게** 반영된다.
+
+결과: 스왑한 계정이 포함하는 모델이 `extra credit 필요` 로 남는다. 한 번의 재시작으로,
+때로는 하루 종일. Claude Code 입장에서는 버그가 아니다 — **계정은 `/login` 으로만
+바뀐다**는 전제 위에 서 있고, `/login` 은 그 전에 이 블록을 통째로 지운다.
+
+**해결: 스왑이 `/login` 과 같은 것을 버린다.** `ACCOUNT_SCOPED_CONFIG_KEYS` 는 Claude
+Code 자신의 로그아웃 경로가 지우는 목록 그대로다. 그 로그아웃 함수를 *부르는* 것이
+아니라 — 그건 refresh token 을 서버에서 폐기하고 `mcpOAuth` 까지 가져간다 — **설정 키를
+지우는 마지막 단계만** 복제한다.
+
+세 가지를 정했다.
+
+1. **없거나 못 읽는 파일은 손대지 않는다.** Claude Code 소유 파일이다. 만들지도, 고치지도
+   않는다. 자격증명 이동이 남의 파일 파싱에 인질로 잡히면 안 된다.
+2. **살아 있는 세션 옆에서도 지운다.** "세션이 떠 있으니 두자" 는 규칙은 정확히 이 버그를
+   놓친다 — 사용자가 스왑하고 나갔다 `--resume` 으로 돌아오면, 그 세션이 읽는 게 바로 이
+   파일이다. 안전하기도 하다: Claude Code 의 설정 쓰기는 락을 잡고 **디스크에서 재독한 뒤**
+   머지하며, 다른 프로세스의 편집을 감시한다. 우리 쪽은 temp + rename 이라 찢어진 파일은
+   나올 수 없다.
+3. **같은 계정 재선택은 지우지 않는다.** 정체가 안 바뀌었으니 캐시도 그 계정 것이다. 지우면
+   프로필 재조회와 추가 모델 프롬프트만 공짜로 다시 부른다.
+
+`oauthAccount` 를 지우는 것은 부작용이 아니라 **요점**이다. 프로필 재조회 가드가
+`oauthAccount` 존재를 먼저 보므로, 지우는 것이 외부 프로세스가 저 24시간 타이머를 건드릴 수
+있는 유일한 레버다. 지운 동안 §12.0 의 정체 판별은 포인터로 답한다 — 방금 우리가 설치한
+값이니 정답이다.
+
 ### 12.0.5 남는 한계
 
 **(1) 다른 계정의 세션이 라이브 블롭을 쓴 경우.** A 세션이 살아 있는 채로 B 로 로그인하면,

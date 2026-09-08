@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -506,6 +507,85 @@ def live_identity():
                 fetched = fetched if isinstance(fetched, (int, float)) else 0
                 return uuid, (email if isinstance(email, str) else ""), int(fetched)
     return None, "", 0
+
+
+# Everything Claude Code caches about which account this is and what it may run.
+# Taken from its own logout path, the only place that enumerates account-scoped
+# state, so a swap drops exactly what a /login drops and nothing more.
+#
+# None of it is keyed by account, and the startup fetch that fills it never asks
+# whether the account changed: `oauthAccount` is merged only while the uuid still
+# matches, and the profile behind it refetches on a 24h timer. Leave these and the
+# incoming account inherits the outgoing account's entitlements — a model the new
+# plan includes still reads as credits-only — for a launch, or for a day.
+ACCOUNT_SCOPED_CONFIG_KEYS = (
+    "oauthAccount",
+    "additionalModelOptionsCache",
+    "additionalModelOptionsAnsweredAt",
+    "additionalModelCostsCache",
+    "modelAccessCache",
+    "orgModelDefaultCache",
+    "lastSeenOrgDefaultUpdatedAt",
+    "clientDataCache",
+    "clientDataCacheSlots",
+    "autoCompactWindowsCache",
+    "cachedUsageUtilization",
+    "githubWebConnectionStatusCache",
+    "startupPrefetchedAt",
+)
+
+
+def config_paths():
+    """Every .claude.json Claude Code might read, in live_identity()'s order.
+
+    Both are visited for the reason live_write() visits both credential stores: a
+    stale copy left beside the live one resurrects the account we just left."""
+    seen = []
+    for p in (os.path.join(claude_config_dir(), ".claude.json"),
+              os.path.join(os.path.expanduser("~"), ".claude.json")):
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def drop_account_scoped_config():
+    """Forget what Claude Code cached about the account we just left.
+
+    Claude Code owns this file, so this creates nothing and repairs nothing: an
+    install without a config, or one we cannot parse, is left exactly as found.
+    The credential move is what matters and must never be held hostage to the
+    state of somebody else's file.
+
+    Safe next to a running session, and needed there most of all — that session is
+    about to be restarted, and the restart reads this file. Claude Code's own
+    writer re-reads under a lock and applies its change to what it finds on disk,
+    and it watches the file for other processes, so a deletion survives its next
+    write. What it cannot pick up is its own in-memory copy, which is why the
+    caller still tells the user that only a restart makes the swap real."""
+    for path in config_paths():
+        cfg = read_json(path)
+        if cfg is None:
+            continue                    # absent, or not ours to repair
+        if not any(k in cfg for k in ACCOUNT_SCOPED_CONFIG_KEYS):
+            continue                    # nothing stale; do not rewrite for nothing
+        for k in ACCOUNT_SCOPED_CONFIG_KEYS:
+            cfg.pop(k, None)
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = 0o600
+        try:
+            write_json(path, cfg, mode)
+        except Exception:
+            # Deliberately every exception, not just OSError. The credential swap
+            # has already committed, and ccd-handoff reads a non-zero exit as "the
+            # swap failed" and stops relaunching — stranding the user mid-handoff
+            # over somebody else's file. A config Claude Code wrote can hold a lone
+            # surrogate, which json.dumps(ensure_ascii=False) turns into a
+            # UnicodeEncodeError on the way out; that is a ValueError, and the
+            # narrower clause let it escape.
+            warn(f"could not clear the cached account state in {path} — the new "
+                 "account's models may take an extra restart to appear")
 
 
 def _bank_target():
@@ -987,14 +1067,24 @@ def swap_to(name, force=False):
             if not live_write(new_blob, sources):
                 die("failed to write the credential store")
             active_set(name)
+            # The credential is only half of an account. The other half is what
+            # Claude Code cached about the one we just left.
+            drop_account_scoped_config()
 
     if not force:
         others = claude_processes()
         if others:
-            warn(
-                f"{others} other Claude Code session(s) are running — they will "
-                "move to this account on their next token refresh"
-            )
+            # A live session read its entitlements once, at startup, and holds
+            # them in memory — no file we write reaches them. Saying so is what
+            # keeps the user from reading a working swap as a failed one.
+            if others == 1:
+                warn("1 other Claude Code session is running. It keeps the "
+                     "previous account's models and limits until it restarts — "
+                     "/exit it, then `claude --resume`.")
+            else:
+                warn(f"{others} other Claude Code sessions are running. They keep "
+                     "the previous account's models and limits until they restart "
+                     "— /exit one, then `claude --resume`.")
     return target
 
 
