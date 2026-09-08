@@ -2957,5 +2957,236 @@ rm -f "$FAKE"/hook.*
 rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-stale" "$FAKE/.claude/ccd/last-stale-warn" \
        "$FAKE/.claude/ccd/accounts-keepalive"
 
+head_ "26. multi-account: the caches a swap must not leave behind"
+# A swap moves the credential. It does not move Claude Code's answer to "what may
+# this account run" — that lives in ~/.claude.json, unkeyed by account, and its
+# only writer is a startup fetch that never asks whether the account changed.
+# `oauthAccount` is the worst of it: the bootstrap merge refuses to update it
+# across an identity change, and the profile refetch behind it is on a 24h timer.
+# So a swap that leaves these behind sells the incoming account the outgoing
+# account's entitlements — Fable reads as credits-only on a plan that includes it.
+# The list is Claude Code's own: exactly what it drops when an account changes.
+export CCD_CREDENTIALS_BACKEND=file
+export CCD_HTTP_TIMEOUT=1
+CJSON="$FAKE/.claude.json"
+STALE_KEYS='oauthAccount additionalModelOptionsCache additionalModelOptionsAnsweredAt
+            additionalModelCostsCache modelAccessCache orgModelDefaultCache
+            lastSeenOrgDefaultUpdatedAt clientDataCache clientDataCacheSlots
+            autoCompactWindowsCache cachedUsageUtilization
+            githubWebConnectionStatusCache startupPrefetchedAt'
+
+# A config shaped like a real one: the account-scoped caches we must drop, sitting
+# beside the session and plugin state we must not touch.
+write_config() { # $1=path
+  python3 - "$1" <<'PY'
+import json, os, sys
+json.dump({
+    "numStartups": 198,
+    "userID": "u-1",
+    "projects": {"/tmp/work": {"history": ["one", "two"], "allowedTools": ["Bash"]}},
+    "mcpServers": {"notion": {"type": "http"}},
+    "pluginUsage": {"ccd": 3},
+    "skillUsage": {"ccd:doctor": 1},
+    "hasCompletedOnboarding": True,
+    "subscriptionNoticeCount": 2,
+    "oauthAccount": {"accountUuid": "uuid-one", "emailAddress": "first@example.com",
+                     "hasExtraUsageEnabled": False, "seatTier": "team_standard",
+                     "organizationUuid": "org-A", "profileFetchedAt": 1},
+    "additionalModelOptionsCache": [{"value": "claude-fable-5-1",
+                                     "label": "Fable", "description": "d"}],
+    "additionalModelOptionsAnsweredAt": 1788747338532,
+    "additionalModelCostsCache": {"claude-fable-5-1": {}},
+    "modelAccessCache": [{"apiName": "claude-fable-5-1", "entitled": False}],
+    "orgModelDefaultCache": {"name": "x", "updated_at": "t",
+                             "data_source": "s", "override_user_selection": False},
+    "lastSeenOrgDefaultUpdatedAt": "t",
+    "clientDataCache": {"legacy": 1},
+    "clientDataCacheSlots": {"slot-A": {"at": 1}},
+    "autoCompactWindowsCache": {"w": 1},
+    "cachedUsageUtilization": {"u": 1},
+    "githubWebConnectionStatusCache": {"g": 1},
+    "startupPrefetchedAt": 1788839142826,
+}, open(sys.argv[1], "w"))
+os.chmod(sys.argv[1], 0o600)
+PY
+}
+
+# Present  → the key survived a swap it should not have.
+# Absent   → cleared.
+stale_left() { # $1=path; prints the keys still there
+  python3 - "$1" $STALE_KEYS <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("UNREADABLE"); raise SystemExit(0)
+print(" ".join(k for k in sys.argv[2:] if k in d))
+PY
+}
+
+rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-quota.json"
+write_creds one; "$ACCT" --no-color add --name one --label "first@example.com" >/dev/null 2>&1
+write_creds two; "$ACCT" --no-color add --name two --label "second@example.com" >/dev/null 2>&1
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+
+# ── The swap that changes account ───────────────────────────────────────────
+write_config "$CJSON"
+"$ACCT" --no-color use two --force >/dev/null 2>&1
+left=$(stale_left "$CJSON")
+[ -z "$left" ] \
+  && ok "a swap drops every cache that described the account we left" \
+  || bad "stale caches" "still present: $left"
+
+# The same write must not cost the user anything else in that file. Conversations
+# live outside it, but the per-project history, MCP servers, plugins and skills
+# are all in here, and a swap has no business touching any of them.
+python3 - "$CJSON" <<'PY' \
+  && ok "...and nothing else in the config moves (projects, MCP, plugins, skills)" \
+  || bad "config collateral" "a swap changed state it does not own"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["projects"] == {"/tmp/work": {"history": ["one", "two"], "allowedTools": ["Bash"]}}
+assert d["mcpServers"] == {"notion": {"type": "http"}}
+assert d["pluginUsage"] == {"ccd": 3}
+assert d["skillUsage"] == {"ccd:doctor": 1}
+assert d["numStartups"] == 198 and d["userID"] == "u-1"
+# Onboarding is cleared only by a real logout, and a swap is not one.
+assert d["hasCompletedOnboarding"] is True and d["subscriptionNoticeCount"] == 2
+PY
+
+perm=$(python3 -c 'import os,stat,sys;print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$CJSON" 2>/dev/null)
+[ "$perm" = "0o600" ] && ok "...and the config keeps its 600 mode" \
+  || bad "config perms" "got $perm"
+
+# ccd reads oauthAccount to tell a manual /login from its own swap. Clearing it is
+# safe only because the pointer answers while it is gone — if that fallback ever
+# breaks, ccd forgets which account it just installed.
+cur=$("$ACCT" --no-color current 2>/dev/null)
+case "$cur" in
+  *two*) ok "...and ccd still knows which account it just installed" ;;
+  *) bad "identity after clear" "current says: $cur" ;;
+esac
+
+# ── The swap that changes nothing ───────────────────────────────────────────
+# `use` on the account already signed in is the repair path: it reconciles the two
+# credential stores and installs nothing. No identity changed, so the caches are
+# still this account's own — dropping them would re-run the profile fetch and put
+# the additional-model-options prompt back on screen for no reason.
+write_config "$CJSON"
+# The exit status matters here: without it a command that died before it ever
+# reached the config would satisfy the retention assertion by doing nothing.
+"$ACCT" --no-color use two --force >/dev/null 2>&1 \
+  || bad "same-account swap" "the swap itself failed"
+left=$(stale_left "$CJSON")
+[ "$(printf '%s' "$left" | wc -w | tr -d ' ')" = "13" ] \
+  && ok "re-selecting the active account leaves its caches alone" \
+  || bad "same-account swap" "cleared caches that were still valid: kept only [$left]"
+
+# ── A live session must not stop the clear ──────────────────────────────────
+# The tempting rule is "a session is running, so leave its file alone". It is
+# wrong, and it would miss the reported bug entirely: the user swaps, exits, and
+# resumes — and the resumed session reads exactly this file. Skip the clear and
+# the restart they were told to do fixes nothing.
+#
+# It is also safe. Claude Code's own config write re-reads from disk under a lock
+# and applies its change to what it finds there, and it watches the file for other
+# processes; an external edit is a condition it is built for, not a corruption. A
+# torn write is what would hurt, so ours is a temp file and a rename.
+cat > "$FAKE/fakebin/pgrep" <<'EOF'
+#!/bin/sh
+echo 4242
+EOF
+chmod +x "$FAKE/fakebin/pgrep"
+write_config "$CJSON"
+"$ACCT" --no-color use one >"$FAKE/use.out" 2>&1
+[ -z "$(stale_left "$CJSON")" ] \
+  && ok "a swap clears even while a session is running — that session's restart reads it" \
+  || bad "live-session clear" "left the caches for the resumed session to trip over"
+grep -q 'AT-one' "$CREDS" \
+  && ok "...and the credential moves as it always did" \
+  || bad "live-session swap" "credential unchanged"
+# The live session keeps its own copy in memory, so the swap cannot reach the
+# models it is offering right now. Only saying so keeps the user from concluding
+# the swap failed.
+grep -q -- '--resume' "$FAKE/use.out" \
+  && ok "...and the user is told a restart is what makes it real" \
+  || bad "live-session message" "got: $(tr '\n' ' ' < "$FAKE/use.out" | head -c 120)"
+# The plural wording only ever runs on a real machine with two sessions open, so
+# nothing else would catch a typo in that branch. Re-selecting the account that
+# is already active exercises it without moving the swap sequence along.
+cat > "$FAKE/fakebin/pgrep" <<'EOF'
+#!/bin/sh
+echo 4242
+echo 4243
+EOF
+chmod +x "$FAKE/fakebin/pgrep"
+"$ACCT" --no-color use one >"$FAKE/use.out" 2>&1
+grep -q -- '2 other Claude Code sessions are running' "$FAKE/use.out" \
+  && ok "...and it counts them correctly when there is more than one" \
+  || bad "plural message" "got: $(tr '\n' ' ' < "$FAKE/use.out" | head -c 120)"
+
+# --force is the handoff's path: claude has exited and the relaunch has not
+# started. Same clear, no warning to give — there is nobody to warn.
+write_config "$CJSON"
+"$ACCT" --no-color use two --force >"$FAKE/use.out" 2>&1
+[ -z "$(stale_left "$CJSON")" ] \
+  && ok "...and --force, the between-sessions path, clears the same way" \
+  || bad "forced swap" "left stale caches at the one moment nothing holds the file"
+rm -f "$FAKE/fakebin/pgrep"
+
+# ── The file may not be there, or may be junk ───────────────────────────────
+# Claude Code owns this file. A swap that has to create or repair it is a swap
+# writing state it does not understand, and the credential move must never be
+# held hostage to parsing it.
+rm -f "$CJSON"
+"$ACCT" --no-color use one --force >/dev/null 2>&1 \
+  && ok "a swap with no config at all still succeeds" \
+  || bad "missing config" "the swap failed"
+[ ! -e "$CJSON" ] && ok "...and does not conjure one into existence" \
+  || bad "missing config" "created a config Claude Code did not write"
+
+# A lone surrogate parses fine and re-encodes into UnicodeEncodeError on the way
+# out. The swap has already committed by then, and ccd-handoff reads a non-zero
+# exit as a failed swap and stops relaunching — so this must not be fatal.
+python3 -c 'import json,sys; json.dump({"projects":{"/p":{"history":["\ud800"]}},
+  "modelAccessCache":[]}, open(sys.argv[1],"w"))' "$CJSON"
+"$ACCT" --no-color use two --force >/dev/null 2>&1 \
+  && ok "a config carrying an unencodable string does not fail the swap" \
+  || bad "surrogate config" "the swap died on a string it could not write back"
+grep -q 'AT-two' "$CREDS" \
+  && ok "...and the credential still moved" \
+  || bad "surrogate config" "the swap was left half done"
+
+printf 'not json {' > "$CJSON"
+"$ACCT" --no-color use one --force >/dev/null 2>&1 \
+  && ok "a swap with an unparseable config still succeeds" \
+  || bad "malformed config" "the swap failed"
+[ "$(cat "$CJSON")" = 'not json {' ] \
+  && ok "...and leaves the file exactly as it found it" \
+  || bad "malformed config" "rewrote a file it could not read"
+
+# ── CLAUDE_CONFIG_DIR ───────────────────────────────────────────────────────
+# ccd already reads identity from there first, so that is the copy Claude Code
+# loads and the one that has to be cleared. Note the credential store moves with
+# it — the whole run has to be coherent under that dir, or the swap fails before
+# it ever reaches the config.
+mkdir -p "$FAKE/altcfg"
+cp "$CREDS" "$FAKE/altcfg/.credentials.json"
+write_config "$FAKE/altcfg/.claude.json"
+write_config "$CJSON"
+CLAUDE_CONFIG_DIR="$FAKE/altcfg" "$ACCT" --no-color use two --force >/dev/null 2>&1
+[ -z "$(stale_left "$FAKE/altcfg/.claude.json")" ] \
+  && ok "CLAUDE_CONFIG_DIR is where the caches get cleared" \
+  || bad "config dir" "cleared the wrong copy"
+# The copy left in $HOME goes too, for the reason live_write() keeps both
+# credential stores in step: unset the variable one day and a stale file is
+# sitting there ready to hand back the account we left.
+[ -z "$(stale_left "$CJSON")" ] \
+  && ok "...and the copy beside it cannot be left behind to resurrect the old account" \
+  || bad "config dir" "left a stale copy in \$HOME"
+
+rm -rf "$ADIR" "$FAKE/altcfg" "$CJSON" "$FAKE/use.out"
+unset CCD_CREDENTIALS_BACKEND
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

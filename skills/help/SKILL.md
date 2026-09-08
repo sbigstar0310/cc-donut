@@ -50,9 +50,12 @@ and is the better skill when nothing is set up yet.
 
 **Switching does not move the session you are in.** `account use` rewrites the
 credential store, and a running Claude Code keeps serving from the tokens it
-already holds until it next refreshes them. `ccd account use` says so itself when
-it finds other sessions running. For the switch to carry this conversation, the
-user does `/exit` then `claude --resume` in the same terminal.
+already holds until it next refreshes them. Even after that refresh moves the
+billing, the models and limits that session offers are still the ones it started
+with — it read those once, at startup. `ccd account use` says so itself when it
+finds other sessions running. For the switch to carry this conversation, the user
+does `/exit` then `claude --resume` in the same terminal; the swap has already
+cleared what the new session needs to re-read, so one restart is enough.
 
 **An account reporting `needs re-login`** means ccd's stored copy of its refresh
 token is dead, not that the account is. The fix is one step: run `claude` and
