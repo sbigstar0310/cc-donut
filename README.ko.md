@@ -87,10 +87,12 @@ ccd account list                 # 두 계정과 실시간 쿼타
 ```
 
 나머지는 그대로이고, Notion·Slack 같은 MCP 로그인도 전환의 영향을 받지 않습니다.
-statusline이 지금 어느 계정인지, 예비 계정이 준비됐는지 알려줍니다:
+statusline이 지금 어느 계정인지, 예비 계정이 얼마나 남았는지, 그 창이 언제
+리셋되는지 알려줍니다:
 
 ```text
-● claude:personal │ spare work 20%
+● claude:personal │ spare work 20% (2h10m)     # 지금 바로 넘어갈 수 있음
+● claude:personal │ spare work 98% (13m)       # 소진 — 13분만 기다리면 된다
 ```
 
 등록 순서대로 고르고(`--priority`로 조정), **5시간·7일 창 둘 다** 여유가 있을

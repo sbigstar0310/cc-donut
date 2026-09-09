@@ -361,8 +361,17 @@ fi
 # Reads files directly instead of shelling out to ccd-account (~50ms per render):
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
 acct_seg=$(python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
-import hashlib, json, os, sys
+import datetime, hashlib, json, os, sys
 adir, qfile = sys.argv[1], sys.argv[2]
+
+# The ready/full bound, read the way ccd-account reads it (HEADROOM,
+# bin/ccd-account:71). Drawing the line at 90 here while the swap draws it
+# somewhere else would name a spare that the handoff then declines to use. A junk
+# value must not take the row down with it.
+try:
+    HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
+except ValueError:
+    HEADROOM = 90
 
 def load(p):
     try:
@@ -458,13 +467,74 @@ def row_valid(rec, acct):
 
 quota = {n: r for n, r in quota.items() if row_valid(r, accounts.get(n) or {})}
 
-def pct(name):
+def secs_until(iso):
+    """Seconds from now until an ISO timestamp, or None for any answer we cannot
+    stand behind: absent, unparseable, or already past. Past means the cache
+    predates the reset, so the percentage beside it is the stale half — not a
+    reason to print a countdown of zero."""
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:                     # naive readings are UTC by convention here
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    left = (t - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    return left if left > 0 else None
+
+
+def reading(name):
+    """The binding window's usage, and two different answers about time.
+
+    `eases` is when that window turns over. `frees` is when EVERY window is back
+    under the bound, which is the only thing that makes an account usable at all
+    (has_headroom(), bin/ccd-account:985).
+
+    They are not the same number, and which one a spare wants depends on whether
+    it has room. At 89% the question is how long the squeeze lasts, so `eases`
+    answers it. At 100% on the 5-hour AND 100% on the weekly, the 5-hour
+    resetting in thirteen minutes and the weekly in six days, the account is
+    usable in six days: printing thirteen minutes there promises relief that does
+    not arrive — the same lie as printing the weekly reset beside a spent 5-hour
+    window, pointed the other way."""
     q = quota.get(name) or {}
     if q.get("status") != "ok":
-        return None
-    vals = [q.get(k) for k in ("five_hour_percent", "seven_day_percent")]
-    vals = [v for v in vals if isinstance(v, (int, float))]
-    return max(vals) if vals else None
+        return None, None, None
+    worst, eases, blocked = None, None, []
+    for pk, rk in (("five_hour_percent", "five_hour_reset"),
+                   ("seven_day_percent", "seven_day_reset")):
+        v = q.get(pk)
+        if not isinstance(v, (int, float)):
+            continue
+        secs = secs_until(q.get(rk))
+        if worst is None or v > worst:
+            worst, eases = v, secs
+        if v >= HEADROOM:
+            blocked.append(secs)
+    # The LAST blocked window to turn over is the one that frees the account, so a
+    # blocked window we cannot time leaves the whole account untimeable. Better no
+    # number than the soonest of the ones we happen to know.
+    frees = None if any(s is None for s in blocked) else max(blocked, default=None)
+    return worst, eases, frees
+
+
+def clock(secs):
+    """` (13m)` / ` (4h55m)` / ` (1d19h)` — the format the dashboard row above us
+    already uses for the same kind of number. Empty when there is nothing to say,
+    so callers can concatenate it unconditionally."""
+    if secs is None:
+        return ""
+    # Rounded up. This number is read as "how long until I can use it", and
+    # rounding down declares the wait over while it is not — besides spending the
+    # last minute of every wait showing `(0m)`.
+    m = int(secs // 60) + (1 if secs % 60 else 0)
+    if m < 60:
+        return f" ({m}m)"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f" ({h}h{m}m)"
+    return f" ({h // 24}d{h % 24}h)"
 
 G, Y, R, DIM, RS, C = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m", "\033[36m"
 mark = f"{Y}●{RS}" if unregistered else f"{G}●{RS}"
@@ -473,7 +543,8 @@ if unregistered:
     head += f" {DIM}(unregistered){RS}"
 
 # With nothing else registered there is no spare to talk about, so stop here
-# rather than printing "spare none" at someone who never asked for the feature.
+# rather than spending the row on the answer "you have one account" at someone who
+# never asked for the feature. It is also what makes the states below exhaustive.
 if len(names) < 2:
     print(head, end="")
     raise SystemExit(0)
@@ -487,7 +558,17 @@ if len(names) < 2:
 # with the number of registered accounts would push the quota numbers off screen
 # for exactly the people who registered the most. The extras become a "+N" count:
 # the question this answers is "do I have a net?", not "what is my whole roster".
-ready, dead, unknown = [], [], 0
+#
+# Every account we have a reading for lands in one of the three lists, so all
+# three are empty only when nothing has been measured yet — and that says "?",
+# not "none". The distinction is the whole of #15: a spare over the bound used to
+# reach no list, every list came up empty, and the fall-through denied the
+# account existed, at a healthy spare thirteen minutes from usable.
+#
+# Each list carries the number that answers ITS question, so the two render
+# branches stay the same shape: with room, how long the squeeze lasts; without,
+# how long until there is room at all.
+ready, dead, full = [], [], []
 for n in names:
     if n == active:
         continue
@@ -495,29 +576,41 @@ for n in names:
     if q.get("status") == "dead":
         dead.append(n)
         continue
-    p = pct(n)
+    p, eases, frees = reading(n)
     if p is None:
-        unknown += 1          # never yet probed, or the reading failed
-    elif p < 90:
-        ready.append((p, n))
+        continue              # never yet probed, or the reading failed
+    if p < HEADROOM:
+        ready.append((p, n, eases))
+    else:
+        full.append((p, n, frees))
 ready.sort()
+# Soonest usable first — not least spent: 91% back in two hours is a net, and 99%
+# back in six days is not, whichever number is larger. One we cannot time sorts
+# last, since a spare we can time beats one we cannot.
+full.sort(key=lambda r: (r[2] is None, r[2], r[0]))
 
 def short(n, w=14):
     return n if len(n) <= w else n[: w - 1] + "…"
 
+# The percentage says whether to switch; the countdown says whether to wait
+# instead. Naming the spare without either left both questions open (#16).
 if ready:
-    p, n = ready[0]
+    p, n, secs = ready[0]
     more = f"{DIM} +{len(ready) - 1}{RS}" if len(ready) > 1 else ""
-    tail = f"{DIM}spare{RS} {G}{short(n)} {p}%{RS}{more}"
+    tail = f"{DIM}spare{RS} {G}{short(n)} {p}%{clock(secs)}{RS}{more}"
 elif dead:
+    # Ahead of `full`: a dead spare is the only one of these states that needs
+    # the user to do something, and this row is the only place it shows up.
     more = f" +{len(dead) - 1}" if len(dead) > 1 else ""
     tail = f"{R}spare {short(dead[0])} needs re-login{more}{RS}"
-elif unknown:
+elif full:
+    p, n, secs = full[0]
+    more = f"{DIM} +{len(full) - 1}{RS}" if len(full) > 1 else ""
+    tail = f"{DIM}spare{RS} {Y}{short(n)} {p}%{clock(secs)}{RS}{more}"
+else:
     # Not the same as having no spare. Saying "none" here would be a claim we
     # cannot support, and it is the claim that matters most to get right.
     tail = f"{DIM}spare ?{RS}"
-else:
-    tail = f"{DIM}spare none{RS}"
 print(f"{head} {DIM}│{RS} {tail}", end="")
 PY
 )
