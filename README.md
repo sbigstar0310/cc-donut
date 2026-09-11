@@ -71,12 +71,16 @@ matters once every subscription is spent.
 ```text
 BEFORE   stuck mid-task, restart, lose the thread
 
-MANUAL   /exit
-         ccd account use <name>     hop to the subscription with room
-         claude --resume            same conversation, nothing billed
+MANUAL   !ccd account use <name>    right there in the session
+         /exit, claude --resume     same conversation, nothing billed
 
 AUTO     nothing to type at all     ccd setup --auto handles both directions
 ```
+
+`!` runs a shell command without leaving Claude Code, so the swap happens where
+you already are. It takes effect immediately; the session you are in keeps the
+old account's models and limits until it restarts, which is what the `/exit` and
+`claude --resume` are for.
 
 ---
 
@@ -200,7 +204,7 @@ calls.
 | --- | --- |
 | `ccd account add` | Register the signed-in account as a spare subscription |
 | `ccd account list` | Registered accounts with live quota |
-| `ccd account use <name>` | Hop to that account. Run it between sessions, then `claude --resume` |
+| `ccd account use <name>` | Hop to that account. `!ccd account use <name>` works inside a session; `/exit` and `claude --resume` to pick it up |
 | `ccd account rm <name>` | Remove one |
 | `ccd setup --auto` | Opt in to automatic handoff |
 | `ccd setup --no-auto` | Turn automatic handoff back off |
