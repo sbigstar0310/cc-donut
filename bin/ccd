@@ -518,7 +518,12 @@ pick() {
 }
 
 doctor() {
-  load_env; require_key; apply_tiers
+  # No require_key here. Everything above the OpenRouter probe describes the
+  # subscription path, which is what most people run on, and dying at the top
+  # made the accounts, handoff and quota sections unreachable for anyone who
+  # never configured a paid fallback. The key is required by the one section
+  # that actually needs it, and only there.
+  load_env; apply_tiers
   # "Why did nothing happen?" is the question the first user test ended on.
   # Installed is not active, and active in some shell is not supervising THIS one.
   printf '\n%sAutomatic handoff%s\n' "$b" "$r"
@@ -597,6 +602,117 @@ try:
 except OSError:
     pass
 PY
+  fi
+
+  # Quota readings. Everything automatic hangs off these: the warnings, the reset
+  # notice, and the arming gate that a rate_limit alone can never pass. When they
+  # stop, nothing announces it — the warnings simply never appear again and the
+  # handoff quietly stops firing — so the one view that exists to answer "is this
+  # working?" has to say so out loud.
+  printf '\n%sQuota readings%s %s(warnings, reset detection, and the handoff all need these)%s\n' \
+    "$b" "$r" "$d" "$r"
+  QC="$CCD_DIR/quota-cache.json" QF="$CCD_DIR/refresh-failed" python3 - <<'PY'
+import datetime, json, os, time
+G, Y, R, DIM, RS = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+path = os.environ["QC"]
+claude, age = None, None
+try:
+    with open(path, encoding="utf-8") as f:
+        claude = json.load(f).get("claude") or {}
+    age = int(time.time()) - int(os.path.getmtime(path))
+except (OSError, ValueError, AttributeError):
+    claude = None
+usable = (isinstance(claude, dict) and claude.get("available") is True
+          and claude.get("error") is False)
+
+
+def expired(reset):
+    """The same rule the arming gate applies (quota_peak in quota-guard.sh).
+
+    A window that has already turned over describes quota the user no longer
+    has, however young the sample is. Reporting it green here would be the
+    failure this section exists to end: a healthy check on a reading the handoff
+    has already discarded."""
+    if not isinstance(reset, str) or not reset:
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(reset.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
+
+
+vals, dropped = [], False
+if usable:
+    for label, key, rkey in (("5h", "fiveHourPercent", "fiveHourReset"),
+                             ("7d", "sevenDayPercent", "sevenDayReset")):
+        v = claude.get(key)
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool)):
+            continue
+        if expired(claude.get(rkey)):
+            dropped = True
+            continue
+        vals.append(f"{label} {int(v)}%")
+if vals:
+    # The same bound the arming gate uses (MAX_READING_AGE in quota-guard.sh).
+    # Reporting healthy up to some friendlier number would be the exact failure
+    # this section exists to end: a green check on a reading that the handoff has
+    # already stopped trusting.
+    stale = age is None or age > 1800
+    mark = f"{Y}△{RS}" if stale else f"{G}✓{RS}"
+    when = f" {DIM}({age // 60}m old){RS}" if age is not None else ""
+    print(f"  {mark} {' · '.join(vals)}{when}")
+    if stale:
+        print(f"      {Y}Too old to arm a handoff.{RS} {DIM}Refreshes have stopped;"
+              f" the reading has to be under 30 minutes old.{RS}")
+        try:
+            with open(os.environ["QF"], encoding="utf-8") as f:
+                for line in f.read().splitlines():
+                    if line.strip():
+                        print(f"      {DIM}{line.strip()}{RS}")
+        except OSError:
+            pass
+elif dropped:
+    print(f"  {R}✗ none usable{RS} — every window in the reading has already reset")
+    # "Nothing to fix" is only true when the reading is recent and nothing has
+    # been failing. A two-day-old cache with a recorded failure has the same
+    # shape, and telling that user to wait for the next prompt sends them away
+    # from the cause with the cause already written down.
+    failure = ""
+    try:
+        with open(os.environ["QF"], encoding="utf-8") as f:
+            failure = f.read().strip()
+    except OSError:
+        pass
+    if failure or age is None or age > 1800:
+        when = f" {DIM}({age // 60}m old){RS}" if age is not None else ""
+        print(f"      {Y}Refreshes have stopped.{RS}{when}")
+        for line in failure.splitlines():
+            if line.strip():
+                print(f"      {DIM}{line.strip()}{RS}")
+    else:
+        print(f"      {DIM}The next prompt takes a new one. Nothing to fix.{RS}")
+else:
+    print(f"  {R}✗ none{RS} — an automatic handoff cannot arm without one")
+    try:
+        with open(os.environ["QF"], encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                if line.strip():
+                    print(f"      {DIM}{line.strip()}{RS}")
+    except OSError:
+        print(f"      {DIM}No reading has been taken yet. Start a Claude Code session"
+              f" and send one prompt.{RS}")
+    print(f"      {DIM}Fix it with a `/login` as the account you want measured."
+          f" claude-dashboard is not involved.{RS}")
+PY
+
+  printf '\n%sOpenRouter fallback%s\n' "$b" "$r"
+  if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    printf '  %s· no key configured%s — the last resort is not available\n' "$d" "$r"
+    printf '      %sOnly needed once every registered subscription is spent: ccd key%s\n' "$d" "$r"
+    return 0
   fi
 
   local model="$ANTHROPIC_MODEL"

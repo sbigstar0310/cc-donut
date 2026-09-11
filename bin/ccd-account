@@ -1557,6 +1557,49 @@ def stale_breadcrumb(stale):
         pass
 
 
+def cmd_usage(args):
+    """Live quota for the login Claude Code is signed in as, in the same shape a
+    claude-dashboard reading has.
+
+    This is what lets the quota hook work with no dashboard installed, and it
+    answers for a login nobody registered as an account. The live token belongs
+    to Claude Code, so this never refreshes it: an expiring one reports nothing
+    rather than rotating a credential another process owns."""
+    blob, _ = live_read()
+    oauth = blob.get("claudeAiOauth") or {}
+    token = oauth.get("accessToken") or ""
+    claude = {"available": False, "error": True}
+    rc = 1
+    if token and not token_expired(oauth):
+        status, body = usage_fetch(token)
+        if status == 200 and isinstance(body, dict):
+            fh, fhr = _window(body, "five_hour")
+            sd, sdr = _window(body, "seven_day")
+            # Both windows missing means the payload told us nothing. An empty
+            # reading must never stand in for a real one: everything downstream
+            # treats a number as proof the quota really is spent.
+            if fh is not None or sd is not None:
+                claude = {
+                    "available": True,
+                    "error": False,
+                    "fiveHourPercent": fh,
+                    "fiveHourReset": fhr,
+                    "sevenDayPercent": sd,
+                    "sevenDayReset": sdr,
+                }
+                rc = 0
+    if args.json:
+        print(json.dumps({"claude": claude}, ensure_ascii=False))
+    else:
+        parts = [
+            f"{lab} {claude[k]}%"
+            for lab, k in (("5h", "fiveHourPercent"), ("7d", "sevenDayPercent"))
+            if isinstance(claude.get(k), (int, float))
+        ]
+        print(" · ".join(parts) if parts else "no reading")
+    return rc
+
+
 def cmd_current(args):
     """What backbone and account is this session on? Used by the statusline and
     doctor, both of which must answer without touching the network."""
@@ -1630,6 +1673,10 @@ def main(argv):
     a.add_argument("--force", action="store_true")
     a.add_argument("--report", action="store_true")
     a.set_defaults(fn=cmd_keepalive)
+
+    a = sub.add_parser("usage", help="live quota for the signed-in login (internal)")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(fn=cmd_usage)
 
     a = sub.add_parser("current", help="active backbone and account (internal)")
     a.add_argument("--json", action="store_true")

@@ -168,8 +168,10 @@ prices move and new models ship), do this:
   quota outage's cumulative spend (survives ccd restarts, cleared on quota
   recovery). Updated on prompts/tool runs; unchanged while idle. This row
   renders even without the claude-dashboard plugin.
-- Install claude-dashboard to get quota warnings and automatic recovery detection;
-  it is an optional enhancement, not a ccd dependency.
+- Quota warnings, reset detection, and the automatic handoff all work without
+  claude-dashboard: ccd reads the signed-in account's quota from the same
+  Anthropic usage endpoint it uses for spare accounts. Install claude-dashboard
+  only for its own richer rows, which render above ccd's.
 - The statusline's `✓ Claude recovered` means a Claude 5-hour or 7-day quota
   went from 100% to 0% after a reset. Then: `/exit`, and in the same terminal
   `claude --resume`.

@@ -98,6 +98,111 @@ find_node() {
   return 1
 }
 
+# Locate ccd-account. The hook runs from the plugin, so a sibling lookup off
+# CLAUDE_PLUGIN_ROOT is the direct answer; the glob covers a hook invoked by hand.
+ccd_account_bin() {
+  local t
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/bin/ccd-account" ]; then
+    printf '%s' "$CLAUDE_PLUGIN_ROOT/bin/ccd-account"; return 0
+  fi
+  t=$(ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd-account 2>/dev/null | sort -V | tail -1)
+  [ -n "$t" ] && { printf '%s' "$t"; return 0; }
+  return 1
+}
+
+# The reading does not have to come from claude-dashboard. ccd already talks to
+# the same Anthropic usage endpoint for its spare accounts, so it can measure the
+# account this session is signed in as. That keeps quota warnings, reset
+# detection, and the automatic handoff working on an install that has no
+# dashboard: without a reading none of them can fire at all (see quota_peak).
+#
+# A failed probe backs off. This runs on a stale cache, and a stale cache is what
+# a failure leaves behind, so without the marker every prompt and every tool use
+# would spawn python3 and open a socket for an account that is offline or signed
+# out.
+PROBE_BACKOFF="$CCD_DIR/.usage-probe-backoff"
+PROBE_BACKOFF_TTL=300
+# mkdir, not a marker file: it either creates the directory or fails, and exactly
+# one caller can win. A `: >` claim cannot single-flight anything, because every
+# sibling's write succeeds — six overlapping hooks still opened three sockets.
+PROBE_LOCK="$CCD_DIR/.usage-probe.lock"
+# Held across the caller's validate-and-install step, so probe_release is what
+# ends the lease, never usage_probe's own success path.
+PROBE_LEASED=0
+
+probe_release() {
+  [ "$PROBE_LEASED" -eq 1 ] || return 0
+  rmdir "$PROBE_LOCK" 2>/dev/null
+  PROBE_LEASED=0
+}
+
+# Is this file a reading, or just well-formed JSON? Everything downstream treats
+# a percentage as proof the quota really is spent, so "parses" is not the bar.
+usable_reading() {  # $1=file
+  python3 - "$1" 2>/dev/null <<'PY'
+import json, sys
+try:
+    c = (json.load(open(sys.argv[1])).get("claude") or {})
+except Exception:
+    raise SystemExit(1)
+if c.get("available") is not True or c.get("error") is not False:
+    raise SystemExit(1)
+raise SystemExit(0 if any(
+    isinstance(p, (int, float)) and not isinstance(p, bool)
+    for p in (c.get("fiveHourPercent"), c.get("sevenDayPercent"))) else 1)
+PY
+}
+
+usage_probe() {  # $1=destination file
+  local ab leased=0
+  # The backoff and the lease both protect the prompt path, where this hook fires
+  # several times a minute. StopFailure is the opposite: it fires once, on the
+  # turn that actually failed, and the reading decides whether the conversation
+  # survives. Nothing may stand between that event and its answer.
+  if [ "$EVENT" != "StopFailure" ]; then
+    [ "$(file_age "$PROBE_BACKOFF")" -gt "$PROBE_BACKOFF_TTL" ] || return 1
+    if mkdir "$PROBE_LOCK" 2>/dev/null; then
+      leased=1
+      # Re-check under the lease. The check above and this claim are two steps,
+      # so a sibling can pass the first, wait, and arrive here after the winner
+      # has already probed, failed and released. Asking again is what makes the
+      # marker it left mean something. The cache is re-checked for the same
+      # reason: a winner that succeeded has made this probe pointless.
+      if [ "$(file_age "$PROBE_BACKOFF")" -le "$PROBE_BACKOFF_TTL" ] \
+         || [ "$(file_age "$CACHE")" -le "$TTL" ]; then
+        rmdir "$PROBE_LOCK" 2>/dev/null
+        return 1
+      fi
+    else
+      # A lease left behind by a killed probe must not block refreshes forever.
+      # The age floor is what keeps this from reaping a live sibling's lease.
+      find "$CCD_DIR" -maxdepth 1 -name "$(basename "$PROBE_LOCK")" -mmin +1 -delete 2>/dev/null
+      return 1
+    fi
+  fi
+  PROBE_LEASED=$leased
+  if ! ab=$(ccd_account_bin); then
+    probe_release
+    return 1
+  fi
+  # Record the attempt BEFORE the request, so being killed mid-flight backs off
+  # the same way a refusal does. Recording it only on failure meant a hard kill
+  # left nothing behind and the next tick tried again immediately.
+  : > "$PROBE_BACKOFF" 2>/dev/null
+  # Bound the wait. A hook that blocks is a prompt that hangs, and the default is
+  # ten seconds per socket operation. Not a hard deadline (urllib budgets each
+  # operation, not the whole request), but it keeps the common slow case off the
+  # prompt path.
+  # A win keeps the lease and keeps the backoff marker. Both are cleared by the
+  # caller, once the reading is validated and installed: until then this probe
+  # has produced nothing a sibling could use.
+  if CCD_HTTP_TIMEOUT="${CCD_PROBE_TIMEOUT:-5}" "$ab" --no-color usage --json > "$1" 2>/dev/null; then
+    return 0
+  fi
+  probe_release
+  return 1
+}
+
 if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   script=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/check-usage.js 2>/dev/null | sort -V | tail -1)
   node_bin=$(find_node) || node_bin=""
@@ -112,23 +217,49 @@ if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   # The signal handlers must exit, not just clean up: bash resumes the script
   # after a handler returns, and the resumed `mv` would chase a file the handler
   # just deleted.
-  trap 'rm -f "$tmp"' EXIT
-  trap 'rm -f "$tmp"; exit 130' INT
-  trap 'rm -f "$tmp"; exit 143' TERM
+  trap 'rm -f "$tmp"; probe_release' EXIT
+  trap 'rm -f "$tmp"; probe_release; exit 130' INT
+  trap 'rm -f "$tmp"; probe_release; exit 143' TERM
   # SIGKILL cannot be trapped, so sweep what an earlier hard kill already left.
   # The age floor is what keeps this from deleting a live sibling's in-flight tmp.
   find "$CCD_DIR" -maxdepth 1 -name "$(basename "$CACHE").tmp.*" -mmin +60 -delete 2>/dev/null || true
-  if [ -n "$script" ] && [ -n "$node_bin" ] && "$node_bin" "$script" --json > "$tmp" 2>/dev/null \
-     && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$tmp" 2>/dev/null; then
-    mv "$tmp" "$CACHE"
-    rm -f "$CCD_DIR/refresh-failed"
+  # Either producer writes the same shape, so everything downstream reads one
+  # format and never learns where the numbers came from. Exiting 0 is not the
+  # same as answering: the dashboard reports its own failures as valid JSON with
+  # error=true, and taking that as success published an unusable payload over the
+  # last good reading AND skipped the fallback entirely. An installed dashboard
+  # that cannot reach Anthropic would then disable handoffs on a machine that can
+  # measure itself perfectly well, which is the exact failure this change exists
+  # to remove. So each producer is judged on what it produced.
+  got=0
+  if [ -n "$script" ] && [ -n "$node_bin" ] \
+     && "$node_bin" "$script" --json > "$tmp" 2>/dev/null && usable_reading "$tmp"; then
+    got=1
+  elif usage_probe "$tmp" && usable_reading "$tmp"; then
+    got=1
+  fi
+  if [ "$got" -eq 1 ]; then
+    # Only a reading that actually landed may clear the markers. Publication can
+    # fail (a full or read-only $HOME), and clearing them on the way past would
+    # advertise a fresh reading that is not there.
+    if mv "$tmp" "$CACHE" 2>/dev/null; then
+      rm -f "$CCD_DIR/refresh-failed" "$PROBE_BACKOFF"
+    else
+      rm -f "$tmp"
+      echo "the quota reading could not be written to $CACHE" \
+        > "$CCD_DIR/refresh-failed" 2>/dev/null
+    fi
   else
     rm -f "$tmp"
-    # Leave a breadcrumb so `ccd doctor` can say quota data is stale instead of
-    # the warnings just never appearing.
-    { [ -n "$script" ] || echo "claude-dashboard not installed"
-      [ -n "$node_bin" ] || echo "node not found in hook PATH"; } > "$CCD_DIR/refresh-failed" 2>/dev/null
+    # Leave a breadcrumb, because `ccd doctor` is the only place this surfaces.
+    # A reading that stops coming is invisible otherwise: the warnings just never
+    # appear again. Which producer failed does not matter to the user, only that
+    # the account could not be measured, so say that and nothing else.
+    { echo "the signed-in Claude account could not be measured (login, token, or network)"
+      [ -f "$PROBE_BACKOFF" ] && echo "backing off; the next attempt is a few minutes away"
+    } > "$CCD_DIR/refresh-failed" 2>/dev/null
   fi
+  probe_release
   trap - EXIT INT TERM
 fi
 
@@ -139,18 +270,51 @@ fi
 
 # Highest observed quota percentage, or empty when the data is unusable.
 # Unusable is deliberately NOT zero: a missing reading must never arm a handoff.
+#
+# Age is part of usable. The cache keeps its last good sample when a refresh
+# fails, so a reading can outlive the window it measured: a 96% sample taken
+# before a reset still reads 96% afterwards, and a transient rate_limit on the
+# fresh quota would then look corroborated. Three consecutive failed refreshes
+# (the refresh runs on a ten-minute timer) is the point where the sample stops
+# being evidence about now.
+MAX_READING_AGE=1800
 quota_peak() {
   [ -f "$CACHE" ] || return 0
+  [ "$(file_age "$CACHE")" -le "$MAX_READING_AGE" ] || return 0
   python3 - "$CACHE" 2>/dev/null <<'PY'
-import json, sys
+import datetime, json, sys
 try:
     c = (json.load(open(sys.argv[1])).get("claude") or {})
 except Exception:
     raise SystemExit(0)
 if c.get("available") is not True or c.get("error") is not False:
     raise SystemExit(0)
-vals = [p for p in (c.get("fiveHourPercent"), c.get("sevenDayPercent"))
-        if isinstance(p, (int, float)) and not isinstance(p, bool)]
+
+
+def expired(reset):
+    """Has the window this percentage belongs to already turned over?
+
+    Age alone cannot answer it. A reading taken four minutes ago is fresh by any
+    clock and still describes a window that reset three minutes ago, and 96% of a
+    window that no longer exists is not evidence about the one that replaced it.
+    An unparseable value (the dashboard does not promise a timestamp) means we
+    cannot tell, and not being able to tell is not a reason to discard a reading:
+    the age bound above still governs it."""
+    if not isinstance(reset, str) or not reset:
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(reset.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
+
+
+vals = [p for p, reset in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
+                           (c.get("sevenDayPercent"), c.get("sevenDayReset")))
+        if isinstance(p, (int, float)) and not isinstance(p, bool)
+        and not expired(reset)]
 if vals:
     print(int(max(vals)))
 PY
@@ -347,18 +511,6 @@ handoff_ready() {
 has_accounts() {
   set -- "$CCD_DIR/accounts"/*.json
   [ -e "$1" ]
-}
-
-# Locate ccd-account. The hook runs from the plugin, so a sibling lookup off
-# CLAUDE_PLUGIN_ROOT is the direct answer; the glob covers a hook invoked by hand.
-ccd_account_bin() {
-  local t
-  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/bin/ccd-account" ]; then
-    printf '%s' "$CLAUDE_PLUGIN_ROOT/bin/ccd-account"; return 0
-  fi
-  t=$(ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd-account 2>/dev/null | sort -V | tail -1)
-  [ -n "$t" ] && { printf '%s' "$t"; return 0; }
-  return 1
 }
 
 # Name of a registered account with quota left, or empty. Excludes the launcher's
