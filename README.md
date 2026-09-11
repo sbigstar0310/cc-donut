@@ -71,16 +71,23 @@ matters once every subscription is spent.
 ```text
 BEFORE   stuck mid-task, restart, lose the thread
 
-MANUAL   !ccd account use <name>    right there in the session
-         /exit, claude --resume     same conversation, nothing billed
+AUTO     nothing to type at all     the session ends and comes back by itself
+                                    on the other subscription (ccd setup --auto)
 
-AUTO     nothing to type at all     ccd setup --auto handles both directions
+MANUAL   !ccd account use <name>    for when the handoff did not fire
+         /exit, claude --resume     same conversation, nothing billed
 ```
 
-`!` runs a shell command without leaving Claude Code, so the swap happens where
-you already are. It takes effect immediately; the session you are in keeps the
-old account's models and limits until it restarts, which is what the `/exit` and
-`claude --resume` are for.
+Automatic is the point, so turn it on: `ccd setup --auto` ends the spent session
+and brings the conversation back on the other subscription without you typing
+anything.
+
+The manual route needs that restart, and it is not a choice. A running session
+holds its token in memory and reads its model list once at startup, so it goes on
+using the account that just ran out no matter what the credential on disk says.
+Ending the session is the only thing that picks up a swap, which is exactly the
+step `ccd setup --auto` does for you. `!` runs a shell command without leaving
+Claude Code, so at least the swap happens where you already are.
 
 ---
 
