@@ -1077,14 +1077,10 @@ def swap_to(name, force=False):
             # A live session read its entitlements once, at startup, and holds
             # them in memory — no file we write reaches them. Saying so is what
             # keeps the user from reading a working swap as a failed one.
-            if others == 1:
-                warn("1 other Claude Code session is running. It keeps the "
-                     "previous account's models and limits until it restarts — "
-                     "/exit it, then `claude --resume`.")
-            else:
-                warn(f"{others} other Claude Code sessions are running. They keep "
-                     "the previous account's models and limits until they restart "
-                     "— /exit one, then `claude --resume`.")
+            noun = "session is" if others == 1 else "sessions are"
+            warn(f"{others} other Claude Code {noun} running. The swap applies to "
+                 "them too; their model list and limits keep describing the "
+                 "previous account until they next start.")
     return target
 
 

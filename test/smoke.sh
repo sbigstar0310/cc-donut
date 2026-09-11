@@ -3125,12 +3125,16 @@ write_config "$CJSON"
 grep -q 'AT-one' "$CREDS" \
   && ok "...and the credential moves as it always did" \
   || bad "live-session swap" "credential unchanged"
-# The live session keeps its own copy in memory, so the swap cannot reach the
-# models it is offering right now. Only saying so keeps the user from concluding
-# the swap failed.
+# The swap reaches a live session's requests; what it cannot reach is the model
+# list and limits that session read at startup. Naming that is useful. Telling
+# the user to restart is not: it sent people out of a session that goes on
+# working, which is the one thing this feature exists to avoid.
+grep -q -- 'model list and limits' "$FAKE/use.out" \
+  && ok "...and the user is told which part lags" \
+  || bad "live-session message" "got: $(tr '\n' ' ' < "$FAKE/use.out" | head -c 140)"
 grep -q -- '--resume' "$FAKE/use.out" \
-  && ok "...and the user is told a restart is what makes it real" \
-  || bad "live-session message" "got: $(tr '\n' ' ' < "$FAKE/use.out" | head -c 120)"
+  && bad "live-session message" "still sends the user out of a session that keeps working" \
+  || ok "...and is not sent out of a session that keeps working"
 # The plural wording only ever runs on a real machine with two sessions open, so
 # nothing else would catch a typo in that branch. Re-selecting the account that
 # is already active exercises it without moving the swap sequence along.

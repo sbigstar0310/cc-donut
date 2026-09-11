@@ -71,12 +71,20 @@ matters once every subscription is spent.
 ```text
 BEFORE   stuck mid-task, restart, lose the thread
 
-MANUAL   /exit
-         ccd account use <name>     hop to the subscription with room
-         claude --resume            same conversation, nothing billed
+AUTO     nothing to type at all     the session moves itself to the other
+                                    subscription (ccd setup --auto)
 
-AUTO     nothing to type at all     ccd setup --auto handles both directions
+MANUAL   !ccd account use <name>    one line, then keep typing
 ```
+
+`!` runs a shell command without leaving Claude Code, so the swap happens in the
+session that just ran out, and that session carries on. You do not have to end
+anything.
+
+What lags is cosmetic. Claude Code reads the model list, the limits and the usage
+figures once at startup and holds them, so those keep describing the account you
+left until the next start. ccd clears the cached copies the same way `/login`
+does, so nothing carries over further than that.
 
 ---
 
@@ -200,7 +208,7 @@ calls.
 | --- | --- |
 | `ccd account add` | Register the signed-in account as a spare subscription |
 | `ccd account list` | Registered accounts with live quota |
-| `ccd account use <name>` | Hop to that account. Run it between sessions, then `claude --resume` |
+| `ccd account use <name>` | Hop to that account. `!ccd account use <name>` does it from inside a session, which then carries on |
 | `ccd account rm <name>` | Remove one |
 | `ccd setup --auto` | Opt in to automatic handoff |
 | `ccd setup --no-auto` | Turn automatic handoff back off |
