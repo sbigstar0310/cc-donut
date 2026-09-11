@@ -24,6 +24,18 @@ unset CCD_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
 # the tests always pass an explicit CLAUDE_PID for their own stand-in process.
 unset CLAUDE_PID CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
 
+# Every credential operation stays inside $HOME. The keychain is the one thing
+# ccd touches outside it, so without this the suite reads (and could overwrite)
+# the developer's real Claude login on macOS. It belongs at the top: `ccd doctor`
+# lists accounts long before the multi-account sections start.
+export CCD_CREDENTIALS_BACKEND=file
+
+# A key exported in the developer's own shell is not this suite's key. It reaches
+# have_key() ahead of the throwaway HOME, and the assertions that a missing key
+# must stop a handoff then measure the developer's environment instead of the
+# code. Those passed in CI and failed only on the machine of whoever set a key.
+unset OPENROUTER_API_KEY 2>/dev/null || true
+
 pass=0 fail=0
 
 ok()   { pass=$((pass+1)); printf '  ✓ %s\n' "$1"; }
@@ -600,6 +612,19 @@ rm -f "$FAKE/fakebin/curl"
 head_ "16. automatic handoff: arming predicate + hook stdin"
 mkdir -p "$FAKE/.claude/ccd/providers"
 hf_reset() { rm -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json"; }
+# Did a signalled stand-in exit within the ceiling? A single sleep turns "was it
+# signalled?" into "was it signalled fast enough?", and the answer to the second
+# depends on how busy the machine is.
+died_within() { # $1=pid  $2=seconds
+  local waited=0 ceiling
+  ceiling=$(( ${2%%.*} * 10 ))
+  while [ "$waited" -lt "$ceiling" ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
 hf_get() { python3 -c "
 import json,os,sys
 p='$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json'
@@ -733,8 +758,8 @@ set +m 2>/dev/null
 sleep 0.3
 hf_reset
 stopfail sess-f rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
-sleep 0.6
-if kill -0 "$TARGET" 2>/dev/null; then bad "handoff signal" "target survived CCD_HANDOFF=1"; else ok "CCD_HANDOFF=1 → SIGHUP delivered to the claude process"; fi
+if died_within "$TARGET" 5; then ok "CCD_HANDOFF=1 → SIGHUP delivered to the claude process"
+else bad "handoff signal" "target survived CCD_HANDOFF=1"; fi
 kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
 
 # An armed handoff with no key would end the session with nowhere to go.
@@ -1759,9 +1784,8 @@ sleep 0.3
 hf_reset
 printf '{"session_id":"sess-r","cwd":"/tmp/w","hook_event_name":"UserPromptSubmit"}' \
   | CCD_ACTIVE=1 CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
-sleep 0.6
-if kill -0 "$TARGET" 2>/dev/null; then bad "automatic return" "recovery armed but never ended the session"; kill -9 "$TARGET" 2>/dev/null
-else ok "quota recovery ends the session so the launcher can return"; fi
+if died_within "$TARGET" 5; then ok "quota recovery ends the session so the launcher can return"
+else bad "automatic return" "recovery armed but never ended the session"; kill -9 "$TARGET" 2>/dev/null; fi
 wait "$TARGET" 2>/dev/null
 [ "$(hf_get direction)" = "to_subscription" ] && ok "recovery arms the return trip" \
   || bad "return direction" "got: $(hf_get direction)"
@@ -2048,9 +2072,6 @@ rm -f "$FAKE/.claude/ccd"/handoff-*.json
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
 
 head_ "21. multi-account: the store"
-# Every credential operation stays inside $HOME. Without this the suite would
-# overwrite the developer's real Claude login on macOS.
-export CCD_CREDENTIALS_BACKEND=file
 # No test may reach the real network. If one does, fail in ~1s rather than
 # stalling for the full timeout on every account.
 export CCD_HTTP_TIMEOUT=1
@@ -2689,7 +2710,6 @@ grep -q FALLBACK "$FAKE/.ladder" \
   || bad "ladder end" "never reached the final fallback"
 rm -f "$HSTATE" "$FAKE/.rung" "$FAKE/.ladder"
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
-unset CCD_CREDENTIALS_BACKEND
 
 head_ "25. multi-account: a spare must not die in silence"
 # The failure this covers happened in production: every keepalive pass failed for
@@ -3186,7 +3206,6 @@ CLAUDE_CONFIG_DIR="$FAKE/altcfg" "$ACCT" --no-color use two --force >/dev/null 2
   || bad "config dir" "left a stale copy in \$HOME"
 
 rm -rf "$ADIR" "$FAKE/altcfg" "$CJSON" "$FAKE/use.out"
-unset CCD_CREDENTIALS_BACKEND
 
 head_ "27. multi-account: the statusline's spare row"
 # The row that answers "do I have a net?". Its states have to stay distinguishable
@@ -3389,6 +3408,510 @@ else
   ok "...and the row has no way left to answer \"no spare\" at a registered one"
 fi
 
+rm -rf "$ADIR" "$SLQ"
+
+head_ "28. no claude-dashboard installed"
+# ccd reads Claude quota to do three things: warn before exhaustion, notice a
+# reset, and corroborate a rate_limit before arming a handoff. claude-dashboard
+# is one source for that reading, not the only one there could be, and an install
+# without it used to lose all three in silence: the statusline said nothing, the
+# handoff never fired, and nothing anywhere said why. ccd already talks to the
+# same Anthropic usage endpoint for its spare accounts, so it can measure the
+# account this session is signed in as and answer for itself.
+#
+# Every assertion below runs with no dashboard anywhere on disk.
+rm -rf "$FAKE/.claude/plugins/cache/claude-dashboard" \
+       "$FAKE/.claude/plugins/data/claude-dashboard-claude-dashboard" \
+       "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock"
+
+# A stand-in for the Anthropic usage endpoint. ccd-account reaches it with urllib
+# rather than curl, so the double goes in as a sitecustomize module on PYTHONPATH.
+# It is inert unless CCD_FAKE_USAGE names a staged response, which is what keeps
+# it out of the way of every other python3 in this suite and keeps production
+# free of any test-only branch.
+mkdir -p "$FAKE/pysite"
+cat > "$FAKE/pysite/sitecustomize.py" <<'SCEOF'
+import json, os
+_stage = os.environ.get("CCD_FAKE_USAGE")
+if _stage:
+    import urllib.error, urllib.request
+
+    def _urlopen(req, timeout=None, *a, **k):
+        # Count attempts, not successes: the backoff assertion needs to see the
+        # call that failed.
+        log = os.environ.get("CCD_FAKE_USAGE_LOG")
+        if log:
+            with open(log, "a") as f:
+                f.write("call\n")
+        with open(_stage) as f:
+            staged = json.load(f)
+        status = staged.get("status", 200)
+        body = json.dumps(staged.get("body", {})).encode()
+        if status != 200:
+            raise urllib.error.HTTPError(
+                getattr(req, "full_url", ""), status, "staged", {}, None)
+
+        class _R:
+            def __init__(self):
+                self.status = status
+
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                return False
+
+        return _R()
+
+    urllib.request.urlopen = _urlopen
+SCEOF
+export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
+export CCD_FAKE_USAGE="$FAKE/.stage-usage.json"
+export CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
+# Reset timestamps are generated relative to now. Hardcoded dates would quietly
+# expire: once they pass, the reading is correctly rejected as belonging to a
+# window that already turned over, and every positive assertion here starts
+# failing on a calendar date rather than on a code change. Expired timestamps
+# belong only in the reset-crossing test, which builds its own.
+stage_usage() { # $1=5h utilization  $2=7d utilization  [$3=http status]
+  python3 - "$CCD_FAKE_USAGE" "$1" "$2" "${3:-200}" <<'SUEOF'
+import datetime, json, sys
+out, fh, sd, status = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+now = datetime.datetime.now(datetime.timezone.utc)
+ahead = lambda h: (now + datetime.timedelta(hours=h)).isoformat()
+with open(out, "w") as f:
+    json.dump({"status": status,
+               "body": {"five_hour": {"utilization": fh, "resets_at": ahead(2)},
+                        "seven_day": {"utilization": sd, "resets_at": ahead(72)}}}, f)
+SUEOF
+}
+# The hook as the plugin runs it, with the dashboard gone.
+nd_hook() { CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" "$@"; }
+# Move the file into the past rather than the clock into the future: production
+# only ever compares against a real now. (Section 17b's age_file is unset by the
+# time this section runs.)
+nd_age() { python3 -c "import os,sys,time;t=time.time()-float(sys.argv[2]);os.utime(sys.argv[1],(t,t))" "$1" "$2"; }
+CCDD="$FAKE/.claude/ccd"
+
+# ── The reading ─────────────────────────────────────────────────────────────
+write_creds nodash
+stage_usage 58 96
+usage_out=$("$ACCT" --no-color usage --json 2>/dev/null)
+case "$usage_out" in
+  *'"fiveHourPercent": 58'*|*'"fiveHourPercent":58'*)
+    ok "ccd measures the signed-in account with no dashboard installed" ;;
+  *) bad "self-measured quota" "got: ${usage_out:0:120}" ;;
+esac
+case "$usage_out" in
+  *'"sevenDayPercent": 96'*|*'"sevenDayPercent":96'*) ok "...both windows, in the shape the cache already speaks" ;;
+  *) bad "self-measured 7d window" "got: ${usage_out:0:120}" ;;
+esac
+
+# ── What the user sees ──────────────────────────────────────────────────────
+rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+nd_hook UserPromptSubmit >/dev/null 2>&1
+got=$(python3 -c "import json;print((json.load(open('$CCDD/quota-cache.json')).get('claude') or {}).get('sevenDayPercent'))" 2>/dev/null)
+[ "$got" = "96" ] && ok "the hook fills the quota cache from ccd's own reading" \
+  || bad "cache without a dashboard" "got: $got"
+
+rm -f "$CCDD/last-warn" "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+out=$(nd_hook UserPromptSubmit 2>/dev/null)
+case "$out" in
+  *"QUOTA NEARLY EXHAUSTED"*) ok "...so the near-exhaustion warning still reaches the user" ;;
+  *) bad "warning without a dashboard" "got: ${out:0:120}" ;;
+esac
+
+# ── The statusline ──────────────────────────────────────────────────────────
+rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
+mk_sl_acct main; mk_sl_acct backup
+printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+seed_rows main:ok:0:22:18000:600000 backup:ok:20:30:18000:600000
+row=$(sl_spare)
+case "$row" in
+  *"spare backup"*) ok "the spare row still names the account to hop to" ;;
+  *) bad "spare row without a dashboard" "got: $row" ;;
+esac
+ccdrow=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
+case "$ccdrow" in
+  *ccd*luna*) ok "...and the ccd row renders with no dashboard to render above" ;;
+  *) bad "ccd row without a dashboard" "got: ${ccdrow:0:80}" ;;
+esac
+
+# ── The handoff ─────────────────────────────────────────────────────────────
+# The whole point of the reading. Without one, arming is impossible by design
+# (see quota_peak), so this is what an install with no dashboard used to lose.
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$CCDD/providers/keys.env"
+set +m 2>/dev/null
+# A fresh stand-in per arm. Arming signals the claude process, so the one that
+# armed is gone by the next call — and a dead pid fails the readiness check for
+# a reason that has nothing to do with what these assertions are about.
+nd_arm() { # $1=session id
+  "$FAKE/sigbin/claude" 8 2>/dev/null & NDPID=$!
+  sleep 0.3
+  stopfail "$1" rate_limit \
+    | CCD_HANDOFF=00000000000000000000000000000002 \
+      CCD_HANDOFF_STATE="$CCDD/handoff-00000000000000000000000000000002.json" \
+      CLAUDE_PID=$NDPID CCD_STANDIN_PID=$NDPID CLAUDE_PLUGIN_ROOT="$ROOT" \
+      "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+  sleep 0.3
+  kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
+}
+
+# Nothing registered: the only place left to go is OpenRouter.
+rm -rf "$ADIR" "$SLQ"
+hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96
+nd_arm sess-nd1
+[ "$(hf_get armed)" = "True" ] && ok "rate_limit + a self-measured 96% arms the handoff" \
+  || bad "arming without a dashboard" "armed=$(hf_get armed)"
+[ "$(hf_get direction)" = "to_fallback" ] && ok "...toward OpenRouter when no subscription is registered" \
+  || bad "direction" "got: $(hf_get direction)"
+
+# Two subscriptions: the spare wins, and nothing is billed.
+rm -rf "$ADIR"
+for n in nd_one nd_two; do write_creds "$n"; "$ACCT" --no-color add --name "$n" >/dev/null 2>&1; done
+"$ACCT" --no-color use nd_one --force >/dev/null 2>&1
+# Rows the picker will accept whichever way these accounts registered:
+# _cache_row_valid asks for the uuid when an account has one and for the
+# credential when it does not, so carry both. A row it retires sends pick to the
+# network, and there it would read the signed-in account's numbers for every
+# account, which is a fixture bug that looks exactly like a product bug.
+nd_seed_rows() { # name:5h:7d ...
+  python3 - "$ADIR" "$SLQ" "$@" <<'NDEOF'
+import hashlib, json, os, sys, time
+adir, out, specs = sys.argv[1], sys.argv[2], sys.argv[3:]
+rows = {}
+for spec in specs:
+    name, fh, sd = spec.split(":")
+    acct = json.load(open(os.path.join(adir, name + ".json")))
+    token = (acct.get("claudeAiOauth") or {}).get("accessToken") or ""
+    rows[name] = {
+        "status": "ok",
+        "checked_at": int(time.time()),
+        "uuid": acct.get("account_uuid"),
+        "cred": hashlib.sha256(token.encode()).hexdigest()[:16],
+        "five_hour_percent": int(fh),
+        "seven_day_percent": int(sd),
+    }
+json.dump(rows, open(out, "w"))
+NDEOF
+}
+nd_seed_rows nd_one:99:99 nd_two:10:20
+hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+nd_arm sess-nd2
+[ "$(hf_get direction)" = "to_account" ] && ok "...and toward the other subscription when one has room" \
+  || bad "direction" "got: $(hf_get direction)"
+[ "$(hf_get account)" = "nd_two" ] && ok "...naming the account with quota left" \
+  || bad "handoff account" "got: $(hf_get account)"
+
+# ── Fails closed ────────────────────────────────────────────────────────────
+# No dashboard AND no reading is the same as no reading: a bare rate_limit can be
+# transient throttling, and arming on one would end a session on a guess.
+rm -rf "$ADIR" "$SLQ"
+hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96 500
+nd_arm sess-nd3
+[ -z "$(hf_get armed)" ] && ok "an unmeasurable account still refuses to arm" \
+  || bad "armed on no reading" "armed=$(hf_get armed)"
+[ ! -f "$CCDD/quota-cache.json" ] && ok "...and no unusable reading is cached as if it were one" \
+  || bad "cached a failed probe" "cache: $(cat "$CCDD/quota-cache.json" 2>/dev/null | head -c 80)"
+
+# The hook fires on every prompt and every tool use, and a failed probe leaves the
+# cache exactly as stale as it found it. Without a backoff that is a python3 spawn
+# and a socket several times a minute for an account that is offline or signed out.
+rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+: > "$CCD_FAKE_USAGE_LOG"
+nd_hook UserPromptSubmit >/dev/null 2>&1
+n1=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+nd_hook UserPromptSubmit >/dev/null 2>&1
+n2=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+[ "${n1:-0}" -ge 1 ] && ok "a missing cache is probed once" \
+  || bad "probe never ran" "calls: ${n1:-0}"
+[ "${n2:-0}" = "${n1:-0}" ] && ok "...and a failed probe backs off instead of running on every tick" \
+  || bad "no backoff" "calls went $n1 → $n2"
+
+# ── A reading can be too old to mean anything ───────────────────────────────
+# The cache keeps its last good sample when a refresh fails, so a 96% reading
+# survives the reset it was taken before. Arming on that hands off a session
+# whose quota is fine, on a rate_limit that was only ever transient.
+"$FAKE/sigbin/claude" 8 2>/dev/null & NDPID=$!
+sleep 0.3
+kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
+rm -rf "$ADIR" "$SLQ"
+hf_reset; rm -f "$CCDD/.usage-probe-backoff"
+quota 58 96                      # a good reading...
+nd_age "$CCDD/quota-cache.json" 5400     # ...taken an hour and a half ago
+stage_usage 58 96 500            # and every refresh since has failed
+nd_arm sess-nd4
+[ -z "$(hf_get armed)" ] && ok "a reading too old to describe now does not arm" \
+  || bad "armed on a stale reading" "armed=$(hf_get armed)"
+# The bound has to be an upper one, not a rejection of everything: a reading from
+# four minutes ago is what a working install always has.
+hf_reset; quota 58 96
+nd_age "$CCDD/quota-cache.json" 240
+nd_arm sess-nd5
+[ "$(hf_get armed)" = "True" ] && ok "...while a recent one still does" \
+  || bad "rejected a fresh reading" "armed=$(hf_get armed)"
+
+# A reading can be young and still describe a window that no longer exists. Four
+# minutes old passes every age bound, and if its 5-hour window reset three minutes
+# ago then 96% is a fact about quota the user no longer has.
+hf_reset; rm -f "$CCDD/.usage-probe-backoff"
+past=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=3)).isoformat())")
+future=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).isoformat())")
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
+  "$past" "$future" > "$CCDD/quota-cache.json"
+nd_age "$CCDD/quota-cache.json" 240
+stage_usage 58 96 500
+nd_arm sess-nd6
+[ -z "$(hf_get armed)" ] && ok "a window that has already reset does not corroborate" \
+  || bad "armed across a reset" "armed=$(hf_get armed)"
+# The same reading before its reset is exactly what a real handoff runs on.
+hf_reset
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
+  "$future" "$future" > "$CCDD/quota-cache.json"
+nd_age "$CCDD/quota-cache.json" 240
+nd_arm sess-nd7
+[ "$(hf_get armed)" = "True" ] && ok "...while one whose window is still open does" \
+  || bad "rejected a live window" "armed=$(hf_get armed)"
+
+# ── One probe, not one per hook ─────────────────────────────────────────────
+# UserPromptSubmit and PostToolUse overlap constantly. Recording the attempt only
+# after a failure let every sibling pass the backoff check and open its own
+# socket, which is the shape that turns one slow endpoint into a stalled session.
+rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+: > "$CCD_FAKE_USAGE_LOG"
+stage_usage 58 96 500
+for _ in 1 2 3 4 5 6; do nd_hook PostToolUse >/dev/null 2>&1 & done; wait
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+[ "${calls:-0}" -eq 1 ] && ok "six concurrent hooks make exactly one request" \
+  || bad "probe stampede" "6 concurrent hooks made $calls requests, expected 1"
+
+# The same contention on the path that succeeds. A failed probe leaves a backoff
+# marker behind, which would hide a lease released too early; a successful one
+# leaves nothing until the cache is installed, so only the lease can hold the
+# gap between the request returning and the reading being published.
+rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+rm -rf "$CCDD/.usage-probe.lock"
+: > "$CCD_FAKE_USAGE_LOG"
+stage_usage 58 96
+for _ in 1 2 3 4 5 6; do nd_hook PostToolUse >/dev/null 2>&1 & done; wait
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+[ "${calls:-0}" -eq 1 ] && ok "...and exactly one when the request succeeds" \
+  || bad "probe stampede on success" "6 concurrent hooks made $calls requests, expected 1"
+got=$(python3 -c "import json;print((json.load(open('$CCDD/quota-cache.json')).get('claude') or {}).get('sevenDayPercent'))" 2>/dev/null)
+[ "$got" = "96" ] && ok "...with the reading published exactly once" \
+  || bad "publication" "cache holds: $got"
+[ ! -d "$CCDD/.usage-probe.lock" ] && ok "...and the lease released after publication" \
+  || bad "lease leak" "the lock outlived the probe"
+
+# An installed dashboard that cannot reach Anthropic reports that as valid JSON
+# and exits 0. Treating the exit code as the answer published its error payload
+# over the last good reading and skipped the fallback, so a machine that could
+# measure itself perfectly well lost its handoffs to a broken neighbour.
+DASHD="$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist"
+mkdir -p "$DASHD"
+cat > "$DASHD/check-usage.js" <<'DJS'
+// contents are irrelevant; the stub node below decides what it prints
+DJS
+cp "$FAKE/fakebin/node" "$FAKE/node.before-nodash"
+cat > "$FAKE/fakebin/node" <<'NEOF'
+#!/bin/sh
+echo '{"claude":{"available":false,"error":true}}'
+exit 0
+NEOF
+chmod +x "$FAKE/fakebin/node"
+rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"; rm -rf "$CCDD/.usage-probe.lock"
+: > "$CCD_FAKE_USAGE_LOG"
+stage_usage 58 96
+nd_hook UserPromptSubmit >/dev/null 2>&1
+[ "$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')" -ge 1 ] \
+  && ok "a dashboard that answers with an error still falls through to ccd" \
+  || bad "fallback suppressed" "the dashboard's error payload was taken as an answer"
+got=$(python3 -c "import json;print((json.load(open('$CCDD/quota-cache.json')).get('claude') or {}).get('sevenDayPercent'))" 2>/dev/null)
+[ "$got" = "96" ] && ok "...and the reading that lands is the usable one" \
+  || bad "unusable publication" "cache holds: $got"
+# ...and when neither producer can answer, the last good reading is left alone.
+quota 58 91
+stage_usage 58 96 500
+nd_age "$CCDD/quota-cache.json" 900
+rm -f "$CCDD/.usage-probe-backoff"; rm -rf "$CCDD/.usage-probe.lock"
+nd_hook UserPromptSubmit >/dev/null 2>&1
+got=$(python3 -c "import json;print((json.load(open('$CCDD/quota-cache.json')).get('claude') or {}).get('sevenDayPercent'))" 2>/dev/null)
+[ "$got" = "91" ] && ok "...and neither producer answering leaves the last good one in place" \
+  || bad "clobbered a good reading" "cache holds: $got"
+cp "$FAKE/node.before-nodash" "$FAKE/fakebin/node"; chmod +x "$FAKE/fakebin/node"
+rm -rf "$FAKE/.claude/plugins/cache/claude-dashboard"
+
+# ── What doctor says about it ───────────────────────────────────────────────
+# A reading that stops coming is invisible everywhere else: the warnings simply
+# never appear again and the handoff quietly stops arming. doctor is the one view
+# whose job is to answer "is this working?", so it has to name the state.
+doctor_out() {
+  OPENROUTER_API_KEY=sk-or-v1-smoketest CLAUDE_PLUGIN_ROOT="$ROOT" \
+    "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g'
+}
+rm -f "$CCDD/quota-cache.json" "$CCDD/refresh-failed" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96 500
+nd_hook UserPromptSubmit >/dev/null 2>&1      # probe fails, leaves the breadcrumb
+out=$(doctor_out)
+case "$out" in
+  *"Quota readings"*) ok "doctor reports the quota reading as its own state" ;;
+  *) bad "doctor quota section" "no Quota readings section in doctor output" ;;
+esac
+case "$out" in
+  *"✗ none"*) ok "...and says so plainly when there is no reading to arm on" ;;
+  *) bad "doctor with no reading" "got: $(printf '%s' "$out" | grep -A2 'Quota readings' | head -3)" ;;
+esac
+case "$out" in
+  *"could not be measured"*) ok "...carrying the reason the hook already recorded" ;;
+  *) bad "doctor breadcrumb" "the recorded reason never reached the user" ;;
+esac
+
+rm -f "$CCDD/quota-cache.json" "$CCDD/refresh-failed" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96
+nd_hook UserPromptSubmit >/dev/null 2>&1
+out=$(doctor_out)
+case "$out" in
+  *"5h 58%"*"7d 96%"*) ok "...and reports the numbers once a reading lands" ;;
+  *) bad "doctor with a reading" "got: $(printf '%s' "$out" | grep -A2 'Quota readings' | head -3)" ;;
+esac
+
+# doctor and the arming gate must draw the line in the same place. A green check
+# on a reading the handoff has already stopped trusting is the exact failure this
+# section exists to end.
+nd_age "$CCDD/quota-cache.json" 1799
+inside=$(doctor_out)
+case "$inside" in
+  # Absence of the warning is not evidence on its own: doctor failing outright
+  # would also lack the string. Require the row it is supposed to print.
+  *"Too old to arm"*) bad "doctor freshness" "called a 1799s reading too old" ;;
+  *"✓ 5h 58%"*) ok "doctor still trusts a reading one second inside the arming bound" ;;
+  *) bad "doctor freshness" "no healthy quota row: ${inside:0:120}" ;;
+esac
+nd_age "$CCDD/quota-cache.json" 1801
+case "$(doctor_out)" in
+  *"Too old to arm"*) ok "...and says so the second it falls outside" ;;
+  *) bad "doctor freshness" "a 1801s reading still read as healthy" ;;
+esac
+
+# doctor and the gate must also agree about a window that has already reset. A
+# young sample whose window turned over is evidence about quota nobody has any
+# more, and a green check on it is exactly the false healthy this section exists
+# to end.
+gone=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=3)).isoformat())")
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s"}}\n' \
+  "$gone" > "$CCDD/quota-cache.json"
+nd_age "$CCDD/quota-cache.json" 240
+case "$(doctor_out)" in
+  *"none usable"*) ok "...and calls a reading whose windows have all reset unusable" ;;
+  *) bad "doctor expiry" "reported an expired window as a reading: $(doctor_out | grep -A1 'Quota readings' | tail -1)" ;;
+esac
+# The same shape with a recorded failure behind it is not the benign case. A
+# reading whose windows reset two days ago is not waiting for the next prompt.
+printf 'the signed-in Claude account could not be measured (login, token, or network)\n' \
+  > "$CCDD/refresh-failed"
+nd_age "$CCDD/quota-cache.json" 172800
+case "$(doctor_out)" in
+  *"Refreshes have stopped"*) ok "...and names the cause when one was recorded" ;;
+  *) bad "doctor expiry" "offered reassurance over a recorded failure" ;;
+esac
+case "$(doctor_out)" in
+  *"could not be measured"*) ok "...carrying the recorded reason through" ;;
+  *) bad "doctor expiry" "the reason never reached the user" ;;
+esac
+rm -f "$CCDD/refresh-failed"
+
+# Termination while the lease is held must not strand it. A hook killed during
+# validation used to leave the lock behind, and every later hook then had to wait
+# out the stale-lock reaper before it could refresh at all.
+rm -rf "$CCDD/.usage-probe.lock"; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96
+nd_hook UserPromptSubmit >/dev/null 2>&1
+[ ! -d "$CCDD/.usage-probe.lock" ] && ok "a completed refresh leaves no lease behind" \
+  || bad "lease leak" "the lock outlived a normal refresh"
+# Termination while the lease is held must not strand it: the EXIT/INT/TERM traps
+# release it, and a hook killed mid-refresh would otherwise make every later one
+# wait out the reaper before it could refresh at all.
+rm -rf "$CCDD/.usage-probe.lock"; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+# Signal the hook itself, not a wrapper subshell around it: TERM on a wrapper
+# kills the wrapper while the hook runs to completion, and the assertion then
+# passes without the trap ever firing. And hold the probe open, so the kill
+# lands while the lease is actually held rather than before or after it.
+mkdir -p "$FAKE/slowplug/bin"
+printf '#!/bin/sh\nsleep 5\n' > "$FAKE/slowplug/bin/ccd-account"
+chmod +x "$FAKE/slowplug/bin/ccd-account"
+CLAUDE_PLUGIN_ROOT="$FAKE/slowplug" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit \
+  >/dev/null 2>&1 < /dev/null & HKPID=$!
+held=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -d "$CCDD/.usage-probe.lock" ] && { held=1; break; }
+  sleep 0.1
+done
+[ "$held" -eq 1 ] && ok "the lease is held for the length of the request" \
+  || bad "lease never taken" "nothing to clean up, so the next assertion proves nothing"
+kill -TERM $HKPID 2>/dev/null; wait $HKPID 2>/dev/null
+[ ! -d "$CCDD/.usage-probe.lock" ] && ok "...and a hook killed mid-request releases it" \
+  || bad "lease leak" "a TERMed hook stranded the lock"
+rm -rf "$FAKE/slowplug"
+
+# And if one survives anyway, it still cannot block the event that matters:
+# StopFailure takes no lease, so an armed handoff fires straight through it.
+rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+mkdir -p "$CCDD/.usage-probe.lock"          # as a killed hook would leave it
+stage_usage 58 96
+hf_reset
+nd_arm sess-nd8
+[ "$(hf_get armed)" = "True" ] && ok "...and a stranded lease never blocks a handoff" \
+  || bad "lease blocks arming" "armed=$(hf_get armed)"
+rm -rf "$CCDD/.usage-probe.lock"
+
+# Publication that fails must not look like one that succeeded: clearing the
+# markers there would advertise a fresh reading the cache never received.
+rm -rf "$CCDD/.usage-probe.lock"; rm -f "$CCDD/quota-cache.json" "$CCDD/refresh-failed"
+: > "$CCDD/.usage-probe-backoff"; nd_age "$CCDD/.usage-probe-backoff" 400
+stage_usage 58 96
+# Fail the move itself. A directory at the cache path does not do it: `mv file
+# dir` moves the file into the directory and reports success.
+cat > "$FAKE/fakebin/mv" <<'MVEOF'
+#!/bin/sh
+exit 1
+MVEOF
+chmod +x "$FAKE/fakebin/mv"
+nd_hook UserPromptSubmit >/dev/null 2>&1
+rm -f "$FAKE/fakebin/mv"
+grep -q "could not be written" "$CCDD/refresh-failed" 2>/dev/null \
+  && ok "a reading that cannot be written is recorded as a publication failure" \
+  || bad "silent publication failure" "got: $(cat "$CCDD/refresh-failed" 2>&1 | head -1)"
+[ -f "$CCDD/.usage-probe-backoff" ] && ok "...and the retry protection is left in place" \
+  || bad "backoff cleared" "a failed publication cleared the marker"
+[ ! -f "$CCDD/quota-cache.json" ] && ok "...and no half-written reading is left at the cache path" \
+  || bad "publication" "a failed move still produced a cache file"
+
+# Subscription-only users are the ones this whole path is for, and they have no
+# OpenRouter key. doctor used to exit at the top without one, which put the
+# accounts, handoff and quota sections behind a paid fallback nobody needs yet.
+mv "$CCDD/providers/keys.env" "$CCDD/providers/keys.env.bak"
+nokey_out=$(env -u OPENROUTER_API_KEY CLAUDE_PLUGIN_ROOT="$ROOT" \
+  "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
+mv "$CCDD/providers/keys.env.bak" "$CCDD/providers/keys.env"
+case "$nokey_out" in
+  *"Quota readings"*) ok "doctor diagnoses the subscription path with no OpenRouter key" ;;
+  *) bad "doctor without a key" "got: ${nokey_out:0:160}" ;;
+esac
+case "$nokey_out" in
+  *"Automatic handoff"*) ok "...including the handoff section it used to exit before" ;;
+  *) bad "doctor without a key" "no handoff section" ;;
+esac
+case "$nokey_out" in
+  *"no key configured"*) ok "...and names the fallback as the one thing missing" ;;
+  *) bad "doctor without a key" "never mentioned the missing key" ;;
+esac
+
+unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
 rm -rf "$ADIR" "$SLQ"
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
