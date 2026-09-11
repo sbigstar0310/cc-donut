@@ -451,8 +451,9 @@ status() {
   if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
     printf '\n%sWhen quota runs out%s %s(automatic handoff is on)%s\n' "$b" "$r" "$grn" "$r"
     if shim_leads_path; then
-      printf '  %sNothing to type.%s The conversation moves to OpenRouter by itself,\n' "$grn" "$r"
-      printf '  and returns to your subscription when the window resets.\n'
+      printf '  %sNothing to type.%s The conversation moves to whichever subscription\n' "$grn" "$r"
+      printf '  still has room, and to OpenRouter only when none do. It returns when\n'
+      printf '  the window resets.\n'
       # The manual route still works and always will. Automation you cannot step
       # around is worse than no automation — show the way out, quietly.
       printf '  %sIf it ever does not fire: /exit, then ccd -c (the manual route still works)%s\n' "$d" "$r"
@@ -1128,9 +1129,10 @@ CCD_SHIM_PATH="$self" exec "$t" "$@"
 CCD_CLAUDE_SHIM
       chmod +x "$claude_shim"
       printf '✓ automatic handoff installed at %s\n' "$(tilde "$claude_shim")"
-      printf '  %sWhen your Claude quota runs out, sessions continue on OpenRouter —%s\n' "$d" "$r"
-      printf '  %spaid per token with your own key — and return to your subscription%s\n' "$d" "$r"
-      printf '  %sby themselves when the quota resets.%s\n' "$d" "$r"
+      printf '  %sWhen your Claude quota runs out, sessions continue on your other%s\n' "$d" "$r"
+      printf '  %ssubscription if one has room, with nothing billed. OpenRouter (paid,%s\n' "$d" "$r"
+      printf '  %syour own key) is the last resort when every subscription is spent.%s\n' "$d" "$r"
+      printf '  %sEither way they return by themselves when the quota resets.%s\n' "$d" "$r"
 
       # The shim is only reachable if its directory comes before the real claude
       # on PATH. Ask before editing a startup file: --auto is consent to install
