@@ -71,23 +71,20 @@ matters once every subscription is spent.
 ```text
 BEFORE   stuck mid-task, restart, lose the thread
 
-AUTO     nothing to type at all     the session ends and comes back by itself
-                                    on the other subscription (ccd setup --auto)
+AUTO     nothing to type at all     the session moves itself to the other
+                                    subscription (ccd setup --auto)
 
-MANUAL   !ccd account use <name>    for when the handoff did not fire
-         /exit, claude --resume     same conversation, nothing billed
+MANUAL   !ccd account use <name>    one line, then keep typing
 ```
 
-Automatic is the point, so turn it on: `ccd setup --auto` ends the spent session
-and brings the conversation back on the other subscription without you typing
+`!` runs a shell command without leaving Claude Code, so the swap happens in the
+session that just ran out, and that session carries on. You do not have to end
 anything.
 
-The manual route needs that restart, and it is not a choice. A running session
-holds its token in memory and reads its model list once at startup, so it goes on
-using the account that just ran out no matter what the credential on disk says.
-Ending the session is the only thing that picks up a swap, which is exactly the
-step `ccd setup --auto` does for you. `!` runs a shell command without leaving
-Claude Code, so at least the swap happens where you already are.
+What lags is cosmetic. Claude Code reads the model list, the limits and the usage
+figures once at startup and holds them, so those keep describing the account you
+left until the next start. ccd clears the cached copies the same way `/login`
+does, so nothing carries over further than that.
 
 ---
 
@@ -211,7 +208,7 @@ calls.
 | --- | --- |
 | `ccd account add` | Register the signed-in account as a spare subscription |
 | `ccd account list` | Registered accounts with live quota |
-| `ccd account use <name>` | Hop to that account. `!ccd account use <name>` works inside a session; `/exit` and `claude --resume` to pick it up |
+| `ccd account use <name>` | Hop to that account. `!ccd account use <name>` does it from inside a session, which then carries on |
 | `ccd account rm <name>` | Remove one |
 | `ccd setup --auto` | Opt in to automatic handoff |
 | `ccd setup --no-auto` | Turn automatic handoff back off |

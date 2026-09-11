@@ -70,21 +70,18 @@ ccd setup --auto    # 선택: 칠 것 없이 알아서 전환
 ```text
 이전       작업 중간에 막힘, 재시작, 맥락 상실
 
-자동       칠 것 없음                 세션이 알아서 끝나고 다른 구독으로
-                                      되살아납니다 (ccd setup --auto)
+자동       칠 것 없음                 세션이 알아서 다른 구독으로
+                                      옮겨갑니다 (ccd setup --auto)
 
-수동       !ccd account use <name>    자동 전환이 안 걸렸을 때
-           /exit, claude --resume     같은 대화, 무과금
+수동       !ccd account use <name>    한 줄 치고 그대로 계속
 ```
 
-자동이 기본입니다. `ccd setup --auto`를 켜 두면 쿼타가 바닥난 세션을 알아서 끝내고
-다른 구독에서 대화를 이어 줍니다. 칠 것이 없습니다.
+`!`를 붙이면 Claude Code를 벗어나지 않고 셸 명령을 실행할 수 있습니다. 쿼타가 바닥난
+그 세션에서 계정을 바꾸고, 그 세션에서 그대로 이어서 씁니다. 나갈 필요 없습니다.
 
-수동 경로에서 재시작이 필요한 것은 선택의 문제가 아닙니다. 실행 중인 세션은 토큰을
-메모리에 들고 있고 모델 목록도 시작할 때 한 번만 읽기 때문에, 디스크의 자격증명이
-무엇이든 방금 바닥난 계정을 계속 씁니다. 세션을 끝내는 것만이 전환을 반영하는 유일한
-방법이고, `ccd setup --auto`가 대신 해 주는 일이 바로 그것입니다. `!`를 붙이면 Claude
-Code를 벗어나지 않고 셸 명령을 실행할 수 있어서, 최소한 전환만큼은 하던 자리에서 됩니다.
+뒤늦게 따라오는 것은 표시뿐입니다. Claude Code는 모델 목록과 한도, 사용량 수치를 시작할
+때 한 번 읽어 들고 있어서, 다음 실행 전까지는 떠나온 계정 기준으로 보입니다. ccd가 그
+캐시를 `/login`과 똑같이 비우므로 그 이상 남지는 않습니다.
 
 ---
 
@@ -206,7 +203,7 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 | --- | --- |
 | `ccd account add` | 로그인된 계정을 예비 구독으로 등록 |
 | `ccd account list` | 등록된 계정과 실시간 쿼타 확인 |
-| `ccd account use <name>` | 그 계정으로 전환. 세션 안에서는 `!ccd account use <name>`, 반영하려면 `/exit` 후 `claude --resume` |
+| `ccd account use <name>` | 그 계정으로 전환. 세션 안에서 `!ccd account use <name>`으로 하면 그 세션에서 그대로 이어집니다 |
 | `ccd account rm <name>` | 계정 제거 |
 | `ccd setup --auto` | 자동 전환 켜기 |
 | `ccd setup --no-auto` | 자동 전환 끄기 |
