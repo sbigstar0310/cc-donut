@@ -2995,6 +2995,15 @@ elif cmd == "msg":
     s = m.stale_spares(); print(m.stale_message(s) if s else "")
 elif cmd == "breadcrumb":
     m.stale_breadcrumb(m.stale_spares()); print("yes" if os.path.exists(m.STALE_FILE) else "no")
+elif cmd == "refresh-ok":             # run the real account_refresh, stubbing only HTTP
+    # The fixtures carry the refresh token "r", so the exchange cannot succeed
+    # against anything real — and a test that reaches the network is a bug in the
+    # test. Everything account_refresh does with the result is the code under test.
+    name = argv[1]
+    m.token_refresh = lambda rt: ({"accessToken": "A2", "refreshToken": "R2",
+                                   "expiresAt": int((time.time() + 8 * 3600) * 1000)}, 200)
+    acct = m.account_load(name)
+    print("ok" if m.account_refresh(name, acct)[0] else "failed")
 elif cmd == "quiet":                  # park keepalive so hook runs make no network call
     m.write_json(m.KEEPALIVE_MARK, {"fails": 0}, 0o600)
 elif cmd == "warm":                   # ...and park the picker, for the same reason
@@ -3091,6 +3100,60 @@ esac
 [ "$(ka breadcrumb)" = "yes" ] \
   && ok "the verdict is left where the hook can find it" \
   || bad "breadcrumb" "keepalive left nothing behind"
+# ── A refresh that never succeeded is not a refresh ─────────────────────────
+# stale_spares() keys on refreshed_at, and bank_live_oauth() and swap_to() both write
+# that field on a successful COPY. So every hop reset the staleness clock while the
+# refresh path kept failing: on the reporting machine the spare's refreshed_at was
+# the exact second of a manual swap, six consecutive keepalive failures were on disk,
+# and the warning never fired.
+ka mk banked-spare 20 8
+python3 - "$ADIR/banked-spare.json" <<'BANKPY'
+import json, sys, time
+# What banking leaves behind: a fresh refreshed_at against a token nothing has ever
+# managed to refresh.
+p = sys.argv[1]
+d = json.load(open(p))
+d["refreshed_at"] = int(time.time())
+json.dump(d, open(p, "w"))
+BANKPY
+case "$(ka stale)" in
+  *'"banked-spare"'*) ok "a spare whose token was copied but never refreshed is still stale" ;;
+  *) bad "stale detection" "a copy reset the clock: $(ka stale)" ;;
+esac
+
+# ...and a refresh that really happened clears it.
+ka refresh-ok banked-spare >/dev/null
+case "$(ka stale)" in
+  *'"banked-spare"'*) bad "stale detection" "a real refresh did not count: $(ka stale)" ;;
+  *) ok "...and a refresh that actually succeeded clears it" ;;
+esac
+
+# The failure counter is evidence nobody was reading. A manual repair must clear it,
+# or the account just proven healthy stays in the backoff keepalive computes from it.
+ka_fails() { python3 -c "
+import json
+try: print((json.load(open('$FAKE/.claude/ccd/accounts-keepalive')) or {}).get('fails'))
+except Exception: print('unreadable')"; }
+
+# One account refreshing is not the pass succeeding. The marker carries the SCHEDULE
+# as well as the count, so a per-account write postpones the next pass — and with the
+# quota warm probing every few minutes, postpones it forever. That silences the
+# warning a different, failing spare is waiting for, which is the bug this issue is
+# about rather than a new one to introduce.
+ka mk lone-success 1 8
+printf '{"fails": 6}' > "$FAKE/.claude/ccd/accounts-keepalive"
+[ "$(ka refresh-ok lone-success)" = "ok" ] || bad "keepalive counter" "the fixture refresh failed"
+[ "$(ka_fails)" = "6" ] \
+  && ok "one account's refresh does not reset the whole pass's record" \
+  || bad "keepalive counter" "a single success claimed the pass: $(ka_fails)"
+
+# A clean sweep of every spare is a repair, and that is where the counter clears.
+printf '{"fails": 6}' > "$FAKE/.claude/ccd/accounts-keepalive"
+CCD_TOKEN_URL="http://127.0.0.1:1/x" "$ACCT" --no-color refresh >/dev/null 2>&1
+[ "$(ka_fails)" = "6" ] \
+  && ok "...and a sweep with a failure in it does not clear it either" \
+  || bad "keepalive counter" "cleared on a failed sweep: $(ka_fails)"
+
 # Park keepalive AND the picker: hook runs below must not fire a background token
 # refresh or a quota probe. These fixtures carry the refresh token "r" and an
 # expired access token, so anything that reaches the network here is a test

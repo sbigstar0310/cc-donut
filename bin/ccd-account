@@ -661,7 +661,8 @@ def bank_live_oauth():
             if not acct:
                 return         # removed while we waited
             acct["claudeAiOauth"] = live
-            # stale_spares() keys on this, and the snapshot really is this fresh.
+            # The snapshot really is this fresh. stale_spares() no longer keys on
+            # it — a copy is not a refresh, which is the whole of #27.
             # quota_for() retires failure verdicts by credential identity, not
             # by this, so the two never race on second-granular clocks.
             acct["refreshed_at"] = now()
@@ -840,6 +841,11 @@ def account_refresh(name, acct):
     merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
     acct["claudeAiOauth"] = merged
     acct["refreshed_at"] = now()
+    # Two different facts, and conflating them is what let six consecutive failures
+    # pass unreported. refreshed_at says the snapshot on disk is this fresh, which
+    # bank_live_oauth() and swap_to() can write truthfully after a copy. This says
+    # the token exchange itself worked, which only happens here.
+    acct["refresh_ok_at"] = now()
     account_save(name, acct)
     return True, "ok"
 
@@ -1175,6 +1181,9 @@ def cmd_add(args):
         "claudeAiOauth": oauth,
         "added_at": (existing or {}).get("added_at") or now(),
         "refreshed_at": now(),
+        # Carried across like added_at: re-registering the same account must not
+        # erase what we know about its refreshes (#27).
+        "refresh_ok_at": (existing or {}).get("refresh_ok_at"),
         "subscription_type": oauth.get("subscriptionType"),
         "rate_limit_tier": oauth.get("rateLimitTier"),
     }
@@ -1357,6 +1366,15 @@ def cmd_refresh(args):
             rc = 1
             hint = "needs re-login" if why == "dead" else "unreachable"
             print(f"{C_RED}✗{C_RESET} {name} — {hint}")
+    # A clean sweep of every spare is a repair, and the backoff keepalive computes
+    # from the failure count no longer describes anything. Only here: writing this
+    # marker also resets the schedule it carries, so a single account's success must
+    # never claim it — that postpones the pass a DIFFERENT spare is waiting for.
+    if rc == 0 and not args.name:
+        try:
+            write_json(KEEPALIVE_MARK, {"fails": 0}, 0o600)
+        except Exception:
+            pass
     return rc
 
 
@@ -1504,7 +1522,20 @@ def stale_spares():
 
     Keyed on age, not on the last error. The user's exposure is identical
     whether the refresh failed with 429, 500, or a dropped connection, and
-    keying on the error class is exactly what let a 429 pass unreported."""
+    keying on the error class is exactly what let a 429 pass unreported.
+
+    The age is of the last SUCCESSFUL refresh. refreshed_at cannot answer that:
+    bank_live_oauth() and swap_to() write it after copying the live blob, which is
+    an honest claim about the snapshot and says nothing about the token exchange.
+    Keying on it meant every hop reset this clock while the refresh path kept
+    failing — six consecutive failures, and never a word (#27).
+
+    Without refresh_ok_at this falls back to added_at, which is deliberately harsh:
+    an account registered long ago reads as stale at once, even if it refreshed
+    yesterday, because a pre-upgrade refreshed_at cannot be told apart from a copy.
+    The alternative is to trust it and reproduce the bug. The false alarm names the
+    command that fixes it, and the first successful refresh stamps the field, so it
+    corrects itself within a keepalive interval."""
     cur = active_name()
     out = []
     for name in account_names():
@@ -1513,7 +1544,7 @@ def stale_spares():
         acct = account_load(name)
         if not acct:
             continue
-        ts = acct.get("refreshed_at") or acct.get("added_at")
+        ts = acct.get("refresh_ok_at") or acct.get("added_at")
         if not isinstance(ts, (int, float)):
             continue
         age = now() - ts
