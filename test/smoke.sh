@@ -42,6 +42,14 @@ ok()   { pass=$((pass+1)); printf '  ✓ %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  ✗ %s\n' "$1"; [ -n "${2:-}" ] && printf '      %s\n' "$2"; }
 head_() { printf '\n%s\n' "$1"; }
 
+# The paid hop bills, so it is gated on an opt-in that `ccd setup --auto` records,
+# while the free hop between subscriptions is not gated at all. Most sections here
+# are about thresholds, corroboration and signalling rather than about consent, so
+# they run on a machine where that question is already settled. The sections that
+# ARE about the gate turn it off explicitly and say so.
+paid_optin_on()  { : > "$HOME/.claude/ccd/paid-handoff"; }
+paid_optin_off() { rm -f "$HOME/.claude/ccd/paid-handoff"; }
+
 # A fake `node` so we don't need a real one: it prints the JSON we stage.
 mkdir -p "$FAKE/fakebin"
 cat > "$FAKE/fakebin/node" <<'EOF'
@@ -638,6 +646,7 @@ stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFa
 # would: a launcher marker, a key, and a resolvable claude process. Section 19
 # covers what happens when each of those is missing.
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 # Stand-in for the claude process. Nothing resolves as "claude" on every
 # platform at once — a symlink shows the target on Linux, a script shows the
 # interpreter on macOS, and copied system binaries fail code-signing there. On
@@ -718,6 +727,7 @@ head_ "17. automatic handoff: the SIGHUP interlock"
 # THE safety property: never signal unless a relaunch loop is there to catch it.
 # Otherwise the session just dies with nothing bringing it back.
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 # Stand-in for the claude process. Nothing resolves as "claude" on every
 # platform at once — a symlink shows the target on Linux, a script shows the
 # interpreter on macOS, and copied system binaries fail code-signing there. On
@@ -773,6 +783,7 @@ if kill -0 "$TARGET" 2>/dev/null; then ok "missing OpenRouter key → no signal 
 else bad "signalled without a key" "target died with no fallback available"; fi
 kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 
 head_ "17b. the statusline never waits on the dashboard"
 # ccd renders the dashboard's rows above its own by running it as a child. That
@@ -1828,6 +1839,77 @@ rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
 
+head_ "18d. --auto is the opt-in for the paid hop, and only for that"
+# The free hop between registered subscriptions costs nothing and is what the
+# product promises; the hop to OpenRouter spends the user's money. One flag used to
+# stand for both. `--auto` now records consent for the paid one, and the launcher
+# it installs carries the free one on its own.
+rm -f "$RC"; printf '# my own file\n' > "$RC"
+rm -f "$FAKE/.claude/ccd/paid-handoff" "$FAKE/.claude/ccd/auto-path"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+[ -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "--auto records the paid-hop opt-in" \
+  || bad "paid opt-in" "setup --auto left no record of consent"
+
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "--no-auto takes it back" \
+  || bad "paid opt-in" "consent survived --no-auto"
+
+# Consent must not be re-granted by a run that never asked for it. A bare setup
+# installs the launcher and nothing more, so it must leave this alone in both
+# directions.
+HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "a bare setup does not grant it" \
+  || bad "paid opt-in" "a bare setup opted the user into billing"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1
+[ -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "...and does not revoke it either" \
+  || bad "paid opt-in" "a bare setup revoked consent the user had given"
+
+# Removing ccd removes the consent with it.
+HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "uninstall removes it" || bad "paid opt-in" "left behind by uninstall"
+
+# It has to be legible somewhere. `ccd doctor` is where the handoff already
+# explains itself, and the two hops now have different answers.
+rm -f "$RC"; printf '# my own file\n' > "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" doctor 2>&1)
+# "OpenRouter" alone is not enough: doctor names it in the key section too, so that
+# string was green before this line existed. Match the state, not the word.
+case "$out" in
+  *"OpenRouter hop allowed"*) ok "doctor says where the paid hop stands" ;;
+  *) bad "doctor paid hop" "no mention: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+rm -f "$FAKE/.claude/ccd/paid-handoff"
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" doctor 2>&1)
+case "$out" in
+  *"ccd setup --auto"*) ok "...and how to turn it on when it is off" ;;
+  *) bad "doctor paid hop" "no remedy: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+# The status screen makes a promise about where a session goes. With the paid hop
+# off it must not promise OpenRouter, because nothing will take it there.
+rm -f "$FAKE/.claude/ccd/paid-handoff"
+# SHIMPATH puts the shim ahead of the real claude, which is the branch that makes
+# the promise at all — without it status only says "installed, but not active".
+out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" 2>&1)
+case "$out" in
+  *"to OpenRouter only when none do"*)
+    bad "status promise" "promised a paid hop that is not allowed" ;;
+  *"Subscriptions only"*) ok "status promises subscriptions only when the paid hop is off" ;;
+  *) bad "status promise" "said neither: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" 2>&1)
+case "$out" in
+  *"to OpenRouter only when none do"*) ok "...and names it once it is allowed" ;;
+  *) bad "status promise" "never names the paid hop: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+
 head_ "19. automatic handoff: readiness gates"
 # Each of these ends a session, so each must fail closed. A key ccd would later
 # reject is the same as no key: the session would end with nowhere to go.
@@ -1851,6 +1933,7 @@ keycase 'unquoted'             'OPENROUTER_API_KEY=sk-or-v1-real'          usabl
 # Arming must not outlive the conditions that justified it: a file left behind by
 # an unsupervised session would be consumed by a later launcher.
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
+paid_optin_on
 quota 58 96
 hf_reset
 stopfail sess-h rate_limit | "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
@@ -1865,6 +1948,7 @@ stopfail sess-i rate_limit | CCD_HANDOFF=1 "$ROOT/scripts/quota-guard.sh" StopFa
   && ok "no key → nothing is armed either" \
   || bad "armed without a key" "would end the session with nowhere to go"
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
+paid_optin_on
 
 # The headline promise: on recovery the session must actually END, or the return
 # trip waits for an unrelated exit that may never come.
@@ -3647,6 +3731,7 @@ esac
 # The whole point of the reading. Without one, arming is impossible by design
 # (see quota_peak), so this is what an install with no dashboard used to lose.
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$CCDD/providers/keys.env"
+paid_optin_on
 set +m 2>/dev/null
 # A fresh stand-in per arm. Arming signals the claude process, so the one that
 # armed is gone by the next call — and a dead pid fails the readiness check for
@@ -3673,7 +3758,20 @@ nd_arm sess-nd1
 [ "$(hf_get direction)" = "to_fallback" ] && ok "...toward OpenRouter when no subscription is registered" \
   || bad "direction" "got: $(hf_get direction)"
 
-# Two subscriptions: the spare wins, and nothing is billed.
+# Without the opt-in the same situation arms nothing. A key configured at some point
+# in the past says the paid backbone is reachable; it does not say the user agreed
+# that quota exhaustion may start billing while they are not at the keyboard.
+paid_optin_off
+hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96
+nd_arm sess-nd1b
+[ -z "$(hf_get armed)" ] \
+  && ok "...and not at all when the paid hop was never opted into" \
+  || bad "paid opt-in" "armed $(hf_get direction) on a configured key alone"
+
+# Two subscriptions: the spare wins, and nothing is billed. The opt-in stays OFF
+# through this one, because that is the whole point — the free hop is the product
+# and it must not need a flag.
 rm -rf "$ADIR"
 for n in nd_one nd_two; do write_creds "$n"; "$ACCT" --no-color add --name "$n" >/dev/null 2>&1; done
 "$ACCT" --no-color use nd_one --force >/dev/null 2>&1
@@ -3703,12 +3801,17 @@ json.dump(rows, open(out, "w"))
 NDEOF
 }
 nd_seed_rows nd_one:99:99 nd_two:10:20
+paid_optin_off
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 nd_arm sess-nd2
 [ "$(hf_get direction)" = "to_account" ] && ok "...and toward the other subscription when one has room" \
   || bad "direction" "got: $(hf_get direction)"
 [ "$(hf_get account)" = "nd_two" ] && ok "...naming the account with quota left" \
   || bad "handoff account" "got: $(hf_get account)"
+[ ! -f "$CCDD/paid-handoff" ] \
+  && ok "...and it needed no paid opt-in to get there" \
+  || bad "free hop" "the fixture left an opt-in behind, so this proved nothing"
+paid_optin_on
 
 # ── Fails closed ────────────────────────────────────────────────────────────
 # No dashboard AND no reading is the same as no reading: a bare rate_limit can be

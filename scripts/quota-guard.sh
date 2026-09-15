@@ -484,6 +484,17 @@ raise SystemExit(1)
 PY
 }
 
+# Has the user agreed that quota exhaustion may move the session onto the paid
+# backbone without asking? Written by `ccd setup --auto` (bin/ccd), removed by
+# `--no-auto` and by uninstall.
+#
+# Deliberately separate from have_key. A key says the paid backbone is REACHABLE;
+# this says the user agreed it may be USED unattended. They were the same question
+# only for as long as the launcher itself was what `--auto` installed — the free hop
+# between subscriptions rides on the launcher and needs no flag, so the two facts
+# now have to be recorded separately.
+paid_optin() { [ -f "$CCD_DIR/paid-handoff" ]; }
+
 # Everything that must hold before a session may be ended. Checked BEFORE arming,
 # not after: an armed file left behind by an unsupervised or unready session
 # would be consumed by a later launcher and resume the wrong conversation.
@@ -542,9 +553,13 @@ if [ "$EVENT" = "StopFailure" ]; then
            direction=""; account=""
            if account=$(pick_account) && [ -n "$account" ]; then
              direction=to_account
-           elif have_key; then
+           elif paid_optin && have_key; then
              direction=to_fallback; account=""
            fi
+           # Neither arm taken means every subscription is spent and the paid hop
+           # is not on the table. Nothing is armed and the session ends where it
+           # is, which is the honest outcome: there is nowhere free to go, and
+           # going somewhere paid is not ours to decide.
            # Arm first, then signal: the launcher must find the file when the
            # session exits. If the write fails, do NOT signal — ending a session
            # whose handoff was never recorded leaves nothing to bring it back.
