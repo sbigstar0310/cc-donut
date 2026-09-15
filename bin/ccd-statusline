@@ -364,7 +364,7 @@ fi
 #
 # Reads files directly instead of shelling out to ccd-account (~50ms per render):
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
-acct_seg=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" \
+acct_out=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" \
   python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
 import datetime, hashlib, json, os, sys, time
 adir, qfile = sys.argv[1], sys.argv[2]
@@ -594,7 +594,7 @@ if unregistered:
 # rather than spending the row on the answer "you have one account" at someone who
 # never asked for the feature. It is also what makes the states below exhaustive.
 if len(names) < 2:
-    print(head, end="")
+    print(head); print(); print()
     raise SystemExit(0)
 
 # The spare is the whole point of registering a second account, so say whether one
@@ -642,6 +642,10 @@ def short(n, w=14):
 
 # The percentage says whether to switch; the countdown says whether to wait
 # instead. Naming the spare without either left both questions open (#16).
+# Line three tells the warning below what we actually know: a name, "" for "measured
+# and none of them has room", or "?" for "nothing has been measured". The row already
+# draws that distinction and the warning must not flatten it into a claim.
+best = ready[0][1] if ready else ("" if (dead or full) else "?")
 if ready:
     p, n, secs = ready[0]
     more = f"{DIM} +{len(ready) - 1}{RS}" if len(ready) > 1 else ""
@@ -659,21 +663,37 @@ else:
     # Not the same as having no spare. Saying "none" here would be a claim we
     # cannot support, and it is the claim that matters most to get right.
     tail = f"{DIM}spare ?{RS}"
-print(f"{head} {DIM}│{RS} {tail}", end="")
+# head and tail on their own lines: when the warning names the spare, repeating it in
+# the row would spend the width twice on one fact, and the row is truncated at
+# terminal width. bash decides which halves to keep.
+print(head); print(tail); print(best, end="")
 PY
 )
+
+# Three lines out, split with parameter expansion: this path may not spawn a
+# process, and `sed -n 2p` is a process.
+acct_head=${acct_out%%$'\n'*}
+_rest=${acct_out#*$'\n'}
+acct_tail=${_rest%%$'\n'*}
+ready_spare=${_rest#*$'\n'}
+# Command substitution strips trailing newlines, so an empty third line leaves _rest
+# with no newline at all and the strip above returns the tail unchanged. Both guards
+# are the same shape: if the cut found nothing, there was nothing there.
+[ "$_rest" = "$ready_spare" ] && ready_spare=""
+[ "$acct_out" = "$acct_head" ] && { acct_tail=""; ready_spare=""; }
 
 # ── Append the escape hatch only above the threshold
 suffix=""
 if [ -f "$CACHE" ]; then
   suffix=$(THRESHOLD="$THRESHOLD" WARN_MAX_AGE="$WARN_MAX_AGE" \
+    READY_SPARE="$ready_spare" KEYS="$CCD_DIR/providers/keys.env" \
     python3 - "$CACHE" 2>/dev/null <<'PY'
 # The loudest thing on the screen has to be the best qualified. Three gates, the same
 # three the arming path applies before it ends a session (scripts/quota-guard.sh,
 # quota_peak): the reading must be usable, recent, and about a window that still
 # exists. Without them a sample taken before a reset went on reading 96% afterwards,
 # and a swap left the previous account's 99% shouting beside the new account's 3%.
-import datetime, json, os, sys
+import datetime, json, os, re, sys
 path = sys.argv[1]
 try:
     d = json.load(open(path))
@@ -685,6 +705,27 @@ if age > float(os.environ["WARN_MAX_AGE"]):
 c = d.get("claude") or {}
 if c.get("available") is not True or c.get("error") is not False:
     sys.exit(0)
+
+
+def have_key():
+    """Is there an OpenRouter key to fall back to? Asked in here rather than in the
+    shell so the render path spawns nothing, and only once the warning is already
+    going to fire. Same shapes have_key() accepts in the hook."""
+    v = os.environ.get("OPENROUTER_API_KEY", "")
+    if v.strip():
+        return True
+    try:
+        text = open(os.environ["KEYS"], encoding="utf-8").read()
+    except OSError:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        m = re.match(r"^(?:export\s+)?OPENROUTER_API_KEY=(.*)$", line)
+        if m and m.group(1).strip().strip("\"'").strip():
+            return True
+    return False
 
 
 def spent(iso):
@@ -705,8 +746,28 @@ vals = [p for p, r in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
                        (c.get("sevenDayPercent"), c.get("sevenDayReset")))
         if isinstance(p, (int, float)) and spent(r)]
 if vals and max(vals) >= int(os.environ["THRESHOLD"]):
+    # Name the move that actually applies. The free hop between subscriptions comes
+    # first — it costs nothing and keeps a real Claude model — and OpenRouter is the
+    # last resort, which is the order the handoff path already takes ("Prefer another
+    # subscription over paying", scripts/quota-guard.sh). Offering `ccd -c` while a
+    # registered account sits there with room had it backwards.
+    #
+    # `!` runs the swap from inside the session, so the thread stays on screen.
+    spare = os.environ.get("READY_SPARE", "").strip()
+    if spare and spare != "?":
+        move = "!ccd account use " + spare
+    elif have_key():
+        move = "/exit then ccd -c"
+    elif spare == "?":
+        # The row says "spare ?" here. Saying "no spare" would turn not knowing into
+        # a claim, which is the distinction the row exists to keep.
+        move = "no known spare, no OpenRouter key"
+    else:
+        # Nothing to offer, and we did measure. Say so rather than name a route with
+        # nothing behind it — this is the moment when finding out costs the most.
+        move = "no spare with room, no OpenRouter key"
     # Red, bold — impossible to miss
-    print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → /exit then ccd -c\033[0m", end="")
+    print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → " + move + "\033[0m", end="")
 PY
 )
 fi
@@ -714,7 +775,16 @@ fi
 # The warning gets its own row — appended to the dashboard's last line it is
 # cut off by terminal-width truncation. The account segment shares that row when
 # both are present, so multi-account never costs more than one extra line.
-row="$acct_seg"
+#
+# When the warning names the spare, the row drops its own mention of it. The two
+# halves would otherwise spend the width twice on one account, and this row is
+# truncated: `!ccd account use sbigstar0930` clipped to `!ccd account use s` is not
+# a shorter instruction, it is a wrong one. The actionable half wins.
+row="$acct_head"
+case "$suffix" in
+  *"!ccd account use "*) ;;
+  *) [ -n "$acct_tail" ] && row="$row $(printf '\033[2m│\033[0m') $acct_tail" ;;
+esac
 if [ -n "$suffix" ]; then
   if [ -n "$row" ]; then
     row="$row $(printf '\033[2m│\033[0m') $suffix"

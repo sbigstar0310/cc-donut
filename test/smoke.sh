@@ -3748,6 +3748,12 @@ warn_row() {
   printf '%s' '{"model":{"id":"claude-fable-5"}}' \
     | "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g'
 }
+# Just the warning. The account segment shares the row and legitimately names the
+# spare there, so matching on the whole line cannot tell the two apart. Cut from the
+# ⚠ to the end rather than splitting on the box-drawing separator: `tr` works on
+# bytes, so a multi-byte separator makes it mangle the row instead of dividing it,
+# which is green on macOS and empty in both containers.
+hatch() { warn_row | grep -o '⚠.*' || true; }
 wcache() { # $1=5h $2=7d $3=5h reset $4=7d reset [$5=age seconds]
   printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"sevenDayPercent":%s,"fiveHourReset":"%s","sevenDayReset":"%s"}}\n' \
     "$1" "$2" "$3" "$4" > "$WDIR/quota-cache.json"
@@ -3835,6 +3841,95 @@ HOME="$FAKE" "$ACCT" --no-color use two --force >/dev/null 2>&1 \
   && ok "a swap drops the reading that was about the account it left" \
   || bad "swap cache" "kept a reading about the previous account"
 rm -rf "$ADIR"
+
+head_ "27c. the warning names the move that actually applies"
+# `ccd -c` is the paid last resort. Offering it while a registered subscription sits
+# there with room gets the order backwards — the plugin's own description is "hop to
+# your other Claude subscription first, OpenRouter as the last resort", and the
+# handoff path already agrees ("Prefer another subscription over paying").
+mkdir -p "$ADIR"
+rm -f "$SLQ"
+mk_sl_acct here; mk_sl_acct roomy
+printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+KEYF="$FAKE/.claude/ccd/providers/keys.env"
+mkdir -p "$(dirname "$KEYF")"
+
+# A spare with room: name it, and do not send anyone to a paid backbone.
+seed_rows here:ok:99:40:18000:518400 roomy:ok:8:12:18000:518400
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+case "$row" in
+  *"⚠ quota 99% → !ccd account use roomy") ok "with a spare that has room, the warning names the whole command" ;;
+  *"ccd -c"*) bad "warning target" "offered the paid hop with a spare sitting there: $row" ;;
+  *) bad "warning target" "not a command anyone can run: $row" ;;
+esac
+# ...and the row does not then spend its width saying the same account twice.
+full=$(warn_row)
+case "$full" in
+  *"spare roomy"*) bad "warning target" "named roomy in the row and in the command: $full" ;;
+  *"claude:here"*) ok "...and the row drops the spare it is about to name" ;;
+  *) bad "warning target" "lost the account row: $full" ;;
+esac
+
+# Every subscription spent, key configured: the paid hop is the answer again.
+seed_rows here:ok:99:40:18000:518400 roomy:ok:97:96:18000:518400
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+case "$row" in
+  *"⚠ quota 99% → /exit then ccd -c") ok "...and with every subscription spent it is ccd -c again" ;;
+  *) bad "warning target" "did not fall back to the paid hop: $row" ;;
+esac
+
+# Nothing registered at all is the same answer by a different route.
+rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+case "$row" in
+  *"⚠ quota 99% → /exit then ccd -c") ok "...as is having registered no spare in the first place" ;;
+  *) bad "warning target" "got: $row" ;;
+esac
+
+# No spare with room AND no key: there is nowhere to go, and knowing that before the
+# quota hits zero is the whole point of putting it on screen.
+mv "$KEYF" "$KEYF.bak" 2>/dev/null || true
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+case "$row" in
+  *"⚠ quota 99% → no spare with room, no OpenRouter key") \
+    ok "with no spare and no key it says so, and names nothing it cannot deliver" ;;
+  *"ccd -c"*) bad "warning target" "pointed at a backbone with no key behind it: $row" ;;
+  *"account use"*) bad "warning target" "named a spare it does not have: $row" ;;
+  *) bad "warning target" "got: $row" ;;
+esac
+
+# Measured-and-none is not the same as never-measured. The row says "spare ?" for the
+# second, and the warning must not turn not knowing into a claim. Registered accounts
+# with no rows at all is what "never measured" looks like.
+mk_sl_acct here; mk_sl_acct unseen
+printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+rm -f "$SLQ"
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+case "$row" in
+  *"⚠ quota 99% → no known spare, no OpenRouter key") \
+    ok "...and with nothing measured it says it does not know" ;;
+  *"no spare with room"*) bad "warning target" "claimed there is no spare without having looked: $row" ;;
+  *) bad "warning target" "got: $row" ;;
+esac
+mv "$KEYF.bak" "$KEYF" 2>/dev/null || true
+
+# A spare that needs a re-login is not a spare with room.
+mk_sl_acct here; mk_sl_acct broken
+printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+seed_rows here:ok:99:40:18000:518400 broken:dead:-:-:-:-
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+case "$row" in
+  *"broken"*) bad "warning target" "sent the user to an account that cannot answer: $row" ;;
+  *"⚠ quota 99% → /exit then ccd -c") ok "a spare that needs a re-login is not offered as the escape" ;;
+  *) bad "warning target" "got: $row" ;;
+esac
+rm -rf "$ADIR"; mkdir -p "$ADIR"
 
 head_ "28. no claude-dashboard installed"
 # ccd reads Claude quota to do three things: warn before exhaustion, notice a
@@ -3955,6 +4050,11 @@ rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
 mk_sl_acct main; mk_sl_acct backup
 printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows main:ok:0:22:18000:600000 backup:ok:20:30:18000:600000
+# Below the warning threshold on purpose: this section is about the row surviving a
+# missing dashboard, and above it the row hands its spare to the warning instead of
+# naming it twice (27c), which would be a different thing being tested.
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20,"fiveHourReset":"R1","sevenDayReset":"D1"}}\n' \
+  > "$CCDD/quota-cache.json"
 row=$(sl_spare)
 case "$row" in
   *"spare backup"*) ok "the spare row still names the account to hop to" ;;
