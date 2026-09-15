@@ -1240,6 +1240,20 @@ esac
 [ ! -f "$HSTATE" ] && ok "handoff is disarmed before relaunching" \
   || bad "stale handoff left armed"
 
+# Consent is checked again here, not only where the hop was armed. The two moments
+# are separated by the whole of Claude Code's shutdown, and a `--no-auto` inside
+# that window must not be outrun by a hop armed a minute earlier.
+rm -f "$FAKE/.claude/ccd/paid-handoff"
+: > "$FAKE/.claude/projects/-tmp/sess-revoked.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-revoked","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
+case "$out" in
+  *CCD-RESUMED*) bad "revoked paid hop" "billed on a permission that was withdrawn" ;;
+  *"claude --resume sess-revoked"*) ok "a paid hop whose opt-in was withdrawn does not relaunch" ;;
+  *) bad "revoked paid hop" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+: > "$FAKE/.claude/ccd/paid-handoff"
+
 # to_subscription goes back to the real binary, not to ccd.
 fake_real '#!/bin/sh
 [ "$1" = --resume ] && { echo "REAL-RESUMED:$*"; exit 0; }

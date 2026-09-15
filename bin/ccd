@@ -1090,13 +1090,11 @@ RC_OTHERS
 setup() {
   local launcher="$HOME/.local/bin/ccd" statusline_launcher="$CCD_DIR/statusline-launcher.sh"
   local settings="$HOME/.claude/settings.json"
-  # auto_inert records that the launcher was written but nothing can reach it.
-  # Reported at the very end, and as this function's exit status: an install that
-  # produced nothing runnable is a failed install, however much else went right.
-  # auto_fix carries the remedy for the branch that set it — `--auto --yes` fixes a
-  # declined prompt and nothing else, so a single blanket instruction would send
-  # two of the four paths somewhere that cannot help them.
-  local auto=0 assume_yes=0 auto_next="" auto_inert=0 auto_fix=""
+  # What went wrong, and what to do about it. Reported at the very end and as this
+  # function's exit status, because an install that produced nothing runnable is a
+  # failed install however much else went right. The remedy travels with the
+  # failure: `--auto --yes` repairs a declined prompt and nothing else.
+  local auto=0 assume_yes=0 auto_next="" fail="" fix=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --auto)    auto=1; shift ;;
@@ -1168,7 +1166,15 @@ CCD_CLAUDE_SHIM
       # Written before the PATH work, so a run that ends inert still records the
       # consent it was given. The two are independent: consent does not expire
       # because a startup file could not be edited.
-      : > "$CCD_PAID_OPTIN" 2>/dev/null || true
+      #
+      # Checked, not fire-and-forget. An unwritten record means the paid hop will
+      # not arm, so swallowing the failure would leave setup promising a hop that
+      # cannot happen — the same class of silent half-install this release exists
+      # to end.
+      if ! { : > "$CCD_PAID_OPTIN"; } 2>/dev/null; then
+        fail="the paid-hop opt-in could not be recorded — subscription hops still work"
+        fix="make $(tilde "$CCD_DIR") writable, then re-run: ccd setup --auto"
+      fi
       printf '✓ automatic handoff installed at %s\n' "$(tilde "$claude_shim")"
       printf '  %sWhen your Claude quota runs out, sessions continue on your other%s\n' "$d" "$r"
       printf '  %ssubscription if one has room, with nothing billed. OpenRouter (paid,%s\n' "$d" "$r"
@@ -1211,15 +1217,15 @@ CCD_CLAUDE_SHIM
               printf '%s⚠ could not record ownership in %s — leaving %s alone.%s\n' \
                 "$ylw" "$(tilde "$CCD_PATH_TARGET")" "$(tilde "$rc")" "$r"
               printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
-              auto_inert=1
-              auto_fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
+              fail="automatic handoff is installed but not active"
+              fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
             elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
               printf '✓ added to %s\n' "$(tilde "$rc")"
               auto_next="source $(tilde "$rc")"
             else
               printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
-              auto_inert=1
-              auto_fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
+              fail="automatic handoff is installed but not active"
+              fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
             fi
           elif path_export_present "$rc"; then
             # Declining to add a second copy of a line that is already in the file
@@ -1231,18 +1237,18 @@ CCD_CLAUDE_SHIM
           else
             printf '  %sSkipped — automatic handoff is installed but not active yet.%s\n' "$ylw" "$r"
             printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
-            auto_inert=1
-            auto_fix="ccd setup --auto --yes   (then open a new terminal)"
+            fail="automatic handoff is installed but not active"
+            fix="ccd setup --auto --yes   (then open a new terminal)"
           fi
         elif [ -n "${rc:-}" ]; then
           printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
         else
           printf '\n  %sAdd this to your shell startup file, then open a new terminal:%s\n' "$d" "$r"
           printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
-          auto_inert=1
           # rc_file() declined to name a startup file for this shell, and --yes
           # cannot change that. Only the user can place the line.
-          auto_fix="add the line above to your shell startup file, then open a new terminal"
+          fail="automatic handoff is installed but not active"
+          fix="add the line above to your shell startup file, then open a new terminal"
         fi
       fi
       ;;
@@ -1252,10 +1258,15 @@ CCD_CLAUDE_SHIM
       elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
         printf '%s⚠ %s is not a ccd shim — left alone%s\n' "$ylw" "$(tilde "$claude_shim")" "$r"
       fi
-      # Consent goes with the feature it was given for. Leaving it behind would
-      # mean a later `ccd setup --auto` silently inherited an answer the user gave
-      # before they turned the whole thing off.
-      rm -f "$CCD_PAID_OPTIN" 2>/dev/null || true
+      # Consent goes with the feature it was given for, or a later `--auto` would
+      # inherit an answer given before the user turned the whole thing off. A
+      # revocation that did not happen must never be reported as one: it is the
+      # only failure here that can still cost money.
+      rm -f "$CCD_PAID_OPTIN" 2>/dev/null
+      if [ -f "$CCD_PAID_OPTIN" ]; then
+        fail="the paid-hop opt-in could not be removed — it is still in effect"
+        fix="delete $(tilde "$CCD_PAID_OPTIN") to withdraw it"
+      fi
       # Take the PATH line back out with the shim: an entry pointing at a
       # directory we just emptied is litter in someone's startup file.
       remove_path_line_everywhere || true
@@ -1327,12 +1338,10 @@ PY
   # Everything else setup does has already been written by now, so this reports the
   # one part that did not take, and fails, rather than reaching for an exit status
   # that would undo the rest.
-  if [ "$auto_inert" -eq 1 ]; then
-    printf '\n%s✗ automatic handoff is installed but not active — no session will hand off yet.%s\n' "$red" "$r" >&2
-    printf '%s     Finish it with:  %s%s\n' "$d" "$auto_fix" "$r" >&2
-    return 1
-  fi
-  return 0
+  [ -n "$fail" ] || return 0
+  printf '\n%s✗ %s.%s\n' "$red" "$fail" "$r" >&2
+  printf '%s     Fix:  %s%s\n' "$d" "$fix" "$r" >&2
+  return 1
 }
 
 uninstall() {

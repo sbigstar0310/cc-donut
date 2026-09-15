@@ -77,6 +77,11 @@ ccd_bin() {
   ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd 2>/dev/null | sort -V | tail -1
 }
 
+# quota-guard checks this before it arms; this is the boundary. Not redundant —
+# arming and relaunching are separated by the whole of Claude Code's shutdown, and
+# a `ccd setup --no-auto` inside that window must not be outrun by an older hop.
+paid_optin() { [ -f "$HOME/.claude/ccd/paid-handoff" ]; }
+
 # ccd-account ships beside this file; prefer the sibling so a plugin update moves
 # both together, and fall back to the newest installed copy when this script was
 # invoked through a path that does not carry its siblings.
@@ -349,6 +354,14 @@ while :; do
       backbone=subscription
       ;;
     to_fallback)
+      # Revoked since this was armed: stop rather than bill on a permission that
+      # no longer exists. The conversation is still there.
+      if ! paid_optin; then
+        printf '\nccd: OpenRouter 자동 전환이 꺼져 있습니다 — 과금 없이 여기서 멈춥니다.\n' >&2
+        printf '   이어서 하려면: claude --resume %s\n' "$sid" >&2
+        printf '   유료 전환을 허용하려면: ccd setup --auto\n' >&2
+        exit "$rc"
+      fi
       if [ "$resumed" -eq 1 ]; then
         printf '\n\033[33m▶ 🍩 Claude 쿼타 소진 — 같은 대화를 OpenRouter에서 이어갑니다 (유료)\033[0m\n'
         printf '\033[2m   회복되면 구독으로 자동 복귀합니다\033[0m\n'
