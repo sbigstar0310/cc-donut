@@ -3942,6 +3942,113 @@ row=$(hatch)
   && ok "a spare that needs a re-login is not offered as the escape" || bad "warning target" "got: $row"
 rm -rf "$ADIR"; mkdir -p "$ADIR"
 
+head_ "27d. a session that cannot hand off says so where you are looking"
+# The whole of #21 was an install that sat inert for four days while every surface
+# except `ccd doctor` reported success. doctor is the command nobody runs BEFORE the
+# thing they installed fails to happen; this row is the one people actually read, and
+# it already carries "needs re-login" for the same reason.
+rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
+mk_sl_acct main; mk_sl_acct backup
+printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+seed_rows main:ok:0:22:18000:600000 backup:ok:20:30:18000:600000
+# Below the threshold: this section is about supervision, not about the warning.
+# (CCDD is not defined until section 28; WDIR from 27b names the same directory.)
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20,"fiveHourReset":"R1","sevenDayReset":"D1"}}\n' \
+  > "$WDIR/quota-cache.json"
+SHIMD="$FAKE/.claude/ccd/bin"
+sl_env() { env -u CCD_HANDOFF "$@" HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
+             | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:'; }
+
+# Nothing installed: there is no launcher, so no session can hand off.
+rm -rf "$SHIMD"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"not supervised"*) ok "with no launcher the row says the handoff cannot fire" ;;
+  *) bad "supervision" "said nothing about it: $row" ;;
+esac
+
+# Installed but unreachable — the exact state that stranded the reporter.
+mkdir -p "$SHIMD"; printf '#!/bin/sh\n' > "$SHIMD/claude"; chmod +x "$SHIMD/claude"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"not supervised"*) ok "...and an installed launcher that is not on PATH is the same answer" ;;
+  *) bad "supervision" "counted an unreachable launcher as working: $row" ;;
+esac
+
+# On PATH but with no token: this session started before the launcher did, and
+# nothing here can hand off either.
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | PATH="$SHIMD:$PATH" sl_env)
+case "$row" in
+  *"not supervised"*) ok "a session that predates the launcher is not called supervised" ;;
+  *) bad "supervision" "got: $row" ;;
+esac
+
+# A token the hook would refuse must not read as supervision here. launcher_present()
+# wants 32 lowercase hex and the state path that token implies; anything weaker calls
+# a session supervised that the hook will then decline to signal.
+HST="$FAKE/.claude/ccd/handoff-00000000000000000000000000000001.json"
+for bad_tok in "x" "0000000000000000000000000000000" "0000000000000000000000000000000G"; do
+  row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+          | CCD_HANDOFF="$bad_tok" CCD_HANDOFF_STATE="$HST" HOME="$FAKE" \
+            "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:')
+  case "$row" in
+    *"not supervised"*) : ;;
+    *) bad "supervision" "a token the hook rejects read as supervised: '$bad_tok' -> $row" ;;
+  esac
+done
+ok "a malformed token is not supervision"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+        | CCD_HANDOFF=00000000000000000000000000000001 CCD_HANDOFF_STATE="$FAKE/elsewhere.json" \
+          HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:')
+case "$row" in
+  *"not supervised"*) ok "...and neither is a good token with the wrong state path" ;;
+  *) bad "supervision" "accepted a mismatched state path: $row" ;;
+esac
+
+# Supervised: say nothing. A row that warns when everything is fine is a row people
+# learn not to read.
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+        | CCD_HANDOFF=00000000000000000000000000000001 CCD_HANDOFF_STATE="$HST" \
+          PATH="$SHIMD:$PATH" HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
+        | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:')
+case "$row" in
+  *"not supervised"*) bad "supervision" "warned a supervised session: $row" ;;
+  *"spare backup"*) ok "a session holding the hook's own contract is told nothing" ;;
+  *) bad "supervision" "got: $row" ;;
+esac
+
+# The note yields to the quota warning. Its job is to be read BEFORE the quota runs
+# out; at the moment it has, the command in the warning is what to act on, and this
+# row is truncated at terminal width — the same rule that made the row drop its own
+# mention of the spare in 27c. Two things competing for the end of a truncated line
+# is how a command becomes a different command.
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":99,"sevenDayPercent":40,"fiveHourReset":"%s","sevenDayReset":"%s"}}\n' \
+  "$(iso 3600)" "$(iso 500000)" > "$WDIR/quota-cache.json"
+row=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' | sl_env)
+case "$row" in
+  *"not supervised"*) bad "supervision" "crowded the command it was standing in front of: $row" ;;
+  *"quota 99%"*) ok "the note stands aside while the warning has something to say" ;;
+  *) bad "supervision" "got: $row" ;;
+esac
+# ...and comes back once the quota does.
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20,"fiveHourReset":"R1","sevenDayReset":"D1"}}\n' \
+  > "$WDIR/quota-cache.json"
+row=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' | sl_env)
+case "$row" in
+  *"not supervised"*) ok "...and is back as soon as the alarm stops" ;;
+  *) bad "supervision" "the note did not return: $row" ;;
+esac
+
+# One account has nowhere to hand off to, so the warning would be noise.
+rm -f "$ADIR/backup.json"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"not supervised"*) bad "supervision" "warned with nowhere to hand off: $row" ;;
+  *"claude:main"*) ok "with one account there is nothing to warn about" ;;
+  *) bad "supervision" "the row did not render at all: '$row'" ;;
+esac
+rm -rf "$ADIR" "$SHIMD"; mkdir -p "$ADIR"
+
 head_ "28. no claude-dashboard installed"
 # ccd reads Claude quota to do three things: warn before exhaustion, notice a
 # reset, and corroborate a rate_limit before arming a handoff. claude-dashboard
