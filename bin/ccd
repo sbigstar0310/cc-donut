@@ -982,6 +982,14 @@ shim_leads_path() {
 
 path_line_present() { [ -f "$1" ] && grep -qxF "$CCD_PATH_SIG" "$1"; }
 
+# Whether the export is in the file at all, however it got there. Deliberately a
+# different question from path_line_present, which asks only about OUR marker
+# because removal must never touch a line we did not write. Ownership decides what
+# we may delete; presence decides whether the wiring is done. A user who added the
+# line by hand has a working install, and must not be told it failed just because
+# we cannot claim their line.
+path_export_present() { [ -f "$1" ] && grep -qxF "$CCD_PATH_LINE" "$1"; }
+
 # Take back exactly what we wrote: our marker, and the line after it only when it
 # is still verbatim the export we put there. If the user edited that line it is
 # theirs now — drop the marker and leave their edit alone. Deleting a line we did
@@ -1059,7 +1067,13 @@ RC_OTHERS
 setup() {
   local launcher="$HOME/.local/bin/ccd" statusline_launcher="$CCD_DIR/statusline-launcher.sh"
   local settings="$HOME/.claude/settings.json"
-  local auto=0 assume_yes=0 auto_next=""
+  # auto_inert records that the launcher was written but nothing can reach it.
+  # Reported at the very end, and as this function's exit status: an install that
+  # produced nothing runnable is a failed install, however much else went right.
+  # auto_fix carries the remedy for the branch that set it — `--auto --yes` fixes a
+  # declined prompt and nothing else, so a single blanket instruction would send
+  # two of the four paths somewhere that cannot help them.
+  local auto=0 assume_yes=0 auto_next="" auto_inert=0 auto_fix=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --auto)    auto=1; shift ;;
@@ -1170,21 +1184,38 @@ CCD_CLAUDE_SHIM
               printf '%s⚠ could not record ownership in %s — leaving %s alone.%s\n' \
                 "$ylw" "$(tilde "$CCD_PATH_TARGET")" "$(tilde "$rc")" "$r"
               printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
+              auto_inert=1
+              auto_fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
             elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
               printf '✓ added to %s\n' "$(tilde "$rc")"
               auto_next="source $(tilde "$rc")"
             else
               printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
+              auto_inert=1
+              auto_fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
             fi
+          elif path_export_present "$rc"; then
+            # Declining to add a second copy of a line that is already in the file
+            # is not a failed install. It carries no marker of ours, so the user
+            # wrote it themselves; the wiring is done and only a shell started
+            # since it landed is missing.
+            printf '  %s✓ that line is already in %s — open a new terminal%s\n' \
+              "$grn" "$(tilde "$rc")" "$r"
           else
             printf '  %sSkipped — automatic handoff is installed but not active yet.%s\n' "$ylw" "$r"
             printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
+            auto_inert=1
+            auto_fix="ccd setup --auto --yes   (then open a new terminal)"
           fi
         elif [ -n "${rc:-}" ]; then
           printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
         else
           printf '\n  %sAdd this to your shell startup file, then open a new terminal:%s\n' "$d" "$r"
           printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
+          auto_inert=1
+          # rc_file() declined to name a startup file for this shell, and --yes
+          # cannot change that. Only the user can place the line.
+          auto_fix="add the line above to your shell startup file, then open a new terminal"
         fi
       fi
       ;;
@@ -1258,6 +1289,19 @@ PY
     printf '\n%s→ One thing left: that PATH line only reaches shells started from now on.%s\n' "$b" "$r"
     printf '%s     Open a new terminal, or run:  %s%s\n' "$b" "$auto_next" "$r"
   fi
+  # The shim on disk is not the feature. Without a PATH entry ahead of the real
+  # claude, no session is ever supervised, the quota-guard hook fails closed at
+  # launcher_present(), and a handoff cannot fire — which is exactly how an install
+  # sat inert for four days while everything except `ccd doctor` reported success.
+  # Everything else setup does has already been written by now, so this reports the
+  # one part that did not take, and fails, rather than reaching for an exit status
+  # that would undo the rest.
+  if [ "$auto_inert" -eq 1 ]; then
+    printf '\n%s✗ automatic handoff is installed but not active — no session will hand off yet.%s\n' "$red" "$r" >&2
+    printf '%s     Finish it with:  %s%s\n' "$d" "$auto_fix" "$r" >&2
+    return 1
+  fi
+  return 0
 }
 
 uninstall() {
@@ -1371,7 +1415,10 @@ exec_claude() {
 
 case "${1:-}" in
   ""|status|help|-h|--help) status; exit 0 ;;
-  setup)  shift; setup "$@"; exit 0 ;;
+  # Propagate setup's verdict instead of overwriting it: `exit 0` here made an
+  # install that left automatic handoff inert indistinguishable from one that
+  # worked, for every caller and every script.
+  setup)  shift; setup "$@"; exit $? ;;
   uninstall) shift; uninstall "$@"; exit 0 ;;
   key)    set_key; exit 0 ;;
   models) [ -f "$CATALOG" ] || die "Catalog not found: $CATALOG"; show_models; exit 0 ;;

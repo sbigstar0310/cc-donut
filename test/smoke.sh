@@ -1729,6 +1729,105 @@ HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
 rm -f "$RC"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
+head_ "18c. an install that leaves handoff inert must not report success"
+# The failure this section exists for: `ccd setup --auto` ran, wrote the shim, could
+# not get the PATH line in, printed "Skipped", and exited 0. Automatic handoff was
+# dead for four days while every surface but `ccd doctor` agreed it was fine, and the
+# user found out by being stranded at 100% quota with a healthy spare registered.
+#
+# An install that produced nothing runnable is a failed install. This is the same rule
+# 18b already applies to the other direction — "reports the failure instead of claiming
+# success" — pointed at install rather than removal.
+export SHELL=/bin/zsh
+RC="$FAKE/.zshrc"
+rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path"
+printf '# my own file\n' > "$RC"
+
+# No terminal and no --yes: the PATH line is skipped, so nothing can hand off.
+# `bare` gives the child no controlling terminal, so the consent branch is reached
+# for the reason this test claims. Command substitution alone does not: it redirects
+# stdout and leaves /dev/tty open, so on a developer's machine setup would prompt.
+python3 - "$FAKE/.claude/settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop("statusLine", None)          # so the assertion below measures THIS run
+json.dump(d, open(p, "w"))
+PYX
+python3 "$FAKE/ttyask.py" bare none "$FAKE/.ask-out" \
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --auto >/dev/null 2>&1; st=$?
+out=$(cat "$FAKE/.ask-out")
+[ "$st" -ne 0 ] \
+  && ok "a skipped PATH line makes setup exit non-zero (got $st)" \
+  || bad "inert install" "exited 0 while automatic handoff was left inert"
+case "$out" in
+  *"not active"*) ok "...and says so in words" ;;
+  *) bad "inert install" "no explanation: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
+esac
+[ -x "$SHIM" ] \
+  && ok "...and the shim stays, so --yes can finish what this run started" \
+  || bad "inert install" "removed the shim as well"
+
+# Everything else setup does must still happen: the wiring is not all-or-nothing, and
+# a non-zero exit that also skipped the statusline would trade one silence for another.
+[ "$(python3 -c "
+import json;d=json.load(open('$FAKE/.claude/settings.json'))
+print('statusline-launcher.sh' in ((d.get('statusLine') or {}).get('command') or ''))")" = "True" ] \
+  && ok "...and the rest of setup still ran (statusline wired)" \
+  || bad "inert install" "a failed PATH line took the statusline down with it"
+
+# The same run with consent completes, and must not be dragged down with it.
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>&1); st=$?
+[ "$st" -eq 0 ] \
+  && ok "a completed install still exits 0" \
+  || bad "completed install" "exited $st: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)"
+
+# An rc file that cannot be written is the same failure by another route. Only
+# meaningful as a non-root user — root writes through a read-only file.
+if [ "$(id -u)" -ne 0 ]; then
+  rm -f "$FAKE/.claude/ccd/auto-path"
+  mkdir -p "$FAKE/rodir"; printf '# theirs\n' > "$FAKE/rodir/.zshrc"
+  chmod 400 "$FAKE/rodir/.zshrc"
+  out=$(ZDOTDIR="$FAKE/rodir" HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes 2>&1); st=$?
+  chmod 600 "$FAKE/rodir/.zshrc"
+  [ "$st" -ne 0 ] \
+    && ok "an rc file that cannot be written also exits non-zero (got $st)" \
+    || bad "unwritable rc" "exited 0 after failing to write the PATH line"
+  rm -rf "$FAKE/rodir"
+fi
+
+# A line the user added by hand carries no marker of ours, so we cannot claim it —
+# but the wiring is done and a new terminal is all that is missing. Declining to add
+# a second copy of it is not a failed install.
+rm -f "$SHIM" "$FAKE/.claude/ccd/auto-path"
+printf '# my own file\nexport PATH="$HOME/.claude/ccd/bin:$PATH"\n' > "$RC"
+python3 "$FAKE/ttyask.py" bare none "$FAKE/.ask-out" \
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --auto >/dev/null 2>&1; st=$?
+[ "$st" -eq 0 ] \
+  && ok "an export already in the file is not reported as a failed install" \
+  || bad "already wired" "exited $st although the PATH line was already there"
+[ "$(grep -c 'ccd/bin:\$PATH' "$RC")" = "1" ] \
+  && ok "...and no second copy of the line is added" \
+  || bad "already wired" "line count is now $(grep -c 'ccd/bin:\$PATH' "$RC")"
+grep -q 'ccd-auto-handoff-path' "$RC" \
+  && bad "already wired" "claimed a line the user wrote by adding our marker" \
+  || ok "...and their line is still theirs, unmarked"
+
+# A bare `ccd setup` asks for nothing and promises nothing, so it cannot fail this
+# way. It is also the ordinary install path — making it exit non-zero would turn a
+# routine plugin install into a reported failure.
+rm -f "$RC"; printf '# my own file\n' > "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1; st=$?
+[ "$st" -eq 0 ] && ok "a bare setup exits 0" || bad "bare setup" "exited $st"
+
+# Turning the feature off on purpose is not a failure.
+rm -f "$RC"; printf '# my own file\n' > "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1; st=$?
+[ "$st" -eq 0 ] && ok "--no-auto exits 0" || bad "--no-auto" "exited $st"
+rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+
+
 head_ "19. automatic handoff: readiness gates"
 # Each of these ends a session, so each must fail closed. A key ccd would later
 # reject is the same as no key: the session would end with nowhere to go.

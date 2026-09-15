@@ -30,3 +30,17 @@ Key handling follows the `key` skill: chat paste only with the consent notice,
 never echo a full key back, never write it anywhere but through `ccd key`.
 Never edit files directly; the script owns all writes. If the script fails,
 show the error and stop.
+
+## A non-zero exit is not always a dead end
+
+`ccd setup` exits non-zero when it finished everything else but could not put the
+launcher on PATH, so automatic handoff is installed and inert. Its last line says
+so. That is worth relaying prominently — a quota handoff cannot fire until it is
+fixed — but it is not a reason to abandon the rest of this skill: the statusline,
+hooks and `ccd` command are all already wired by that point. Relay that last line
+verbatim, including the remedy it names, and carry on with the key and `ccd doctor`
+steps above. Stop only when setup failed before doing any of that.
+
+Do not substitute your own remedy. `ccd setup --auto --yes` fixes a declined prompt
+and nothing else — an unwritable startup file or a shell ccd will not edit needs the
+user to place the line by hand, and setup says which case it hit.
