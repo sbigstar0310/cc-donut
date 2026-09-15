@@ -444,6 +444,9 @@ else:
 # someone@example.com beats a bare "?" that tells you nothing.
 display = active or (ident_email.split("@")[0] if ident_email else "")
 if not display:
+    # Nothing to name, but the third line still has to say what we know about
+    # spares: an empty directory is an answer, an unidentifiable session is not.
+    print(); print(); print("-" if not names else "?", end="")
     raise SystemExit(0)
 if len(display) > 18:            # long email local parts must not eat the row
     display = display[:17] + "…"
@@ -594,7 +597,8 @@ if unregistered:
 # rather than spending the row on the answer "you have one account" at someone who
 # never asked for the feature. It is also what makes the states below exhaustive.
 if len(names) < 2:
-    print(head); print(); print()
+    # One account is the one we are on, so there is no spare — measured, not unknown.
+    print(head); print(); print("-", end="")
     raise SystemExit(0)
 
 # The spare is the whole point of registering a second account, so say whether one
@@ -616,7 +620,7 @@ if len(names) < 2:
 # Each list carries the number that answers ITS question, so the two render
 # branches stay the same shape: with room, how long the squeeze lasts; without,
 # how long until there is room at all.
-ready, dead, full = [], [], []
+ready, dead, full, unknown = [], [], [], 0
 for n in names:
     if n == active:
         continue
@@ -626,7 +630,8 @@ for n in names:
         continue
     p, eases, frees = reading(n)
     if p is None:
-        continue              # never yet probed, or the reading failed
+        unknown += 1          # never yet probed, or the reading failed
+        continue
     if p < HEADROOM:
         ready.append((p, n, eases))
     else:
@@ -642,10 +647,18 @@ def short(n, w=14):
 
 # The percentage says whether to switch; the countdown says whether to wait
 # instead. Naming the spare without either left both questions open (#16).
-# Line three tells the warning below what we actually know: a name, "" for "measured
-# and none of them has room", or "?" for "nothing has been measured". The row already
-# draws that distinction and the warning must not flatten it into a claim.
-best = ready[0][1] if ready else ("" if (dead or full) else "?")
+# Line three tells the warning below what we actually know: a name, "" for "every
+# spare was measured and none has room", or "?" for "at least one was not". A spare
+# we could not measure is not a spare without room, so one of those is enough to
+# make the negative claim unsafe — a measured-full account beside an unmeasured one
+# says nothing about the unmeasured one.
+#
+# A newline would be read as the end of this line by the splitter below, so a name
+# carrying one cannot be named at all. NAME_RE ends in `$`, which Python matches
+# before a trailing newline, so this is reachable.
+best = ready[0][1] if ready else ("?" if unknown else "-")
+if "\n" in best:
+    best = "?"
 if ready:
     p, n, secs = ready[0]
     more = f"{DIM} +{len(ready) - 1}{RS}" if len(ready) > 1 else ""
@@ -666,7 +679,7 @@ else:
 # head and tail on their own lines: when the warning names the spare, repeating it in
 # the row would spend the width twice on one fact, and the row is truncated at
 # terminal width. bash decides which halves to keep.
-print(head); print(tail); print(best, end="")
+print(head.replace("\n", " ")); print(tail.replace("\n", " ")); print(best, end="")
 PY
 )
 
@@ -681,6 +694,10 @@ ready_spare=${_rest#*$'\n'}
 # are the same shape: if the cut found nothing, there was nothing there.
 [ "$_rest" = "$ready_spare" ] && ready_spare=""
 [ "$acct_out" = "$acct_head" ] && { acct_tail=""; ready_spare=""; }
+# Nothing at all came back: the block gave up before it could look, which is not the
+# same as looking and finding none.
+# No output at all means the block could not even start; that is not an answer.
+[ -z "$acct_out" ] && ready_spare="?"
 
 # ── Append the escape hatch only above the threshold
 suffix=""
@@ -716,14 +733,14 @@ def have_key():
         return True
     try:
         text = open(os.environ["KEYS"], encoding="utf-8").read()
-    except OSError:
+    except Exception:
         return False
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#"):
             continue
         m = re.match(r"^(?:export\s+)?OPENROUTER_API_KEY=(.*)$", line)
-        if m and m.group(1).strip().strip("\"'").strip():
+        if m and m.group(1).strip().strip('"').strip("'").strip():
             return True
     return False
 
@@ -754,11 +771,19 @@ if vals and max(vals) >= int(os.environ["THRESHOLD"]):
     #
     # `!` runs the swap from inside the session, so the thread stays on screen.
     spare = os.environ.get("READY_SPARE", "").strip()
-    if spare and spare != "?":
+    # Past this the command cannot be relied on to survive the row's truncation, and
+    # a clipped account name is a different account, not a shorter one. Names may be
+    # 64 characters (NAME_RE, bin/ccd-account:90); no arrangement of this row fits
+    # one of those, so the long case gets an instruction that is complete at any
+    # length instead of a command that might not be.
+    named = spare not in ("", "?", "-")
+    if named and len(spare) <= 32:
         move = "!ccd account use " + spare
+    elif named:
+        move = "a spare has room: ccd account list"
     elif have_key():
         move = "/exit then ccd -c"
-    elif spare == "?":
+    elif spare != "-":
         # The row says "spare ?" here. Saying "no spare" would turn not knowing into
         # a claim, which is the distinction the row exists to keep.
         move = "no known spare, no OpenRouter key"

@@ -3849,58 +3849,47 @@ head_ "27c. the warning names the move that actually applies"
 # handoff path already agrees ("Prefer another subscription over paying").
 mkdir -p "$ADIR"
 rm -f "$SLQ"
-mk_sl_acct here; mk_sl_acct roomy
+mk_sl_acct here; mk_sl_acct roomyspare
 printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 KEYF="$FAKE/.claude/ccd/providers/keys.env"
 mkdir -p "$(dirname "$KEYF")"
 
 # A spare with room: name it, and do not send anyone to a paid backbone.
-seed_rows here:ok:99:40:18000:518400 roomy:ok:8:12:18000:518400
+seed_rows here:ok:99:40:18000:518400 roomyspare:ok:8:12:18000:518400
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-case "$row" in
-  *"⚠ quota 99% → !ccd account use roomy") ok "with a spare that has room, the warning names the whole command" ;;
-  *"ccd -c"*) bad "warning target" "offered the paid hop with a spare sitting there: $row" ;;
-  *) bad "warning target" "not a command anyone can run: $row" ;;
-esac
+[ "$row" = "⚠ quota 99% → !ccd account use roomyspare" ] \
+  && ok "with a spare that has room, the warning is exactly the command to run" || bad "warning target" "got: $row"
 # ...and the row does not then spend its width saying the same account twice.
 full=$(warn_row)
 case "$full" in
-  *"spare roomy"*) bad "warning target" "named roomy in the row and in the command: $full" ;;
+  *"spare roomyspare"*) bad "warning target" "named it in the row and in the command: $full" ;;
+  *"ccd -c"*) bad "warning target" "named the paid route anywhere on a row about a free hop: $full" ;;
   *"claude:here"*) ok "...and the row drops the spare it is about to name" ;;
   *) bad "warning target" "lost the account row: $full" ;;
 esac
 
 # Every subscription spent, key configured: the paid hop is the answer again.
-seed_rows here:ok:99:40:18000:518400 roomy:ok:97:96:18000:518400
+seed_rows here:ok:99:40:18000:518400 roomyspare:ok:97:96:18000:518400
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-case "$row" in
-  *"⚠ quota 99% → /exit then ccd -c") ok "...and with every subscription spent it is ccd -c again" ;;
-  *) bad "warning target" "did not fall back to the paid hop: $row" ;;
-esac
+[ "$row" = "⚠ quota 99% → /exit then ccd -c" ] \
+  && ok "...and with every subscription spent it is ccd -c again" || bad "warning target" "got: $row"
 
 # Nothing registered at all is the same answer by a different route.
 rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-case "$row" in
-  *"⚠ quota 99% → /exit then ccd -c") ok "...as is having registered no spare in the first place" ;;
-  *) bad "warning target" "got: $row" ;;
-esac
+[ "$row" = "⚠ quota 99% → /exit then ccd -c" ] \
+  && ok "...as is having registered no spare in the first place" || bad "warning target" "got: $row"
 
 # No spare with room AND no key: there is nowhere to go, and knowing that before the
 # quota hits zero is the whole point of putting it on screen.
 mv "$KEYF" "$KEYF.bak" 2>/dev/null || true
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-case "$row" in
-  *"⚠ quota 99% → no spare with room, no OpenRouter key") \
-    ok "with no spare and no key it says so, and names nothing it cannot deliver" ;;
-  *"ccd -c"*) bad "warning target" "pointed at a backbone with no key behind it: $row" ;;
-  *"account use"*) bad "warning target" "named a spare it does not have: $row" ;;
-  *) bad "warning target" "got: $row" ;;
-esac
+[ "$row" = "⚠ quota 99% → no spare with room, no OpenRouter key" ] \
+  && ok "with no spare and no key it says so, and names nothing it cannot deliver" || bad "warning target" "got: $row"
 
 # Measured-and-none is not the same as never-measured. The row says "spare ?" for the
 # second, and the warning must not turn not knowing into a claim. Registered accounts
@@ -3910,13 +3899,38 @@ printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 rm -f "$SLQ"
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-case "$row" in
-  *"⚠ quota 99% → no known spare, no OpenRouter key") \
-    ok "...and with nothing measured it says it does not know" ;;
-  *"no spare with room"*) bad "warning target" "claimed there is no spare without having looked: $row" ;;
-  *) bad "warning target" "got: $row" ;;
-esac
+[ "$row" = "⚠ quota 99% → no known spare, no OpenRouter key" ] \
+  && ok "...and with nothing measured it says it does not know" || bad "warning target" "got: $row"
 mv "$KEYF.bak" "$KEYF" 2>/dev/null || true
+
+# The threshold is a floor, not a fence: exactly at it must warn. `>=` and `>` are
+# one character apart and every other case in this section passes under either.
+rm -rf "$ADIR"; mkdir -p "$ADIR"
+wcache 95 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+[ "$row" = "⚠ quota 95% → /exit then ccd -c" ] \
+  && ok "a reading exactly at the threshold warns" || bad "warning target" "got: $row"
+wcache 94 40 "$(iso 3600)" "$(iso 500000)"
+[ -z "$(hatch)" ] \
+  && ok "...and one below it does not" || bad "warning target" "warned under the bound: $(hatch)"
+
+# A name long enough to be clipped is not named at all. A truncated account name is a
+# different account, and the row cannot know how wide the terminal is — so past the
+# bound the warning says something that stays true at any length.
+LONGNAME=$(python3 -c "print('n' * 40)")
+mk_sl_acct here; mk_sl_acct "$LONGNAME"
+printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+seed_rows "here:ok:99:40:18000:518400" "$LONGNAME:ok:8:12:18000:518400"
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+row=$(hatch)
+[ "$row" = "⚠ quota 99% → a spare has room: ccd account list" ] \
+  && ok "a name too long to survive truncation is not put in the command" \
+  || bad "warning target" "got: $row"
+case "$(warn_row)" in
+  *"spare nnn"*) ok "...and the row keeps naming it, bounded the way it always was" ;;
+  *) bad "warning target" "dropped the row's own mention as well: $(warn_row)" ;;
+esac
+rm -rf "$ADIR"; mkdir -p "$ADIR"
 
 # A spare that needs a re-login is not a spare with room.
 mk_sl_acct here; mk_sl_acct broken
@@ -3924,11 +3938,8 @@ printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows here:ok:99:40:18000:518400 broken:dead:-:-:-:-
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-case "$row" in
-  *"broken"*) bad "warning target" "sent the user to an account that cannot answer: $row" ;;
-  *"⚠ quota 99% → /exit then ccd -c") ok "a spare that needs a re-login is not offered as the escape" ;;
-  *) bad "warning target" "got: $row" ;;
-esac
+[ "$row" = "⚠ quota 99% → /exit then ccd -c" ] \
+  && ok "a spare that needs a re-login is not offered as the escape" || bad "warning target" "got: $row"
 rm -rf "$ADIR"; mkdir -p "$ADIR"
 
 head_ "28. no claude-dashboard installed"
