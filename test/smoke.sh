@@ -124,7 +124,11 @@ row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 
 case "$row" in *ccd*luna*) ok "ccd statusline row renders" ;; *) bad "statusline row" "got: ${row:0:80}" ;; esac
 warn=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' | "$ROOT/bin/ccd-statusline" 2>/dev/null)
 case "$warn" in *"quota 96%"*) ok "subscription-mode quota warning renders" ;; *) bad "quota warning row" "got: ${warn:0:80}" ;; esac
-"$ROOT/bin/ccd" setup >/dev/null 2>&1 && ok "setup is idempotent" || bad "setup idempotent"
+# --yes and an explicit SHELL so this measures idempotency and nothing else: a bare
+# setup now installs the launcher, so without them it would be asking about a PATH
+# line with nobody to answer, and exit non-zero for that reason instead.
+SHELL=/bin/zsh "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1 \
+  && ok "setup is idempotent" || bad "setup idempotent"
 "$ROOT/bin/ccd" uninstall --purge >/dev/null 2>&1
 [ -d "$FAKE/.claude/ccd" ] && bad "purge removes state" || ok "uninstall --purge removes state"
 
@@ -1707,7 +1711,7 @@ rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
 out=$("$ROOT/bin/ccd" doctor 2>&1 | sed -n '/Automatic handoff/,/^$/p')
 case "$out" in
-  *"off"*"ccd setup --auto"*) ok "doctor: off says how to turn it on" ;;
+  *"off"*"ccd setup"*) ok "doctor: off says how to turn it on" ;;
   *) bad "doctor handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
 esac
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
@@ -1838,12 +1842,16 @@ grep -q 'ccd-auto-handoff-path' "$RC" \
   && bad "already wired" "claimed a line the user wrote by adding our marker" \
   || ok "...and their line is still theirs, unmarked"
 
-# A bare `ccd setup` asks for nothing and promises nothing, so it cannot fail this
-# way. It is also the ordinary install path — making it exit non-zero would turn a
-# routine plugin install into a reported failure.
-rm -f "$RC"; printf '# my own file\n' > "$RC"
-HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1; st=$?
-[ "$st" -eq 0 ] && ok "a bare setup exits 0" || bad "bare setup" "exited $st"
+# A bare `ccd setup` installs the launcher too, so it fails the same way --auto
+# does when the wiring cannot be completed — and succeeds the same way when it can.
+rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path"; printf '# my own file\n' > "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1; st=$?
+[ "$st" -eq 0 ] && ok "a bare setup that wires PATH exits 0" || bad "bare setup" "exited $st"
+rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path"; printf '# my own file\n' > "$RC"
+python3 "$FAKE/ttyask.py" bare none "$FAKE/.ask-out" \
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup >/dev/null 2>&1; st=$?
+[ "$st" -ne 0 ] && ok "...and one that cannot exits non-zero (got $st)" \
+  || bad "bare setup" "exited 0 while leaving the launcher unreachable"
 
 # Turning the feature off on purpose is not a failure.
 rm -f "$RC"; printf '# my own file\n' > "$RC"
@@ -1923,6 +1931,54 @@ case "$out" in
   *"to OpenRouter only when none do"*) ok "...and names it once it is allowed" ;;
   *) bad "status promise" "never names the paid hop: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
+
+head_ "18e. the launcher needs no flag"
+# The free hop between registered subscriptions is the product, not an extra. A bare
+# `ccd setup` installs the launcher that carries it; --auto adds permission for the
+# paid OpenRouter hop on top of that, and --no-auto removes the launcher entirely.
+export SHELL=/bin/zsh
+RC="$FAKE/.zshrc"
+HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
+rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path" "$FAKE/.claude/ccd/paid-handoff"
+printf '# my own file\n' > "$RC"
+
+HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
+[ -x "$SHIM" ] && ok "a bare setup installs the launcher" \
+  || bad "default launcher" "no shim after a bare setup"
+grep -qxF 'export PATH="$HOME/.claude/ccd/bin:$PATH"' "$RC" \
+  && ok "...and wires it onto PATH" || bad "default launcher" "no PATH line"
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "...without authorising the paid hop" \
+  || bad "default launcher" "a bare setup granted the paid opt-in"
+
+# Turning it off has to stick. A later bare setup must not undo a decision the user
+# made deliberately — that is the whole reason --no-auto exists.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ ! -e "$SHIM" ] && ok "--no-auto removes it" || bad "opt-out" "shim survived --no-auto"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
+[ ! -e "$SHIM" ] && ok "...and a later bare setup leaves it off" \
+  || bad "opt-out" "a bare setup reinstalled what the user removed"
+[ ! -f "$FAKE/.claude/ccd/auto-path" ] || ! grep -q 'ccd-auto-handoff-path' "$RC" \
+  && ok "...and adds no PATH line for a launcher that is not there" \
+  || bad "opt-out" "wired PATH to an empty directory"
+
+# --auto is how the user changes their mind back.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+[ -x "$SHIM" ] && ok "--auto turns it back on" || bad "opt-out" "--auto did not reinstall"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
+[ -x "$SHIM" ] && ok "...and the opt-out is forgotten once it is on again" \
+  || bad "opt-out" "a stale opt-out outlived the --auto that cleared it"
+
+# A fresh install starts fresh: uninstall must not leave a refusal behind that a
+# later reinstall would silently obey.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
+rm -f "$RC"; printf '# my own file\n' > "$RC"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
+[ -x "$SHIM" ] && ok "uninstall clears the opt-out, so a reinstall gets the launcher" \
+  || bad "opt-out" "a refusal survived uninstall"
+rm -f "$FAKE/.claude/ccd/paid-handoff"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
 head_ "19. automatic handoff: readiness gates"
 # Each of these ends a session, so each must fail closed. A key ccd would later

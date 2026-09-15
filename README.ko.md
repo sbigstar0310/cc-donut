@@ -59,8 +59,7 @@ ccd account add     # 지금 로그인되어 있는 계정을 등록
 claude              # /login으로 다른 계정 로그인 후 /exit
 ccd account add     # 그 계정도 등록
 ccd account list    # 두 계정과 실시간 쿼타 확인
-ccd setup --auto    # 선택: 칠 것 없이 알아서 전환
-                    # (구독을 다 쓴 뒤 유료 OpenRouter 전환도 함께 허용)
+ccd setup           # 구독 사이 전환이 알아서 일어납니다
 ```
 
 구독 두 개를 쓰는 세팅은 이게 전부입니다. OpenRouter(`ccd key`)는 선택 사항이고,
@@ -72,7 +71,7 @@ ccd setup --auto    # 선택: 칠 것 없이 알아서 전환
 이전       작업 중간에 막힘, 재시작, 맥락 상실
 
 자동       칠 것 없음                 세션이 알아서 다른 구독으로
-                                      옮겨갑니다 (ccd setup --auto)
+                                      옮겨갑니다 (ccd setup)
 
 수동       !ccd account use <name>    한 줄 치고 그대로 계속
 ```
@@ -122,7 +121,7 @@ statusline은 현재 쓰는 계정, 예비 계정의 쿼타 사용량, 해당 �
 <summary><b>자동 전환, 아무것도 안 쳐도 되는 방식</b></summary>
 
 ```sh
-ccd setup --auto
+ccd setup
 ```
 
 런처를 `~/.claude/ccd/bin/claude`에 설치하고, 셸이 이 런처를 먼저 찾도록 셸 초기화
@@ -159,7 +158,8 @@ export PATH="$HOME/.claude/ccd/bin:$PATH"
   런처가 존재하는 이유가 이것입니다.
 - **OpenRouter, 본인 API 키.** 과금됩니다. 등록된 구독을 전부 쓴 뒤에만 도달합니다.
 
-`ccd setup --auto`는 이 둘을 함께 허용합니다. 키를 저장해 둔 것만으로는 부족합니다.
+런처가 첫 번째를 자기 힘으로 들고 갑니다. `ccd setup` 한 줄이면 됩니다.
+`ccd setup --auto`는 두 번째까지 허용합니다. 키를 저장해 둔 것만으로는 부족합니다.
 그 승인 없이 모든 구독이 바닥나면 세션은 유료 백본으로 넘어가지 않고 그 자리에서
 끝납니다. `ccd doctor`가 둘을 따로 보고하고, `ccd setup --no-auto`는 런처와 함께
 이 승인도 거둬들입니다.
@@ -219,8 +219,9 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 | `ccd account list` | 등록된 계정과 실시간 쿼타 확인 |
 | `ccd account use <name>` | 그 계정으로 전환. 세션 안에서 `!ccd account use <name>`으로 하면 그 세션에서 그대로 이어집니다 |
 | `ccd account rm <name>` | 계정 제거 |
-| `ccd setup --auto` | 자동 전환 켜기 (유료 OpenRouter 전환 허용 포함) |
-| `ccd setup --no-auto` | 자동 전환 끄기 |
+| `ccd setup` | 전체 설치. 구독 사이 자동 전환 포함 |
+| `ccd setup --auto` | 구독을 다 쓴 뒤 유료 OpenRouter 전환까지 허용 |
+| `ccd setup --no-auto` | 자동 전환 끄기. 이 결정을 기억합니다 |
 | `ccd doctor [model]` | 탈출 경로 전체 진단 |
 | `ccd` | 상태 확인: 계정, 키, 슬롯, 라우팅, 절차 |
 | `ccd key` | OpenRouter 키 저장 |

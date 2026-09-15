@@ -60,8 +60,7 @@ ccd account add     # registers the account you are signed in as right now
 claude              # /login as your other account, then /exit
 ccd account add     # register that one too
 ccd account list    # both accounts, with live quota
-ccd setup --auto    # optional: the hop happens by itself, both ways
-                    # (and allows the paid OpenRouter hop when all are spent)
+ccd setup           # the hop between subscriptions happens by itself
 ```
 
 That is the whole setup for two subscriptions. OpenRouter is optional and only
@@ -73,7 +72,7 @@ matters once every subscription is spent.
 BEFORE   stuck mid-task, restart, lose the thread
 
 AUTO     nothing to type at all     the session moves itself to the other
-                                    subscription (ccd setup --auto)
+                                    subscription (ccd setup)
 
 MANUAL   !ccd account use <name>    one line, then keep typing
 ```
@@ -125,7 +124,7 @@ Your MCP logins (Notion, Slack) are unaffected by a swap. Tokens live in
 <summary><b>Automatic handoff, with no commands at all</b></summary>
 
 ```sh
-ccd setup --auto
+ccd setup
 ```
 
 That installs a launcher at `~/.claude/ccd/bin/claude` and asks before adding one
@@ -163,7 +162,8 @@ A handoff has two possible destinations and they do not cost the same:
 - **OpenRouter, on your own API key.** Billed, and only ever reached when every
   registered subscription is spent.
 
-`ccd setup --auto` authorises both. Having a key stored is not enough on its own:
+The launcher carries the first one on its own — `ccd setup` is all it takes.
+`ccd setup --auto` authorises the second as well. Having a key stored is not enough:
 without that opt-in, a session whose subscriptions are all spent simply ends where
 it is rather than moving onto a paid backbone unattended. `ccd doctor` reports the
 two separately, and `ccd setup --no-auto` withdraws the authorisation along with the
@@ -226,8 +226,9 @@ calls.
 | `ccd account list` | Registered accounts with live quota |
 | `ccd account use <name>` | Hop to that account. `!ccd account use <name>` does it from inside a session, which then carries on |
 | `ccd account rm <name>` | Remove one |
-| `ccd setup --auto` | Opt in to automatic handoff, including the paid OpenRouter hop |
-| `ccd setup --no-auto` | Turn automatic handoff back off |
+| `ccd setup` | Install everything, including the automatic hop between subscriptions |
+| `ccd setup --auto` | Also allow the paid OpenRouter hop when every subscription is spent |
+| `ccd setup --no-auto` | Turn automatic handoff off, and remember that |
 | `ccd doctor [model]` | Diagnose the whole escape route |
 | `ccd` | Status: accounts, key, slots, routing, procedure |
 | `ccd key` | Store the OpenRouter key |

@@ -474,7 +474,7 @@ status() {
     printf '\n%sWhen quota runs out — these two commands%s\n' "$b" "$r"
     printf '  %s1. /exit%s        End the current session %s(required)%s\n' "$b" "$r" "$d" "$r"
     printf '  %s2. ccd -c%s       In the same terminal; restores the conversation\n' "$b" "$r"
-    printf '  %sWant this to happen by itself next time? Run: ccd setup --auto%s\n' "$d" "$r"
+    printf '  %sWant this to happen by itself next time? Run: ccd setup%s\n' "$d" "$r"
   fi
   printf '\n%sOther commands%s\n' "$b" "$r"
   printf '  %sccd pick%s        Change the three model slots\n' "$b" "$r"
@@ -551,7 +551,7 @@ doctor() {
       printf '      %sIt started before the launcher was on PATH. /exit, then run claude again.%s\n' "$d" "$r"
     fi
   else
-    printf '  %s· off%s — turn it on with: ccd setup --auto\n' "$d" "$r"
+    printf '  %s· off%s — turn it on with: ccd setup\n' "$d" "$r"
   fi
   # Two hops, two answers. The free one rides on the launcher above; this line is
   # only ever about the one that spends money, so it says which.
@@ -979,6 +979,11 @@ CCD_PATH_TARGET="$CCD_DIR/auto-path"
 # from the launcher's presence, because those two facts are about to stop agreeing:
 # a bare `ccd setup` will install the launcher without asking about billing.
 CCD_PAID_OPTIN="$CCD_DIR/paid-handoff"
+
+# The user said no. Without it a bare `ccd setup` — which every plugin update runs —
+# would quietly reinstall the launcher someone removed on purpose. Cleared by
+# `--auto` and by uninstall, so changing your mind and starting over both work.
+CCD_AUTO_OFF="$CCD_DIR/auto-off"
 record_path_target() {
   grep -qxF "$1" "$CCD_PATH_TARGET" 2>/dev/null && return 0
   printf '%s\n' "$1" >> "$CCD_PATH_TARGET" 2>/dev/null
@@ -1122,11 +1127,18 @@ exec "$t"
 CCD_STATUSLINE_LAUNCHER
   chmod +x "$statusline_launcher"
 
-  # Automatic handoff is opt-in: it shadows the `claude` command, which is too
-  # invasive to install without being asked. --auto installs, --no-auto removes,
-  # and a bare `ccd setup` leaves whatever is already there alone.
-  local claude_shim="$CCD_SHIM_DIR/claude"
+  # The launcher carries the free hop between registered subscriptions, which is the
+  # product rather than an extra, so a bare `ccd setup` installs it. --auto adds
+  # permission for the paid OpenRouter hop on top; --no-auto removes the launcher and
+  # remembers that. It still shadows `claude`, which is why the PATH line is asked
+  # about rather than assumed.
+  local claude_shim="$CCD_SHIM_DIR/claude" launcher=0
   case "$auto" in
+    1)  launcher=1; rm -f "$CCD_AUTO_OFF" 2>/dev/null ;;
+    -1) launcher=-1 ;;
+    *)  [ -f "$CCD_AUTO_OFF" ] || launcher=1 ;;
+  esac
+  case "$launcher" in
     1)
       mkdir -p "$CCD_SHIM_DIR"
       # Never clobber a claude the user put here themselves — uninstall protects
@@ -1171,7 +1183,8 @@ CCD_CLAUDE_SHIM
       # not arm, so swallowing the failure would leave setup promising a hop that
       # cannot happen — the same class of silent half-install this release exists
       # to end.
-      if ! { : > "$CCD_PAID_OPTIN"; } 2>/dev/null; then
+      # Only --auto authorises billing; the launcher above is free either way.
+      if [ "$auto" -eq 1 ] && ! { : > "$CCD_PAID_OPTIN"; } 2>/dev/null; then
         fail="the paid-hop opt-in could not be recorded — subscription hops still work"
         fix="make $(tilde "$CCD_DIR") writable, then re-run: ccd setup --auto"
       fi
@@ -1236,9 +1249,9 @@ CCD_CLAUDE_SHIM
               "$grn" "$(tilde "$rc")" "$r"
           else
             printf '  %sSkipped — automatic handoff is installed but not active yet.%s\n' "$ylw" "$r"
-            printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
+            printf '  %sAdd that line yourself, or re-run: ccd setup --yes%s\n' "$d" "$r"
             fail="automatic handoff is installed but not active"
-            fix="ccd setup --auto --yes   (then open a new terminal)"
+            fix="ccd setup --yes   (then open a new terminal)"
           fi
         elif [ -n "${rc:-}" ]; then
           printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
@@ -1253,6 +1266,8 @@ CCD_CLAUDE_SHIM
       fi
       ;;
     -1)
+      # Remembered, so the next bare setup does not undo this.
+      : > "$CCD_AUTO_OFF" 2>/dev/null || true
       if is_ccd_shim "$claude_shim"; then
         rm "$claude_shim"; printf '✓ automatic handoff disabled\n'
       elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
@@ -1416,7 +1431,9 @@ PY
   # A plain uninstall keeps the key and the rest of the state, but not this: it is
   # permission for a feature that is being removed, and a later reinstall must ask
   # again rather than find an answer already on disk.
-  rm -f "$CCD_PAID_OPTIN" 2>/dev/null || true
+  # ...and neither is a refusal: a fresh install must not silently obey a `--no-auto`
+  # from the install before it.
+  rm -f "$CCD_PAID_OPTIN" "$CCD_AUTO_OFF" 2>/dev/null || true
   [ -e "$statusline_launcher" ] || [ -L "$statusline_launcher" ] && rm "$statusline_launcher"
   printf '✓ launchers removed\n'
 
