@@ -24,8 +24,8 @@ stay where they are, and nothing is billed: it is a subscription you already pay
 for. When the window resets, it moves you back.
 
 Two subscriptions rarely run out at the same time, so switching between them is
-enough for most people. If they all run out, OpenRouter takes over as a paid
-fallback.
+enough for most people. If they all run out, OpenRouter can take over as a paid
+fallback — with your own key, and only once you have said so.
 
 ## Install
 
@@ -162,7 +162,7 @@ A handoff has two possible destinations and they do not cost the same:
 - **OpenRouter, on your own API key.** Billed, and only ever reached when every
   registered subscription is spent.
 
-The launcher carries the first one on its own — `ccd setup` is all it takes.
+The launcher carries the first one on its own, and `ccd setup` installs it.
 `ccd setup --auto` authorises the second as well. Having a key stored is not enough:
 without that opt-in, a session whose subscriptions are all spent simply ends where
 it is rather than moving onto a paid backbone unattended. `ccd doctor` reports the
@@ -228,7 +228,7 @@ calls.
 | `ccd account rm <name>` | Remove one |
 | `ccd setup` | Install everything, including the automatic hop between subscriptions |
 | `ccd setup --auto` | Also allow the paid OpenRouter hop when every subscription is spent |
-| `ccd setup --no-auto` | Turn automatic handoff off, and remember that |
+| `ccd setup --no-auto` | Remove the launcher and its PATH line |
 | `ccd doctor [model]` | Diagnose the whole escape route |
 | `ccd` | Status: accounts, key, slots, routing, procedure |
 | `ccd key` | Store the OpenRouter key |

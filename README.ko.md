@@ -23,8 +23,8 @@ Claude 쿼타가 바닥나면 대화를 **본인이 쓰는 다른 Claude 구독*
 구독이니까요. 쿼타가 초기화되면 원래 계정으로 돌아갑니다.
 
 두 구독의 쿼타가 동시에 바닥나는 일은 드물어서, 대부분은 계정 전환만으로 계속 쓸 수
-있습니다. 등록한 구독의 쿼타를 모두 쓴 경우에만 OpenRouter로 넘어갑니다. 이쪽은 토큰
-사용량에 따라 과금되는 최후 수단입니다.
+있습니다. 등록한 구독의 쿼타를 모두 쓴 경우에만 OpenRouter로 넘어갈 수 있습니다. 본인
+키를 쓰고, 미리 허용해 둔 경우에만 넘어가는 유료 최후 수단입니다.
 
 ## Install
 
@@ -158,7 +158,7 @@ export PATH="$HOME/.claude/ccd/bin:$PATH"
   런처가 존재하는 이유가 이것입니다.
 - **OpenRouter, 본인 API 키.** 과금됩니다. 등록된 구독을 전부 쓴 뒤에만 도달합니다.
 
-런처가 첫 번째를 자기 힘으로 들고 갑니다. `ccd setup` 한 줄이면 됩니다.
+런처가 첫 번째를 자기 힘으로 들고 가고, `ccd setup`이 그 런처를 깝니다.
 `ccd setup --auto`는 두 번째까지 허용합니다. 키를 저장해 둔 것만으로는 부족합니다.
 그 승인 없이 모든 구독이 바닥나면 세션은 유료 백본으로 넘어가지 않고 그 자리에서
 끝납니다. `ccd doctor`가 둘을 따로 보고하고, `ccd setup --no-auto`는 런처와 함께
@@ -221,7 +221,7 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 | `ccd account rm <name>` | 계정 제거 |
 | `ccd setup` | 전체 설치. 구독 사이 자동 전환 포함 |
 | `ccd setup --auto` | 구독을 다 쓴 뒤 유료 OpenRouter 전환까지 허용 |
-| `ccd setup --no-auto` | 자동 전환 끄기. 이 결정을 기억합니다 |
+| `ccd setup --no-auto` | 런처와 PATH 줄을 제거 |
 | `ccd doctor [model]` | 탈출 경로 전체 진단 |
 | `ccd` | 상태 확인: 계정, 키, 슬롯, 라우팅, 절차 |
 | `ccd key` | OpenRouter 키 저장 |

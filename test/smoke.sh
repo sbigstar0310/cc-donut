@@ -117,16 +117,16 @@ python3 -c "import json;json.load(open('$FAKE/.claude/ccd/quota-cache.json'))" 2
 [ -z "$(ls "$FAKE/.claude/ccd"/quota-cache.json.tmp* 2>/dev/null)" ] && ok "no leftover tmp files" || bad "no leftover tmp files"
 
 head_ "6. ccd setup / statusline / uninstall"
-"$ROOT/bin/ccd" setup >/dev/null 2>&1
+# --yes and an explicit SHELL on BOTH calls: a bare setup installs the launcher now,
+# so without them the first would block on a consent prompt and the second would be
+# completing that install rather than repeating it.
+SHELL=/bin/zsh "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
 [ -x "$FAKE/.local/bin/ccd" ] && ok "launcher installed" || bad "launcher installed"
 grep -qF 'bash ~/.claude/ccd/statusline-launcher.sh' "$FAKE/.claude/settings.json" 2>/dev/null && ok "statusLine wired to the ccd path" || bad "statusLine wired"
 row=$(printf '%s' '{"model":{"id":"openai/gpt-5.6-luna:floor"}}' | CCD_ACTIVE=1 "$ROOT/bin/ccd-statusline" 2>/dev/null)
 case "$row" in *ccd*luna*) ok "ccd statusline row renders" ;; *) bad "statusline row" "got: ${row:0:80}" ;; esac
 warn=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' | "$ROOT/bin/ccd-statusline" 2>/dev/null)
 case "$warn" in *"quota 96%"*) ok "subscription-mode quota warning renders" ;; *) bad "quota warning row" "got: ${warn:0:80}" ;; esac
-# --yes and an explicit SHELL so this measures idempotency and nothing else: a bare
-# setup now installs the launcher, so without them it would be asking about a PATH
-# line with nobody to answer, and exit non-zero for that reason instead.
 SHELL=/bin/zsh "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1 \
   && ok "setup is idempotent" || bad "setup idempotent"
 "$ROOT/bin/ccd" uninstall --purge >/dev/null 2>&1
@@ -1951,33 +1951,26 @@ grep -qxF 'export PATH="$HOME/.claude/ccd/bin:$PATH"' "$RC" \
   && ok "...without authorising the paid hop" \
   || bad "default launcher" "a bare setup granted the paid opt-in"
 
-# Turning it off has to stick. A later bare setup must not undo a decision the user
-# made deliberately — that is the whole reason --no-auto exists.
+# --no-auto takes back both halves, so the directory it pointed at is not left on
+# PATH after the shim that lived there is gone.
 HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
 [ ! -e "$SHIM" ] && ok "--no-auto removes it" || bad "opt-out" "shim survived --no-auto"
-HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
-[ ! -e "$SHIM" ] && ok "...and a later bare setup leaves it off" \
-  || bad "opt-out" "a bare setup reinstalled what the user removed"
-[ ! -f "$FAKE/.claude/ccd/auto-path" ] || ! grep -q 'ccd-auto-handoff-path' "$RC" \
-  && ok "...and adds no PATH line for a launcher that is not there" \
-  || bad "opt-out" "wired PATH to an empty directory"
+grep -q 'ccd-auto-handoff-path' "$RC" \
+  && bad "opt-out" "left PATH pointing at a directory it just emptied" \
+  || ok "...and takes its PATH line with it"
 
-# --auto is how the user changes their mind back.
-HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
-[ -x "$SHIM" ] && ok "--auto turns it back on" || bad "opt-out" "--auto did not reinstall"
+# Running setup again reinstalls it — every call here is a deliberate act, and the
+# consent that matters is asked on the way through, not remembered from last time.
+python3 "$FAKE/ttyask.py" ctty n "$FAKE/.ask-out" \
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup >/dev/null 2>&1
+grep -q 'ccd-auto-handoff-path' "$RC" \
+  && bad "consent" "shadowed claude after the user declined" \
+  || ok "a later setup asks again, and n still means no"
 HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
-[ -x "$SHIM" ] && ok "...and the opt-out is forgotten once it is on again" \
-  || bad "opt-out" "a stale opt-out outlived the --auto that cleared it"
-
-# A fresh install starts fresh: uninstall must not leave a refusal behind that a
-# later reinstall would silently obey.
-HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
-HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
-rm -f "$RC"; printf '# my own file\n' > "$RC"
-HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
-[ -x "$SHIM" ] && ok "uninstall clears the opt-out, so a reinstall gets the launcher" \
-  || bad "opt-out" "a refusal survived uninstall"
-rm -f "$FAKE/.claude/ccd/paid-handoff"
+[ -x "$SHIM" ] && ok "...and yes puts it back" || bad "consent" "y did not reinstall"
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "...still without authorising the paid hop" \
+  || bad "consent" "a bare setup granted the paid opt-in"
 HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
 head_ "19. automatic handoff: readiness gates"
