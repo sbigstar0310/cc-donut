@@ -365,31 +365,20 @@ fi
 # a row that appears only sometimes is a row you learn not to look at. The ccd row
 # above covers the "not the subscription" case; this covers the rest.
 #
+# One program, one row. It reads every file it needs and renders the whole
+# subscription line, because the two halves are decided from the same facts: which
+# spare has room decides both what the row says and what the warning offers, and
+# splitting them across two python blocks meant marshalling that answer through a
+# line-oriented channel and guessing it back out of rendered text.
+#
 # Reads files directly instead of shelling out to ccd-account (~50ms per render):
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
-# Is a launcher supervising THIS session? The same contract the hook checks before it
-# signals (launcher_present, scripts/quota-guard.sh): a 32-character lowercase-hex
-# token whose state path is the one that token implies. Anything weaker calls a
-# session supervised that the hook will refuse, which is the silence this row exists
-# to end — #21 was an install sitting inert for four days while every surface except
-# `ccd doctor` reported success, and doctor is the command nobody runs BEFORE the
-# thing they installed fails to happen.
-#
-# ONE message, not a remedy. Whether a restart or a `ccd setup` is what fixes it
-# depends on facts this path cannot establish without spawning a process — whether
-# the file at the shim path is ours, and which `claude` PATH actually resolves to —
-# and confident wrong advice is worse than none. `ccd doctor` answers that, and says
-# "NOT supervised" in the same words.
-supervision="not supervised"
-_tok=${CCD_HANDOFF:-}
-if [ "${#_tok}" -eq 32 ] && [ "${CCD_HANDOFF_STATE:-}" = "$CCD_DIR/handoff-$_tok.json" ]; then
-  case "$_tok" in *[!0-9a-f]*) ;; *) supervision="" ;; esac
-fi
-
-acct_out=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" \
-  python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
-import datetime, hashlib, json, os, sys, time
-adir, qfile = sys.argv[1], sys.argv[2]
+row=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" WARN_MAX_AGE="$WARN_MAX_AGE" \
+  THRESHOLD="$THRESHOLD" CCD_DIR="$CCD_DIR" \
+  python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" \
+           "$CACHE" "$CCD_DIR/providers/keys.env" 2>/dev/null <<'PY'
+import datetime, hashlib, json, os, re, sys, time
+adir, qfile, cache_file, keys_file = sys.argv[1:5]
 
 # The ready/full bound, read the way ccd-account reads it (HEADROOM,
 # bin/ccd-account:71). Drawing the line at 90 here while the swap draws it
@@ -465,11 +454,6 @@ else:
 # Name it even when it is not in the store: knowing you are on
 # someone@example.com beats a bare "?" that tells you nothing.
 display = active or (ident_email.split("@")[0] if ident_email else "")
-if not display:
-    # Nothing to name, but the third line still has to say what we know about
-    # spares: an empty directory is an answer, an unidentifiable session is not.
-    print(); print(); print("-" if not names else "?", end="")
-    raise SystemExit(0)
 if len(display) > 18:            # long email local parts must not eat the row
     display = display[:17] + "…"
 
@@ -615,13 +599,12 @@ head = f"{mark} {C}claude:{display}{RS}"
 if unregistered:
     head += f" {DIM}(unregistered){RS}"
 
-# With nothing else registered there is no spare to talk about, so stop here
-# rather than spending the row on the answer "you have one account" at someone who
-# never asked for the feature. It is also what makes the states below exhaustive.
-if len(names) < 2:
-    # One account is the one we are on, so there is no spare — measured, not unknown.
-    print(head); print(); print("-", end="")
-    raise SystemExit(0)
+# Spares are the accounts we are not on. Counting ACCOUNTS instead denied a real one
+# to anyone signed into an account ccd does not know: with an unregistered login and
+# one account on file, that account IS the spare, and cmd_pick would hand off to it
+# (it excludes only the active name). Saying "no spare" there is the claim #15 exists
+# to forbid, in different words.
+spares = [n for n in names if n != active]
 
 # The spare is the whole point of registering a second account, so say whether one
 # is actually ready. "needs re-login" has to be visible here: it is invisible
@@ -643,9 +626,7 @@ if len(names) < 2:
 # branches stay the same shape: with room, how long the squeeze lasts; without,
 # how long until there is room at all.
 ready, dead, full, unknown = [], [], [], 0
-for n in names:
-    if n == active:
-        continue
+for n in spares:
     q = quota.get(n) or {}
     if q.get("status") == "dead":
         dead.append(n)
@@ -698,63 +679,41 @@ else:
     # Not the same as having no spare. Saying "none" here would be a claim we
     # cannot support, and it is the claim that matters most to get right.
     tail = f"{DIM}spare ?{RS}"
-# head and tail on their own lines: when the warning names the spare, repeating it in
-# the row would spend the width twice on one fact, and the row is truncated at
-# terminal width. bash decides which halves to keep.
-print(head.replace("\n", " ")); print(tail.replace("\n", " ")); print(best, end="")
-PY
-)
-
-# Three lines out, split with parameter expansion: this path may not spawn a
-# process, and `sed -n 2p` is a process.
-acct_head=${acct_out%%$'\n'*}
-_rest=${acct_out#*$'\n'}
-acct_tail=${_rest%%$'\n'*}
-ready_spare=${_rest#*$'\n'}
-# Command substitution strips trailing newlines, so an empty third line leaves _rest
-# with no newline at all and the strip above returns the tail unchanged. Both guards
-# are the same shape: if the cut found nothing, there was nothing there.
-[ "$_rest" = "$ready_spare" ] && ready_spare=""
-[ "$acct_out" = "$acct_head" ] && { acct_tail=""; ready_spare=""; }
-# Nothing at all came back: the block gave up before it could look, which is not the
-# same as looking and finding none.
-# No output at all means the block could not even start; that is not an answer.
-[ -z "$acct_out" ] && ready_spare="?"
-
-# ── Append the escape hatch only above the threshold
-suffix=""
-if [ -f "$CACHE" ]; then
-  suffix=$(THRESHOLD="$THRESHOLD" WARN_MAX_AGE="$WARN_MAX_AGE" \
-    READY_SPARE="$ready_spare" KEYS="$CCD_DIR/providers/keys.env" \
-    python3 - "$CACHE" 2>/dev/null <<'PY'
-# The loudest thing on the screen has to be the best qualified. Three gates, the same
-# three the arming path applies before it ends a session (scripts/quota-guard.sh,
-# quota_peak): the reading must be usable, recent, and about a window that still
-# exists. Without them a sample taken before a reset went on reading 96% afterwards,
-# and a swap left the previous account's 99% shouting beside the new account's 3%.
-import datetime, json, os, re, sys
-path = sys.argv[1]
-try:
-    d = json.load(open(path))
-    age = datetime.datetime.now().timestamp() - os.path.getmtime(path)
-except Exception:
-    sys.exit(0)
-if age > float(os.environ["WARN_MAX_AGE"]):
-    sys.exit(0)
-c = d.get("claude") or {}
-if c.get("available") is not True or c.get("error") is not False:
-    sys.exit(0)
+if not spares:
+    tail = ""           # nothing to hand off to; the row is just who is answering
 
 
+# ── Is a launcher supervising THIS session? ──────────────────────────────────
+# The contract the hook checks before it signals (launcher_present,
+# scripts/quota-guard.sh): 32 lowercase hex whose state path is the one that token
+# implies. Anything weaker calls a session supervised that the hook will refuse,
+# which is the silence this row exists to end — #21 sat inert for four days while
+# every surface except `ccd doctor` reported success, and doctor is the command
+# nobody runs BEFORE the thing they installed fails to happen.
+#
+# ONE message, not a remedy: whether a restart or a `ccd setup` is the fix turns on
+# facts this path cannot establish without spawning a process, and confident wrong
+# advice is worse than none.
+tok = os.environ.get("CCD_HANDOFF", "")
+supervised = bool(re.fullmatch(r"[0-9a-f]{32}", tok)) and os.environ.get(
+    "CCD_HANDOFF_STATE") == os.path.join(os.environ.get("CCD_DIR", ""), f"handoff-{tok}.json")
+if spares and not supervised:
+    head += f" {Y}(not supervised){RS}"
+
+
+# ── The escape hatch, above the threshold ────────────────────────────────────
+# The loudest thing on the screen has to be the best qualified. Three gates, the
+# same three the arming path applies before it ends a session (quota_peak in
+# scripts/quota-guard.sh): the reading must be usable, recent, and about a window
+# that still exists. Without them a sample taken before a reset went on reading 96%
+# afterwards, and a swap left the previous account's 99% shouting beside the new
+# account's 3%.
 def have_key():
-    """Is there an OpenRouter key to fall back to? Asked in here rather than in the
-    shell so the render path spawns nothing, and only once the warning is already
-    going to fire. Same shapes have_key() accepts in the hook."""
-    v = os.environ.get("OPENROUTER_API_KEY", "")
-    if v.strip():
+    """Is there an OpenRouter key to fall back to? Same shapes the hook accepts."""
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
         return True
     try:
-        text = open(os.environ["KEYS"], encoding="utf-8").read()
+        text = open(keys_file, encoding="utf-8").read()
     except Exception:
         return False
     for line in text.splitlines():
@@ -767,87 +726,50 @@ def have_key():
     return False
 
 
-def spent(iso):
-    """Is this window still the one running? An unreadable timestamp says nothing
-    either way, and the percentage beside it is still the best we have."""
-    if not isinstance(iso, str) or not iso:
-        return True
-    try:
-        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=datetime.timezone.utc)
-    return t > datetime.datetime.now(datetime.timezone.utc)
-
-
+warn = ""
+try:
+    c = (json.load(open(cache_file)).get("claude") or {})
+    fresh_enough = 0 <= time.time() - os.path.getmtime(cache_file) <= int(
+        os.environ.get("WARN_MAX_AGE", "1800"))
+except Exception:
+    c, fresh_enough = {}, False
 vals = [p for p, r in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
                        (c.get("sevenDayPercent"), c.get("sevenDayReset")))
-        if isinstance(p, (int, float)) and spent(r)]
-if vals and max(vals) >= int(os.environ["THRESHOLD"]):
-    # Name the move that actually applies. The free hop between subscriptions comes
-    # first — it costs nothing and keeps a real Claude model — and OpenRouter is the
-    # last resort, which is the order the handoff path already takes ("Prefer another
-    # subscription over paying", scripts/quota-guard.sh). Offering `ccd -c` while a
-    # registered account sits there with room had it backwards.
-    #
-    # `!` runs the swap from inside the session, so the thread stays on screen.
-    spare = os.environ.get("READY_SPARE", "").strip()
-    # Past this the command cannot be relied on to survive the row's truncation, and
-    # a clipped account name is a different account, not a shorter one. Names may be
-    # 64 characters (NAME_RE, bin/ccd-account:90); no arrangement of this row fits
-    # one of those, so the long case gets an instruction that is complete at any
-    # length instead of a command that might not be.
-    named = spare not in ("", "?", "-")
-    if named and len(spare) <= 32:
-        move = "!ccd account use " + spare
-    elif named:
+        if isinstance(p, (int, float)) and not expired(r)]
+if (fresh_enough and c.get("available") is True and c.get("error") is False
+        and vals and max(vals) >= int(os.environ.get("THRESHOLD", "95"))):
+    # Name the move that applies. The free hop between subscriptions comes first —
+    # it costs nothing and keeps a real Claude model — and OpenRouter is the last
+    # resort, the order the handoff path already takes. `!` runs the swap from
+    # inside the session, so the thread stays on screen.
+    # `⚠ quota 99% → !ccd account use ` is 31 visible characters, so a name past 48
+    # cannot fit an eighty-column line even with this warning alone on it. A clipped
+    # account name is a different account, not a shorter one, so past the bound the
+    # instruction stays true at any length instead.
+    if ready and len(ready[0][1]) <= 48:
+        move = "!ccd account use " + ready[0][1]
+    elif ready:
         move = "a spare has room: ccd account list"
     elif have_key():
         move = "/exit then ccd -c"
-    elif spare != "-":
+    elif unknown:
         # The row says "spare ?" here. Saying "no spare" would turn not knowing into
         # a claim, which is the distinction the row exists to keep.
         move = "no known spare, no OpenRouter key"
     else:
-        # Nothing to offer, and we did measure. Say so rather than name a route with
-        # nothing behind it — this is the moment when finding out costs the most.
         move = "no spare with room, no OpenRouter key"
-    # Red, bold — impossible to miss
-    print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → " + move + "\033[0m", end="")
+    warn = f"\033[1;31m⚠ quota {int(max(vals))}% → {move}{RS}"
+
+# The warning takes its own line. Sharing one with the account segment is what let a
+# long account name push `!ccd account use <name>` off a truncated row, and dropping
+# the segment to make space cost the spare's percentage and countdown — the two
+# numbers that turn the row into a decision (#16). One extra line, only while the
+# quota is actually spent, buys both.
+acct = f" {DIM}│{RS} ".join(x for x in (head, tail) if x)
+print("\n".join(x for x in (acct, warn) if x), end="")
 PY
 )
-fi
 
-# The warning gets its own row — appended to the dashboard's last line it is
-# cut off by terminal-width truncation. The account segment shares that row when
-# both are present, so multi-account never costs more than one extra line.
-#
-# When the warning names the spare, the row drops its own mention of it. The two
-# halves would otherwise spend the width twice on one account, and this row is
-# truncated: `!ccd account use sbigstar0930` clipped to `!ccd account use s` is not
-# a shorter instruction, it is a wrong one. The actionable half wins.
-# The note yields to the warning. Its job is to be read BEFORE the quota runs out —
-# at the moment it has, the command in the warning is the thing to act on, and this
-# row is truncated at terminal width. Same rule the tail follows below: the
-# actionable half wins. An empty tail means fewer than two accounts, where a
-# launcher would have nowhere to hand off to and the note would be noise.
-if [ -z "$suffix" ] && [ -n "$supervision" ] && [ -n "$acct_tail" ]; then
-  acct_head="$acct_head $(printf '\033[33m(%s)\033[0m' "$supervision")"
-fi
-
-row="$acct_head"
-case "$suffix" in
-  *"!ccd account use "*) ;;
-  *) [ -n "$acct_tail" ] && row="$row $(printf '\033[2m│\033[0m') $acct_tail" ;;
-esac
-if [ -n "$suffix" ]; then
-  if [ -n "$row" ]; then
-    row="$row $(printf '\033[2m│\033[0m') $suffix"
-  else
-    row="$suffix"
-  fi
-fi
 
 if [ -n "$base" ] && [ -n "$row" ]; then
   printf '%s\n%s' "$base" "$row"

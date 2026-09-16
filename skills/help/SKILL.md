@@ -109,11 +109,16 @@ with a bare slug in the sonnet slot.
 `ccd` status does not name the account; that comes from `account list` (or
 `account current`). Do not promise one command for both.
 
-**Turning the automatic handoff on** is `$CCD setup --auto`, and it may need to
-add one line to a startup file so the shim leads `PATH`. It asks before touching
-a dotfile, reaching `/dev/tty` when stdin is a pipe. Get the user's agreement in
-the conversation first, then run `$CCD setup --auto --yes` so it does not stop on
-a prompt they cannot see. `$CCD setup --no-auto` turns it back off.
+**Turning the automatic handoff on** is `$CCD setup` — the hop between registered
+subscriptions is the default, not a flag. It may need to add one line to a startup
+file so the shim leads `PATH`, and it asks before touching a dotfile, reaching
+`/dev/tty` when stdin is a pipe. Get the user's agreement in the conversation first,
+then run `$CCD setup --yes` so it does not stop on a prompt they cannot see.
+`$CCD setup --no-auto` turns it back off.
+
+`--auto` is a different question: it grants consent for the paid OpenRouter hop when
+every subscription is spent. Never add it to fix a PATH line, and never add it
+without asking about the billing.
 
 The switch onto OpenRouter and back is the user's to type, because each command
 replaces itself with `claude`:

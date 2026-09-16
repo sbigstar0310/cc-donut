@@ -2995,6 +2995,15 @@ elif cmd == "msg":
     s = m.stale_spares(); print(m.stale_message(s) if s else "")
 elif cmd == "breadcrumb":
     m.stale_breadcrumb(m.stale_spares()); print("yes" if os.path.exists(m.STALE_FILE) else "no")
+elif cmd == "refresh-ok":             # run the real account_refresh, stubbing only HTTP
+    # The fixtures carry the refresh token "r", so the exchange cannot succeed
+    # against anything real — and a test that reaches the network is a bug in the
+    # test. Everything account_refresh does with the result is the code under test.
+    name = argv[1]
+    m.token_refresh = lambda rt: ({"accessToken": "A2", "refreshToken": "R2",
+                                   "expiresAt": int((time.time() + 8 * 3600) * 1000)}, 200)
+    acct = m.account_load(name)
+    print("ok" if m.account_refresh(name, acct)[0] else "failed")
 elif cmd == "quiet":                  # park keepalive so hook runs make no network call
     m.write_json(m.KEEPALIVE_MARK, {"fails": 0}, 0o600)
 elif cmd == "warm":                   # ...and park the picker, for the same reason
@@ -3091,6 +3100,89 @@ esac
 [ "$(ka breadcrumb)" = "yes" ] \
   && ok "the verdict is left where the hook can find it" \
   || bad "breadcrumb" "keepalive left nothing behind"
+# ── A refresh that never succeeded is not a refresh ─────────────────────────
+# stale_spares() keys on refreshed_at, and bank_live_oauth() and swap_to() both write
+# that field on a successful COPY. So every hop reset the staleness clock while the
+# refresh path kept failing: on the reporting machine the spare's refreshed_at was
+# the exact second of a manual swap, six consecutive keepalive failures were on disk,
+# and the warning never fired.
+ka mk banked-spare 20 8
+python3 - "$ADIR/banked-spare.json" <<'BANKPY'
+import json, sys, time
+# What banking leaves behind: a fresh refreshed_at against a token nothing has ever
+# managed to refresh.
+p = sys.argv[1]
+d = json.load(open(p))
+d["refreshed_at"] = int(time.time())
+json.dump(d, open(p, "w"))
+BANKPY
+case "$(ka stale)" in
+  *'"banked-spare"'*) ok "a spare whose token was copied but never refreshed is still stale" ;;
+  *) bad "stale detection" "a copy reset the clock: $(ka stale)" ;;
+esac
+
+# ...and a refresh that really happened clears it.
+ka refresh-ok banked-spare >/dev/null
+case "$(ka stale)" in
+  *'"banked-spare"'*) bad "stale detection" "a real refresh did not count: $(ka stale)" ;;
+  *) ok "...and a refresh that actually succeeded clears it" ;;
+esac
+
+# The failure counter is evidence nobody was reading. A manual repair must clear it,
+# or the account just proven healthy stays in the backoff keepalive computes from it.
+ka_fails() { python3 -c "
+import json
+try: print((json.load(open('$FAKE/.claude/ccd/accounts-keepalive')) or {}).get('fails'))
+except Exception: print('unreadable')"; }
+
+# One account refreshing is not the pass succeeding. The marker carries the SCHEDULE
+# as well as the count, so a per-account write postpones the next pass — and with the
+# quota warm probing every few minutes, postpones it forever. That silences the
+# warning a different, failing spare is waiting for, which is the bug this issue is
+# about rather than a new one to introduce.
+ka mk lone-success 1 8
+printf '{"fails": 6}' > "$FAKE/.claude/ccd/accounts-keepalive"
+[ "$(ka refresh-ok lone-success)" = "ok" ] || bad "keepalive counter" "the fixture refresh failed"
+[ "$(ka_fails)" = "6" ] \
+  && ok "one account's refresh does not reset the whole pass's record" \
+  || bad "keepalive counter" "a single success claimed the pass: $(ka_fails)"
+
+# A clean sweep of every spare is a repair, and that is where the counter clears.
+printf '{"fails": 6}' > "$FAKE/.claude/ccd/accounts-keepalive"
+CCD_TOKEN_URL="http://127.0.0.1:1/x" "$ACCT" --no-color refresh >/dev/null 2>&1
+[ "$(ka_fails)" = "6" ] \
+  && ok "...and a sweep with a failure in it does not clear it either" \
+  || bad "keepalive counter" "cleared on a failed sweep: $(ka_fails)"
+
+# ── One refresher at a time ─────────────────────────────────────────────────
+# keepalive rotates tokens; the quota warm probes, and quota_for() refreshes a token
+# on the way when the stored one has expired. Both therefore spend the same one-time
+# refresh token, and only keepalive takes the store lock. Run as siblings they raced,
+# the loser got `dead`, and the account read as logged out — which is the failure this
+# release is about, arriving by a route we opened.
+#
+# Ordering is the property, so measure ordering: a stub ccd-account records when each
+# command starts and ends. No network, and nothing to flake on but the ordering itself.
+RACEDIR="$FAKE/raceroot"; mkdir -p "$RACEDIR/bin"
+cat > "$RACEDIR/bin/ccd-account" <<'RACEEOF'
+#!/bin/sh
+for a in "$@"; do case "$a" in keepalive|pick) cmd=$a ;; esac; done
+[ -n "${cmd:-}" ] || exit 0
+echo "start $cmd" >> "$HOME/.race"
+sleep 0.4
+echo "end $cmd" >> "$HOME/.race"
+RACEEOF
+chmod +x "$RACEDIR/bin/ccd-account"
+rm -f "$FAKE/.race"
+CLAUDE_PLUGIN_ROOT="$RACEDIR" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit </dev/null >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(grep -c end "$FAKE/.race" 2>/dev/null || echo 0)" -ge 2 ] && break; sleep 0.3
+done
+[ "$(cat "$FAKE/.race" 2>/dev/null | tr '\n' ' ')" = "start keepalive end keepalive start pick end pick " ] \
+  && ok "a prompt runs the two refreshers in sequence, never at once" \
+  || bad "refresher race" "interleaved: $(cat "$FAKE/.race" 2>/dev/null | tr '\n' ' ')"
+rm -rf "$RACEDIR" "$FAKE/.race"
+
 # Park keepalive AND the picker: hook runs below must not fire a background token
 # refresh or a quota probe. These fixtures carry the refresh token "r" and an
 # expired access token, so anything that reaches the network here is a test
@@ -3589,12 +3681,67 @@ rm -f "$ADIR/sooner.json"
 # its own: before this, nothing refreshed accounts-quota.json except a user-typed
 # `ccd account` command, so the row would simply go quiet instead of going wrong.
 # A prompt tick warms it in the background.
-rm -f "$SLQ"
-printf '{"session_id":"sess-warm","cwd":"/tmp"}' \
-  | CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SLQ" ] && break; sleep 0.3; done
-[ -f "$SLQ" ] && ok "a prompt warms the account quota cache in the background" \
-  || bad "quota warm" "nothing re-probed accounts-quota.json"
+# The file appearing is not the point — a failed probe writes one too, and `dead` is
+# the silent-failure state #27 is about. What the row needs is a reading it can use,
+# so stand up a local usage endpoint and check the verdict, not the filename.
+cat > "$FAKE/usageserver.py" <<'USRV'
+import http.server, json, os, socketserver, sys
+port_file = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({
+            "five_hour": {"utilization": 12, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 30, "resets_at": "2099-01-01T00:00:00Z"},
+        }).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+class S(http.server.ThreadingHTTPServer):
+    def server_bind(self):                      # skip getfqdn(), see the token server
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+srv = S(("127.0.0.1", 0), H)
+with open(port_file + ".tmp", "w") as f: f.write(str(srv.server_address[1]))
+os.replace(port_file + ".tmp", port_file)
+srv.serve_forever()
+USRV
+rm -f "$FAKE/.uport"
+python3 "$FAKE/usageserver.py" "$FAKE/.uport" </dev/null >/dev/null 2>&1 &
+usrv_pid=$!
+n=0; while [ ! -s "$FAKE/.uport" ] && [ $n -lt 75 ]; do sleep 0.2; n=$((n+1)); done
+if [ -s "$FAKE/.uport" ]; then
+  # A live access token, so probe_account goes straight to the usage endpoint instead
+  # of trying to refresh a fixture that has no refresh token — `dead` is what that
+  # produces, and `dead` is the silent-failure state this assertion must not accept.
+  python3 - "$ADIR/backup.json" <<'LIVEPY'
+import json, sys, time
+p = sys.argv[1]
+d = json.load(open(p))
+d["claudeAiOauth"]["expiresAt"] = int((time.time() + 8 * 3600) * 1000)
+json.dump(d, open(p, "w"))
+LIVEPY
+  rm -f "$SLQ"
+  printf '{"session_id":"sess-warm","cwd":"/tmp"}' \
+    | CCD_USAGE_URL="http://127.0.0.1:$(cat "$FAKE/.uport")/usage" \
+      CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SLQ" ] && break; sleep 0.3; done
+  verdict=$(python3 -c "
+import json, sys, time
+try: d = json.load(open('$SLQ'))
+except Exception: print('unreadable'); raise SystemExit
+rows = [r for r in d.values() if isinstance(r, dict)]
+if not rows: print('empty'); raise SystemExit
+r = rows[0]
+fresh = isinstance(r.get('checked_at'), (int, float)) and time.time() - r['checked_at'] < 60
+print(f\"{r.get('status')}:{'fresh' if fresh else 'stale'}:{r.get('five_hour_percent')}\")")
+  case "$verdict" in
+    ok:fresh:12) ok "a prompt warms the cache with a reading the row can actually use" ;;
+    *) bad "quota warm" "wrote something, but not a usable reading: $verdict" ;;
+  esac
+else
+  bad "quota warm" "local usage endpoint never came up"
+fi
+kill "$usrv_pid" 2>/dev/null; wait "$usrv_pid" 2>/dev/null
 
 # ── A window that has turned over is not a reading about now ─────────────────
 # A reset in the past means the cache predates it. The row used to print the
@@ -3860,13 +4007,14 @@ wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
 [ "$row" = "⚠ quota 99% → !ccd account use roomyspare" ] \
   && ok "with a spare that has room, the warning is exactly the command to run" || bad "warning target" "got: $row"
-# ...and the row does not then spend its width saying the same account twice.
+# ...and the row still carries the two numbers that make it a decision (#16): how
+# much of that spare is spent, and when its window turns over. The warning has its
+# own line, so naming the account in both places costs nothing.
 full=$(warn_row)
 case "$full" in
-  *"spare roomyspare"*) bad "warning target" "named it in the row and in the command: $full" ;;
   *"ccd -c"*) bad "warning target" "named the paid route anywhere on a row about a free hop: $full" ;;
-  *"claude:here"*) ok "...and the row drops the spare it is about to name" ;;
-  *) bad "warning target" "lost the account row: $full" ;;
+  *"spare roomyspare "*%*\(*\)*) ok "...and the row keeps the spare's percentage and countdown" ;;
+  *) bad "warning target" "dropped the numbers that make the row a decision: $full" ;;
 esac
 
 # Every subscription spent, key configured: the paid hop is the answer again.
@@ -3917,7 +4065,7 @@ wcache 94 40 "$(iso 3600)" "$(iso 500000)"
 # A name long enough to be clipped is not named at all. A truncated account name is a
 # different account, and the row cannot know how wide the terminal is — so past the
 # bound the warning says something that stays true at any length.
-LONGNAME=$(python3 -c "print('n' * 40)")
+LONGNAME=$(python3 -c "print('n' * 56)")
 mk_sl_acct here; mk_sl_acct "$LONGNAME"
 printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows "here:ok:99:40:18000:518400" "$LONGNAME:ok:8:12:18000:518400"
@@ -4017,27 +4165,20 @@ case "$row" in
   *) bad "supervision" "got: $row" ;;
 esac
 
-# The note yields to the quota warning. Its job is to be read BEFORE the quota runs
-# out; at the moment it has, the command in the warning is what to act on, and this
-# row is truncated at terminal width — the same rule that made the row drop its own
-# mention of the spare in 27c. Two things competing for the end of a truncated line
-# is how a command becomes a different command.
+# The note and the warning no longer compete: the warning takes its own line, so both
+# can say their piece without either being truncated away.
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":99,"sevenDayPercent":40,"fiveHourReset":"%s","sevenDayReset":"%s"}}\n' \
   "$(iso 3600)" "$(iso 500000)" > "$WDIR/quota-cache.json"
-row=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' | sl_env)
-case "$row" in
-  *"not supervised"*) bad "supervision" "crowded the command it was standing in front of: $row" ;;
-  *"quota 99%"*) ok "the note stands aside while the warning has something to say" ;;
-  *) bad "supervision" "got: $row" ;;
+both=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' \
+         | env -u CCD_HANDOFF HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
+         | sed $'s/\\x1b\\[[0-9;]*m//g')
+case "$both" in
+  *"not supervised"*"quota 99%"*) ok "the note and the warning both survive, on their own lines" ;;
+  *) bad "supervision" "one crowded the other out: $(printf '%s' "$both" | tr '\n' '/')" ;;
 esac
-# ...and comes back once the quota does.
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20,"fiveHourReset":"R1","sevenDayReset":"D1"}}\n' \
-  > "$WDIR/quota-cache.json"
-row=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' | sl_env)
-case "$row" in
-  *"not supervised"*) ok "...and is back as soon as the alarm stops" ;;
-  *) bad "supervision" "the note did not return: $row" ;;
-esac
+[ "$(printf '%s' "$both" | grep -c 'quota 99%')" = "1" ] \
+  && ok "...and the warning is on a line of its own" \
+  || bad "supervision" "the warning did not get its own line"
 
 # One account has nowhere to hand off to, so the warning would be noise.
 rm -f "$ADIR/backup.json"

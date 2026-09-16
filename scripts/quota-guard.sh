@@ -826,24 +826,30 @@ fi
 # Without it the spare dies quietly and the user discovers it at the exact moment
 # they needed it — the failure ccd exists to prevent. Backgrounded: this must
 # never add latency to a prompt, and it is a no-op on all but one tick a day.
-if [ -z "${CCD_ACTIVE:-}" ] && has_accounts; then
-  ka=$(ccd_account_bin) || ka=""
-  [ -n "$ka" ] && ("$ka" --no-color keepalive >/dev/null 2>&1 &) || true
-  # And keep the spare's QUOTA current, which keepalive does not: it refreshes
-  # tokens and never probes. Nothing else writes accounts-quota.json except a
-  # user-typed `ccd account` command, so the statusline's spare row was reading a
-  # number that only moved when the user happened to ask (#24).
+if [ -z "${CCD_ACTIVE:-}" ] && has_accounts && ka=$(ccd_account_bin); then
+  # Two jobs, ONE background shell, in this order. keepalive refreshes tokens; the
+  # pick probes quota, and quota_for() refreshes a token on the way when the stored
+  # one has expired. Both therefore spend the same one-time refresh token, and only
+  # keepalive takes the store lock — so run as siblings they raced, the loser wrote
+  # `dead`, and the account read as logged out. That is the failure this whole
+  # release is about, arriving by a route we opened.
   #
-  # `pick` is the probe: quota_for() re-reads only rows past their cached TTL and
-  # leaves the rest alone, so a healthy account is measured about every five
-  # minutes however often the hook fires. Not a ceiling — cache_ttl_for() retries an
-  # error after 60s, and concurrent pickers do not single-flight (#13). Prompts
-  # only; tool-use ticks would spend a process to be told the cache is still warm.
-  # Backgrounded and discarded, like keepalive: rendering never waits on it, and the
-  # row it fixes is the NEXT one.
-  if [ "$EVENT" = "UserPromptSubmit" ] && [ -n "$ka" ]; then
-    ("$ka" --no-color pick --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &) || true
-  fi
+  # Serialising them is the whole fix and costs nothing: keepalive is a no-op on all
+  # but one tick a day, and by the time the pick runs the tokens it needs are the
+  # ones keepalive just rotated.
+  #
+  # The pick is what keeps accounts-quota.json current, which keepalive never does —
+  # it refreshes tokens and never probes, so the statusline's spare row moved only
+  # when the user happened to type a `ccd account` command (#24). quota_for() re-reads
+  # only rows past their cached TTL, so a healthy account is measured about every five
+  # minutes however often the hook fires; an error retries after 60s, and concurrent
+  # pickers from OTHER sessions still do not single-flight (#13). Prompts only —
+  # tool-use ticks would spend a process to be told the cache is still warm.
+  (
+    "$ka" --no-color keepalive
+    [ "$EVENT" = "UserPromptSubmit" ] \
+      && "$ka" --no-color pick --exclude "${CCD_BURST_VISITED:-}"
+  ) >/dev/null 2>&1 &
 fi
 
 # Deliver keepalive's verdict. It runs backgrounded with its output discarded, so
