@@ -742,14 +742,13 @@ if (fresh_enough and c.get("available") is True and c.get("error") is False
     # it costs nothing and keeps a real Claude model — and OpenRouter is the last
     # resort, the order the handoff path already takes. `!` runs the swap from
     # inside the session, so the thread stays on screen.
-    # `⚠ quota 99% → !ccd account use ` is 31 visible characters, so a name past 48
-    # cannot fit an eighty-column line even with this warning alone on it. A clipped
-    # account name is a different account, not a shorter one, so past the bound the
-    # instruction stays true at any length instead.
-    if ready and len(ready[0][1]) <= 48:
-        move = "!ccd account use " + ready[0][1]
-    elif ready:
-        move = "a spare has room: ccd account list"
+    # No name in the command, so nothing can be clipped into a different account
+    # (#47). It is also the only honest form: this row reports the last reading,
+    # and `use` measures again when the user actually runs it, so a name written
+    # here could already be the wrong one by the time they press enter. The row
+    # says what we last saw; the command decides on what it sees.
+    if ready:
+        move = "!ccd account use"
     elif have_key():
         move = "/exit then ccd -c"
     elif unknown:
