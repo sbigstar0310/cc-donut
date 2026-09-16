@@ -2997,6 +2997,19 @@ elif cmd == "breadcrumb":
     m.stale_breadcrumb(m.stale_spares()); print("yes" if os.path.exists(m.STALE_FILE) else "no")
 elif cmd == "quiet":                  # park keepalive so hook runs make no network call
     m.write_json(m.KEEPALIVE_MARK, {"fails": 0}, 0o600)
+elif cmd == "warm":                   # ...and park the picker, for the same reason
+    # quota_for() serves any row that is valid for the account and inside the TTL
+    # without touching the network, so a fresh row per account is what silences the
+    # backgrounded `pick` the prompt hook now runs. These accounts carry no uuid, so
+    # _cache_row_valid falls back to the credential fingerprint.
+    rows = {}
+    for name in m.account_names():
+        acct = m.account_load(name)
+        rows[name] = {"status": "ok", "checked_at": m.now(),
+                      "uuid": acct.get("account_uuid"),
+                      "cred": m._cred_fingerprint(acct),
+                      "five_hour_percent": 5, "seven_day_percent": 5}
+    m.quota_cache_save(rows)
 elif cmd == "ua":
     print(m.claude_ua())
 elif cmd == "refresh-ua":             # what UA does a token refresh present?
@@ -3078,8 +3091,12 @@ esac
 [ "$(ka breadcrumb)" = "yes" ] \
   && ok "the verdict is left where the hook can find it" \
   || bad "breadcrumb" "keepalive left nothing behind"
-# Park keepalive: hook runs below must not fire a background token refresh.
+# Park keepalive AND the picker: hook runs below must not fire a background token
+# refresh or a quota probe. These fixtures carry the refresh token "r" and an
+# expired access token, so anything that reaches the network here is a test
+# reaching Anthropic for real — a bug in the test, not a slow one.
 ka quiet
+ka warm
 rm -f "$FAKE/.claude/ccd/last-stale-warn"
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
 case "$out" in
@@ -3108,6 +3125,19 @@ out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
   && ok "a breadcrumb with no message says nothing rather than something broken" \
   || bad "stale warning" "emitted from a malformed breadcrumb: $out"
 rm -f "$FAKE/.claude/ccd/accounts-stale"
+
+# Nothing above may have gone to the network. These fixtures hold the refresh token
+# "r" against a real Anthropic endpoint, so a probe that got through would come back
+# an error or dead and overwrite the rows `ka warm` seeded. Their survival is the
+# assertion: the prompt hook's backgrounded picker stayed home.
+for _ in 1 2 3 4 5 6; do sleep 0.3; done
+left=$(python3 -c "
+import json
+d = json.load(open('$FAKE/.claude/ccd/accounts-quota.json'))
+print(sorted({r.get('status') for r in d.values()}))" 2>/dev/null)
+[ "$left" = "['ok']" ] \
+  && ok "the prompt hook's quota warm stays off the network in a parked fixture" \
+  || bad "test isolation" "a background probe reached out: $left"
 
 # The hook is killed whenever it outruns its timeout, which used to strand its
 # tmp file; eight had accumulated in the reporter's CCD_DIR over four weeks.
@@ -3554,15 +3584,60 @@ case "$row" in
 esac
 rm -f "$ADIR/sooner.json"
 
-# ── Countdowns we cannot stand behind are not printed ────────────────────────
-# A reset in the past means the cache predates it: the percentage beside it is
-# the stale half. Print the number, claim no timing.
+# ── Somebody has to keep the file current ───────────────────────────────────
+# The checks above make a stale row read as unknown, which is honest and useless on
+# its own: before this, nothing refreshed accounts-quota.json except a user-typed
+# `ccd account` command, so the row would simply go quiet instead of going wrong.
+# A prompt tick warms it in the background.
+rm -f "$SLQ"
+printf '{"session_id":"sess-warm","cwd":"/tmp"}' \
+  | CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SLQ" ] && break; sleep 0.3; done
+[ -f "$SLQ" ] && ok "a prompt warms the account quota cache in the background" \
+  || bad "quota warm" "nothing re-probed accounts-quota.json"
+
+# ── A window that has turned over is not a reading about now ─────────────────
+# A reset in the past means the cache predates it. The row used to print the
+# percentage anyway and merely withhold the countdown, which is the half-measure
+# this fixes: 98% of a window that no longer exists is not a smaller claim than
+# 98% with a clock beside it, it is the same wrong claim with less to argue with.
+# The OTHER window is still a reading, so the row shows that one.
 seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:-60:518400
 row=$(sl_spare)
 case "$row" in
-  *"backup 98%"*"("*) bad "past reset" "counted down a reset that has already passed: $row" ;;
-  *"backup 98%"*) ok "a reset already in the past is not counted down" ;;
-  *) bad "past reset" "got: $row" ;;
+  *"backup 98%"*) bad "expired window" "served a percentage whose window had turned over: $row" ;;
+  *"backup 12%"*) ok "a window that has already reset is dropped, not shown without its clock" ;;
+  *) bad "expired window" "got: $row" ;;
+esac
+
+# With every window turned over there is nothing left to report. That is "?", the
+# state the row already has for an account it has never measured — not a number,
+# and not "none", which would deny the account exists.
+seed_rows main:ok:0:22:18000:600000 backup:ok:98:95:-60:-120
+row=$(sl_spare)
+case "$row" in
+  *"backup"*%*) bad "expired window" "invented a number from two dead windows: $row" ;;
+  *"spare ?"*) ok "...and an account with no live window reads as unknown" ;;
+  *) bad "expired window" "got: $row" ;;
+esac
+
+# Staleness has a ceiling of its own. The reset check above is the sharp instrument;
+# this is the backstop for a row whose resets cannot be parsed, or that predates a
+# reset it never recorded. The reporter's machine served a four-day-old row as
+# current for exactly this reason.
+seed_rows main:ok:0:22:18000:600000 backup:ok:8:12:18000:518400
+python3 - "$SLQ" <<'AGEPY'
+import json, sys, time
+p = sys.argv[1]
+d = json.load(open(p))
+d["backup"]["checked_at"] = int(time.time()) - 4 * 86400
+json.dump(d, open(p, "w"))
+AGEPY
+row=$(sl_spare)
+case "$row" in
+  *"backup 12%"*) bad "stale row" "served a four-day-old reading as current: $row" ;;
+  *"spare ?"*) ok "a row too old to be a reading is not shown as one" ;;
+  *) bad "stale row" "got: $row" ;;
 esac
 seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:-:-
 row=$(sl_spare)

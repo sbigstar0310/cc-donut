@@ -39,6 +39,7 @@ DASH_SHIM="$HOME/.claude/plugins/data/claude-dashboard-claude-dashboard/statusli
 # Tunable only so the test suite can reach both sides of each bound in seconds
 # rather than minutes; nothing in normal use sets them.
 DASH_MAX_STALE=${CCD_DASH_MAX_STALE:-3600}  # this old, a reading is not stale but wrong
+ACCT_MAX_STALE=${CCD_ACCT_MAX_STALE:-3600}  # the same rule, applied to account quota rows
 DASH_TIMEOUT=${CCD_DASH_TIMEOUT:-20}        # a hung child must not outlive its row
 
 # Seconds since a file was written; a large number when it is absent, and the same
@@ -360,8 +361,9 @@ fi
 #
 # Reads files directly instead of shelling out to ccd-account (~50ms per render):
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
-acct_seg=$(python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
-import datetime, hashlib, json, os, sys
+acct_seg=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" \
+  python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
+import datetime, hashlib, json, os, sys, time
 adir, qfile = sys.argv[1], sys.argv[2]
 
 # The ready/full bound, read the way ccd-account reads it (HEADROOM,
@@ -372,6 +374,14 @@ try:
     HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
 except ValueError:
     HEADROOM = 90
+# Past this, a percentage is not a stale reading but a wrong one — the same call
+# the dashboard row makes about its own cache. Nothing refreshes this file except
+# an `ccd account` command and the hook's background warm, so without a ceiling a
+# row can be served as current for days (#24).
+try:
+    MAX_STALE = int(os.environ.get("ACCT_MAX_STALE", "3600"))
+except ValueError:
+    MAX_STALE = 3600
 
 def load(p):
     try:
@@ -465,7 +475,19 @@ def row_valid(rec, acct):
     return True
 
 
-quota = {n: r for n, r in quota.items() if row_valid(r, accounts.get(n) or {})}
+def fresh(rec):
+    """Was this measured recently enough to describe now?
+
+    A future stamp is a clock that moved or a file someone edited; either way it
+    is not evidence, and treating it as fresh would make it immortal."""
+    t = rec.get("checked_at")
+    if not isinstance(t, (int, float)):
+        return False
+    return 0 <= (time.time() - t) <= MAX_STALE
+
+
+quota = {n: r for n, r in quota.items()
+         if row_valid(r, accounts.get(n) or {}) and fresh(r)}
 
 def secs_until(iso):
     """Seconds from now until an ISO timestamp, or None for any answer we cannot
@@ -482,6 +504,24 @@ def secs_until(iso):
         t = t.replace(tzinfo=datetime.timezone.utc)
     left = (t - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
     return left if left > 0 else None
+
+
+def expired(iso):
+    """Has the window this percentage belongs to already turned over?
+
+    Only a timestamp we can read and that has passed says yes. An absent or
+    unparseable one says nothing either way, and the percentage beside it is still
+    the best we have — which is a different case from one we can prove is spent.
+    Same judgement the arming path makes (scripts/quota-guard.sh, expired())."""
+    if not isinstance(iso, str) or not iso:
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
 
 
 def reading(name):
@@ -506,6 +546,11 @@ def reading(name):
                    ("seven_day_percent", "seven_day_reset")):
         v = q.get(pk)
         if not isinstance(v, (int, float)):
+            continue
+        # 98% of a window that no longer exists is not a smaller claim than 98%
+        # with a clock beside it — it is the same wrong claim with less to argue
+        # with. Drop the window; the other one may still be a reading.
+        if expired(q.get(rk)):
             continue
         secs = secs_until(q.get(rk))
         if worst is None or v > worst:
