@@ -41,6 +41,8 @@ hooks and `ccd` command are all already wired by that point. Relay that last lin
 verbatim, including the remedy it names, and carry on with the key and `ccd doctor`
 steps above. Stop only when setup failed before doing any of that.
 
-Do not substitute your own remedy. `ccd setup --auto --yes` fixes a declined prompt
-and nothing else — an unwritable startup file or a shell ccd will not edit needs the
-user to place the line by hand, and setup says which case it hit.
+Do not substitute your own remedy, and never reach for `--auto`. `ccd setup --yes`
+is what repairs a declined PATH prompt; `--auto` additionally grants consent for the
+paid OpenRouter hop, so offering it here would opt the user into billing to fix a
+shell startup file. An unwritable startup file, or a shell ccd will not edit, needs
+the user to place the line by hand — setup says which case it hit.

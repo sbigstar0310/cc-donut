@@ -50,6 +50,10 @@ import urllib.request
 # ── Constants ────────────────────────────────────────────────────────────────
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# Test-only, like CCD_TOKEN_URL: lets the suite stand up a local usage endpoint and
+# assert the VERDICT a warm probe produces, not merely that it wrote a file.
+if os.environ.get("CCD_USAGE_URL"):
+    USAGE_URL = os.environ["CCD_USAGE_URL"]
 OAUTH_BETA = "oauth-2025-04-20"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 # Anthropic has been moving token exchange from console.anthropic.com to

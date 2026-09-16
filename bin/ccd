@@ -1094,7 +1094,7 @@ setup() {
   # What went wrong, and what to do about it. Reported at the very end and as this
   # function's exit status, because an install that produced nothing runnable is a
   # failed install however much else went right. The remedy travels with the
-  # failure: `--auto --yes` repairs a declined prompt and nothing else.
+  # failure: `--yes` repairs a declined prompt and nothing else.
   local auto=0 assume_yes=0 auto_next="" fail="" fix=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1125,9 +1125,9 @@ CCD_STATUSLINE_LAUNCHER
 
   # The launcher carries the free hop between registered subscriptions, which is the
   # product rather than an extra, so a bare `ccd setup` installs it. --auto adds
-  # permission for the paid OpenRouter hop on top; --no-auto removes the launcher and
-  # remembers that. It still shadows `claude`, which is why the PATH line is asked
-  # about rather than assumed.
+  # permission for the paid OpenRouter hop on top, and nothing else — it is never the
+  # remedy for a PATH line that did not land. --no-auto removes the launcher. It still
+  # shadows `claude`, which is why the PATH line is asked about rather than assumed.
   local claude_shim="$CCD_SHIM_DIR/claude"
   # A bare `ccd setup` installs it; --auto adds permission for the paid hop on top
   # (#28). Nothing runs setup on the user's behalf — plugin updates deliberately do
@@ -1192,8 +1192,8 @@ CCD_CLAUDE_SHIM
       printf '  %sEither way they return by themselves when the quota resets.%s\n' "$d" "$r"
 
       # The shim is only reachable if its directory comes before the real claude
-      # on PATH. Ask before editing a startup file: --auto is consent to install
-      # the feature, not blanket consent to rewrite the user's dotfiles.
+      # on PATH. Ask before editing a startup file: running setup is consent to
+      # install the feature, not blanket consent to rewrite the user's dotfiles.
       if shim_leads_path; then
         printf '✓ already first on PATH — `claude` hands off on quota exhaustion\n'
       else
