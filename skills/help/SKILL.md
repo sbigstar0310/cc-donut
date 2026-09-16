@@ -38,7 +38,7 @@ subscription and only reaches OpenRouter when every one is spent.
 |---|---|
 | See registered accounts and quota | `$CCD account list` |
 | Register the account signed in right now | `$CCD account add` |
-| Switch the active account | `$CCD account use <name>` |
+| Switch the active account | `$CCD account use` (best spare) or `$CCD account use <name>` |
 | Remove one | `$CCD account rm <name>` — destructive, confirm first |
 | Refresh the stored tokens | `$CCD account refresh` |
 

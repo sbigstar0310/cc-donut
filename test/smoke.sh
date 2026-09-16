@@ -2825,6 +2825,52 @@ seed_quota "{$(q one 99 99),$(q two 10 20)}"
 [ "$("$ACCT" --no-color pick)" = "two" ] \
   && ok "pick returns the spare with room" || bad "pick" "wrong account"
 
+# ── Nobody should have to type a name ccd already knows ─────────────────────
+# Every route into a handoff picks the destination itself; the only place a person
+# supplied it was the one they typed. `use` with no name is that route for people.
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+seed_quota "{$(q one 99 99),$(q two 10 20)}"
+out=$("$ACCT" --no-color use 2>&1); rc=$?
+# The pointer alone is not a swap: a move that updates `.active` without installing
+# the target's token leaves the next session authenticating as the spent account.
+[ "$rc" -eq 0 ] && [ "$(cat "$ADIR/.active")" = "two" ] && grep -q 'AT-two' "$CREDS" \
+  && ok "a bare \`use\` moves to the account a handoff would pick" \
+  || bad "bare use" "rc=$rc active=$(cat "$ADIR/.active" 2>/dev/null): $out"
+case "$out" in
+  *"switched to two"*) ok "...and says which account it chose" ;;
+  *) bad "bare use" "did not name the destination: $out" ;;
+esac
+
+# Naming one still means that one, even when it is not what pick would choose.
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+seed_quota "{$(q one 10 10),$(q two 99 99)}"
+"$ACCT" --no-color use two --force >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$ADIR/.active")" = "two" ] && grep -q 'AT-two' "$CREDS" \
+  && ok "...while a named account is still taken at its word" \
+  || bad "bare use" "rc=$rc: an explicit name was overridden or not installed"
+
+# Nowhere to go is an answer, not a swap to something spent — and not a half-swap
+# either: the live credentials must still be the ones we came in with.
+"$ACCT" --no-color use one --force >/dev/null 2>&1
+seed_quota "{$(q one 99 99),$(q two 99 99)}"
+out=$("$ACCT" --no-color use 2>&1); rc=$?
+[ "$rc" -eq 1 ] && [ "$(cat "$ADIR/.active")" = "one" ] && grep -q 'AT-one' "$CREDS" \
+  && ok "...and with every spare spent it stays put and says so" \
+  || bad "bare use" "rc=$rc active=$(cat "$ADIR/.active" 2>/dev/null): $out"
+case "$out" in
+  *room*|*spent*|*exhaust*) ok "...in words that name the reason" ;;
+  *) bad "bare use" "gave no reason: $out" ;;
+esac
+
+# An empty name is a bad name, not a request to choose one. The difference only
+# shows when there IS something to choose, so put a spare back within reach first:
+# against an exhausted store both readings refuse, for different reasons.
+seed_quota "{$(q one 99 99),$(q two 10 20)}"
+out=$("$ACCT" --no-color use "" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && [ "$(cat "$ADIR/.active")" = "one" ] \
+  && ok "...while an empty name is rejected rather than quietly resolved" \
+  || bad "bare use" "rc=$rc: an empty name was treated as 'choose for me': $out"
+
 # The account currently in use is never its own escape route.
 seed_quota "{$(q one 10 10),$(q two 10 20)}"
 [ "$("$ACCT" --no-color pick)" = "two" ] \
@@ -2864,6 +2910,13 @@ write_creds three
 seed_quota "{$(q one 99 99),$(q two 40 40),$(q three 1 1)}"
 [ "$("$ACCT" --no-color pick)" = "two" ] \
   && ok "priority wins over lower usage" || bad "priority" "picked by usage instead"
+# And a person asking for it gets the same order: with two spares to choose
+# between, a bare `use` is the picker, not a shortcut past it.
+"$ACCT" --no-color use >/dev/null 2>&1
+[ "$(cat "$ADIR/.active")" = "two" ] && grep -q 'AT-two' "$CREDS" \
+  && ok "...and a bare \`use\` lands where pick pointed, priority and all" \
+  || bad "priority" "a bare use took the emptier spare: $(cat "$ADIR/.active" 2>/dev/null)"
+"$ACCT" --no-color use one --force >/dev/null 2>&1   # restore for the checks below
 
 # --no-probe is what the prompt hook uses; it must never open a socket, so stale
 # cache entries simply stop counting.
@@ -4005,7 +4058,7 @@ mkdir -p "$(dirname "$KEYF")"
 seed_rows here:ok:99:40:18000:518400 roomyspare:ok:8:12:18000:518400
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-[ "$row" = "⚠ quota 99% → !ccd account use roomyspare" ] \
+[ "$row" = "⚠ quota 99% → !ccd account use" ] \
   && ok "with a spare that has room, the warning is exactly the command to run" || bad "warning target" "got: $row"
 # ...and the row still carries the two numbers that make it a decision (#16): how
 # much of that spare is spent, and when its window turns over. The warning has its
@@ -4013,7 +4066,7 @@ row=$(hatch)
 full=$(warn_row)
 case "$full" in
   *"ccd -c"*) bad "warning target" "named the paid route anywhere on a row about a free hop: $full" ;;
-  *"spare roomyspare "*%*\(*\)*) ok "...and the row keeps the spare's percentage and countdown" ;;
+  *"spare roomyspare "*%*\(*\)*) ok "...and the row keeps the spare's name, percentage and countdown" ;;
   *) bad "warning target" "dropped the numbers that make the row a decision: $full" ;;
 esac
 
@@ -4062,17 +4115,16 @@ wcache 94 40 "$(iso 3600)" "$(iso 500000)"
 [ -z "$(hatch)" ] \
   && ok "...and one below it does not" || bad "warning target" "warned under the bound: $(hatch)"
 
-# A name long enough to be clipped is not named at all. A truncated account name is a
-# different account, and the row cannot know how wide the terminal is — so past the
-# bound the warning says something that stays true at any length.
+# The command carries no name, so no name can be clipped into a different account,
+# whatever the account is called (#47). The row still names it, bounded as always.
 LONGNAME=$(python3 -c "print('n' * 56)")
 mk_sl_acct here; mk_sl_acct "$LONGNAME"
 printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows "here:ok:99:40:18000:518400" "$LONGNAME:ok:8:12:18000:518400"
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
-[ "$row" = "⚠ quota 99% → a spare has room: ccd account list" ] \
-  && ok "a name too long to survive truncation is not put in the command" \
+[ "$row" = "⚠ quota 99% → !ccd account use" ] \
+  && ok "a name too long for the row cannot reach the command at all" \
   || bad "warning target" "got: $row"
 case "$(warn_row)" in
   *"spare nnn"*) ok "...and the row keeps naming it, bounded the way it always was" ;;

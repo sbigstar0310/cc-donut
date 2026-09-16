@@ -74,7 +74,7 @@ BEFORE   stuck mid-task, restart, lose the thread
 AUTO     nothing to type at all     the session moves itself to the other
                                     subscription (ccd setup)
 
-MANUAL   !ccd account use <name>    one line, then keep typing
+MANUAL   !ccd account use           one line, then keep typing
 ```
 
 `!` runs a shell command without leaving Claude Code, so the swap happens in the
@@ -224,7 +224,8 @@ calls.
 | --- | --- |
 | `ccd account add` | Register the signed-in account as a spare subscription |
 | `ccd account list` | Registered accounts with live quota |
-| `ccd account use <name>` | Hop to that account. `!ccd account use <name>` does it from inside a session, which then carries on |
+| `ccd account use` | Hop to whichever spare has room — the same one a handoff would pick. `!ccd account use` does it from inside a session, which then carries on |
+| `ccd account use <name>` | That account specifically |
 | `ccd account rm <name>` | Remove one |
 | `ccd setup` | Install everything, including the automatic hop between subscriptions |
 | `ccd setup --auto` | Also allow the paid OpenRouter hop when every subscription is spent |

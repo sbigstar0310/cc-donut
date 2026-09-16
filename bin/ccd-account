@@ -26,7 +26,7 @@ Commands:
   ccd account add [--name N] [--label L] [--priority P]
   ccd account list [--json]
   ccd account rm <name>
-  ccd account use <name> [--json]
+  ccd account use [<name>] [--json]
   ccd account refresh [--all] [--inactive-only] [<name>]
   ccd account pick [--exclude a,b] [--json]
   ccd account keepalive          (internal: called by the hook, at most daily)
@@ -1324,12 +1324,25 @@ def cmd_rm(args):
 
 
 def cmd_use(args):
-    target = swap_to(args.name, force=args.force)
+    """Switch the active account. With no name, take the best spare as measured
+    right now — the one place a person still had to supply a fact ccd measures
+    anyway. `--exclude` is deliberately not passed: it is the launcher's per-burst
+    ladder, not a verdict on an account, and a person asking for the best spare
+    means the best one, whether or not the ladder happened to touch it."""
+    name = args.name
+    if name is None:              # `use ""` stays a bad name, not a request to choose
+        a, why = best_target()
+        if a is None:
+            die("no spare is known to have room — `ccd account list` shows each one"
+                if why == "all_exhausted"
+                else "no other account is registered — add one with `ccd account add`")
+        name = a["name"]
+    target = swap_to(name, force=args.force)
     if args.json:
         print(
             json.dumps(
                 {
-                    "account": args.name,
+                    "account": name,
                     "label": target.get("label", ""),
                     "subscription_type": target.get("subscription_type"),
                 },
@@ -1338,7 +1351,7 @@ def cmd_use(args):
         )
     else:
         label = target.get("label") or target.get("subscription_type") or ""
-        print(f"{C_GRN}✓{C_RESET} switched to {C_BOLD}{args.name}{C_RESET} {C_DIM}{label}{C_RESET}")
+        print(f"{C_GRN}✓{C_RESET} switched to {C_BOLD}{name}{C_RESET} {C_DIM}{label}{C_RESET}")
     return 0
 
 
@@ -1382,13 +1395,16 @@ def cmd_refresh(args):
     return rc
 
 
-def cmd_pick(args):
-    """Choose the best account to hand off to. Exit 0 with a pick, 1 without.
+def best_target(exclude="", no_probe=False):
+    """(account, reading) for the best place to hand off, or (None, reason).
 
-    `--exclude` carries the launcher's per-burst visited set (docs §5.2), which is
+    One selection rule for every caller — the hook, the launcher, and a person
+    typing `ccd account use` — so they can differ only in what they pass in.
+
+    `exclude` carries the launcher's per-burst visited set (docs §5.2), which is
     what keeps the ladder finite without hardcoding a hop count."""
     excluded = {
-        x.strip() for x in (args.exclude or "").replace(",", " ").split() if x.strip()
+        x.strip() for x in (exclude or "").replace(",", " ").split() if x.strip()
     }
     cur = active_name()
     if cur:
@@ -1396,14 +1412,12 @@ def cmd_pick(args):
 
     candidates = [a for a in accounts_all() if a["name"] not in excluded]
     if not candidates:
-        if args.json:
-            print(json.dumps({"account": None, "reason": "no_candidate"}))
-        return 1
+        return None, "no_candidate"
 
     cache = quota_cache()
     scored = []
     for a in candidates:
-        if args.no_probe:
+        if no_probe:
             # Cached-only mode for latency-sensitive callers (the prompt hook).
             # Never opens a socket: a stale answer that costs nothing beats a
             # fresh one that freezes the user's prompt for seconds.
@@ -1421,16 +1435,24 @@ def cmd_pick(args):
             rec, cache = quota_for(a["name"], a, cache=cache)
         if has_headroom(rec):
             scored.append((a.get("priority", 999), worst(rec), a, rec))
-    if not args.no_probe:
+    if not no_probe:
         quota_cache_save(cache)
 
     if not scored:
-        if args.json:
-            print(json.dumps({"account": None, "reason": "all_exhausted"}))
-        return 1
+        return None, "all_exhausted"
 
     scored.sort(key=lambda t: (t[0], t[1]))
     _, _, a, rec = scored[0]
+    return a, rec
+
+
+def cmd_pick(args):
+    """Print where a handoff would go. Exit 0 with a pick, 1 without."""
+    a, rec = best_target(args.exclude, args.no_probe)
+    if a is None:
+        if args.json:
+            print(json.dumps({"account": None, "reason": rec}))
+        return 1
     if args.json:
         print(
             json.dumps(
@@ -1687,8 +1709,8 @@ def main(argv):
     a.add_argument("name")
     a.set_defaults(fn=cmd_rm)
 
-    a = sub.add_parser("use", help="switch the active account")
-    a.add_argument("name")
+    a = sub.add_parser("use", help="switch the active account (no name: the best spare)")
+    a.add_argument("name", nargs="?")
     a.add_argument("--json", action="store_true")
     a.add_argument("--force", action="store_true")
     a.set_defaults(fn=cmd_use)

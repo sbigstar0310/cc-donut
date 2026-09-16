@@ -73,7 +73,7 @@ ccd setup           # 구독 사이 전환이 알아서 일어납니다
 자동       칠 것 없음                 세션이 알아서 다른 구독으로
                                       옮겨갑니다 (ccd setup)
 
-수동       !ccd account use <name>    한 줄 치고 그대로 계속
+수동       !ccd account use           한 줄 치고 그대로 계속
 ```
 
 `!`를 붙이면 Claude Code를 벗어나지 않고 셸 명령을 실행할 수 있습니다. 쿼타가 바닥난
@@ -217,7 +217,8 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 | --- | --- |
 | `ccd account add` | 로그인된 계정을 예비 구독으로 등록 |
 | `ccd account list` | 등록된 계정과 실시간 쿼타 확인 |
-| `ccd account use <name>` | 그 계정으로 전환. 세션 안에서 `!ccd account use <name>`으로 하면 그 세션에서 그대로 이어집니다 |
+| `ccd account use` | 여유 있는 계정으로 전환. 핸드오프가 고르는 것과 같은 계정입니다. 세션 안에서 `!ccd account use`로 하면 그 세션에서 그대로 이어집니다 |
+| `ccd account use <name>` | 그 계정으로 전환 |
 | `ccd account rm <name>` | 계정 제거 |
 | `ccd setup` | 전체 설치. 구독 사이 자동 전환 포함 |
 | `ccd setup --auto` | 구독을 다 쓴 뒤 유료 OpenRouter 전환까지 허용 |
