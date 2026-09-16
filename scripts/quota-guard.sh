@@ -484,6 +484,11 @@ raise SystemExit(1)
 PY
 }
 
+# May quota exhaustion move this session onto the paid backbone unattended?
+# Separate from have_key on purpose: a key says OpenRouter is REACHABLE, this says
+# the user agreed it may be USED. Written by `ccd setup --auto`.
+paid_optin() { [ -f "$CCD_DIR/paid-handoff" ]; }
+
 # Everything that must hold before a session may be ended. Checked BEFORE arming,
 # not after: an armed file left behind by an unsupervised or unready session
 # would be consumed by a later launcher and resume the wrong conversation.
@@ -542,9 +547,11 @@ if [ "$EVENT" = "StopFailure" ]; then
            direction=""; account=""
            if account=$(pick_account) && [ -n "$account" ]; then
              direction=to_account
-           elif have_key; then
+           elif paid_optin && have_key; then
              direction=to_fallback; account=""
            fi
+           # Neither arm: nowhere free to go, and going somewhere paid is not ours
+           # to decide. Nothing is armed and the session ends where it is.
            # Arm first, then signal: the launcher must find the file when the
            # session exits. If the write fails, do NOT signal — ending a session
            # whose handoff was never recorded leaves nothing to bring it back.
