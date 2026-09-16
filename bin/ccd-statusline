@@ -40,6 +40,9 @@ DASH_SHIM="$HOME/.claude/plugins/data/claude-dashboard-claude-dashboard/statusli
 # rather than minutes; nothing in normal use sets them.
 DASH_MAX_STALE=${CCD_DASH_MAX_STALE:-3600}  # this old, a reading is not stale but wrong
 ACCT_MAX_STALE=${CCD_ACCT_MAX_STALE:-3600}  # the same rule, applied to account quota rows
+# Where `ccd setup` puts the launcher. Kept in step with CCD_SHIM_DIR in bin/ccd by
+# being the same expression, not by being imported — this file spawns nothing.
+
 # What the arming path calls MAX_READING_AGE. The warning and the handoff answer the
 # same question — is the subscription spent right now — so they get the same bound.
 WARN_MAX_AGE=${CCD_WARN_MAX_AGE:-1800}
@@ -364,6 +367,25 @@ fi
 #
 # Reads files directly instead of shelling out to ccd-account (~50ms per render):
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
+# Is a launcher supervising THIS session? The same contract the hook checks before it
+# signals (launcher_present, scripts/quota-guard.sh): a 32-character lowercase-hex
+# token whose state path is the one that token implies. Anything weaker calls a
+# session supervised that the hook will refuse, which is the silence this row exists
+# to end — #21 was an install sitting inert for four days while every surface except
+# `ccd doctor` reported success, and doctor is the command nobody runs BEFORE the
+# thing they installed fails to happen.
+#
+# ONE message, not a remedy. Whether a restart or a `ccd setup` is what fixes it
+# depends on facts this path cannot establish without spawning a process — whether
+# the file at the shim path is ours, and which `claude` PATH actually resolves to —
+# and confident wrong advice is worse than none. `ccd doctor` answers that, and says
+# "NOT supervised" in the same words.
+supervision="not supervised"
+_tok=${CCD_HANDOFF:-}
+if [ "${#_tok}" -eq 32 ] && [ "${CCD_HANDOFF_STATE:-}" = "$CCD_DIR/handoff-$_tok.json" ]; then
+  case "$_tok" in *[!0-9a-f]*) ;; *) supervision="" ;; esac
+fi
+
 acct_out=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" \
   python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" 2>/dev/null <<'PY'
 import datetime, hashlib, json, os, sys, time
@@ -805,6 +827,15 @@ fi
 # halves would otherwise spend the width twice on one account, and this row is
 # truncated: `!ccd account use sbigstar0930` clipped to `!ccd account use s` is not
 # a shorter instruction, it is a wrong one. The actionable half wins.
+# The note yields to the warning. Its job is to be read BEFORE the quota runs out —
+# at the moment it has, the command in the warning is the thing to act on, and this
+# row is truncated at terminal width. Same rule the tail follows below: the
+# actionable half wins. An empty tail means fewer than two accounts, where a
+# launcher would have nowhere to hand off to and the note would be noise.
+if [ -z "$suffix" ] && [ -n "$supervision" ] && [ -n "$acct_tail" ]; then
+  acct_head="$acct_head $(printf '\033[33m(%s)\033[0m' "$supervision")"
+fi
+
 row="$acct_head"
 case "$suffix" in
   *"!ccd account use "*) ;;
