@@ -1070,6 +1070,15 @@ def swap_to(name, force=False):
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
             drop_account_scoped_config()
+            # And the third half is what WE cached about it. quota-cache.json holds
+            # the signed-in account's usage; after this it describes somebody else,
+            # and the statusline's red warning reads it with no idea a swap happened.
+            # Deleting beats rewriting: the next hook tick measures the new account,
+            # and until then "unknown" is the only honest answer.
+            try:
+                os.unlink(os.path.join(CCD_DIR, "quota-cache.json"))
+            except OSError:
+                pass
 
     if not force:
         others = claude_processes()

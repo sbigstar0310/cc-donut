@@ -40,6 +40,9 @@ DASH_SHIM="$HOME/.claude/plugins/data/claude-dashboard-claude-dashboard/statusli
 # rather than minutes; nothing in normal use sets them.
 DASH_MAX_STALE=${CCD_DASH_MAX_STALE:-3600}  # this old, a reading is not stale but wrong
 ACCT_MAX_STALE=${CCD_ACCT_MAX_STALE:-3600}  # the same rule, applied to account quota rows
+# What the arming path calls MAX_READING_AGE. The warning and the handoff answer the
+# same question — is the subscription spent right now — so they get the same bound.
+WARN_MAX_AGE=${CCD_WARN_MAX_AGE:-1800}
 DASH_TIMEOUT=${CCD_DASH_TIMEOUT:-20}        # a hung child must not outlive its row
 
 # Seconds since a file was written; a large number when it is absent, and the same
@@ -663,15 +666,44 @@ PY
 # ── Append the escape hatch only above the threshold
 suffix=""
 if [ -f "$CACHE" ]; then
-  suffix=$(THRESHOLD="$THRESHOLD" python3 - "$CACHE" 2>/dev/null <<'PY'
-import json, os, sys
+  suffix=$(THRESHOLD="$THRESHOLD" WARN_MAX_AGE="$WARN_MAX_AGE" \
+    python3 - "$CACHE" 2>/dev/null <<'PY'
+# The loudest thing on the screen has to be the best qualified. Three gates, the same
+# three the arming path applies before it ends a session (scripts/quota-guard.sh,
+# quota_peak): the reading must be usable, recent, and about a window that still
+# exists. Without them a sample taken before a reset went on reading 96% afterwards,
+# and a swap left the previous account's 99% shouting beside the new account's 3%.
+import datetime, json, os, sys
+path = sys.argv[1]
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.load(open(path))
+    age = datetime.datetime.now().timestamp() - os.path.getmtime(path)
 except Exception:
     sys.exit(0)
+if age > float(os.environ["WARN_MAX_AGE"]):
+    sys.exit(0)
 c = d.get("claude") or {}
-vals = [p for p in (c.get("fiveHourPercent"), c.get("sevenDayPercent"))
-        if isinstance(p, (int, float))]
+if c.get("available") is not True or c.get("error") is not False:
+    sys.exit(0)
+
+
+def spent(iso):
+    """Is this window still the one running? An unreadable timestamp says nothing
+    either way, and the percentage beside it is still the best we have."""
+    if not isinstance(iso, str) or not iso:
+        return True
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t > datetime.datetime.now(datetime.timezone.utc)
+
+
+vals = [p for p, r in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
+                       (c.get("sevenDayPercent"), c.get("sevenDayReset")))
+        if isinstance(p, (int, float)) and spent(r)]
 if vals and max(vals) >= int(os.environ["THRESHOLD"]):
     # Red, bold — impossible to miss
     print("\033[1;31m⚠ quota " + str(int(max(vals))) + "% → /exit then ccd -c\033[0m", end="")

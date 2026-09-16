@@ -3735,6 +3735,107 @@ fi
 
 rm -rf "$ADIR" "$SLQ"
 
+head_ "27b. the escape hatch fires on a reading, not on a memory"
+# The loudest thing ccd puts on screen, in bold red, was the least qualified: it read
+# one number out of quota-cache.json with no age check, no window check, and no check
+# that the reading was even usable. The arming path next door applies all three, and
+# for the same reason — "a 96% sample taken before a reset still reads 96%
+# afterwards" (scripts/quota-guard.sh:275).
+WDIR="$FAKE/.claude/ccd"
+mkdir -p "$WDIR"
+rm -rf "$FAKE/.claude/ccd/accounts"
+warn_row() {
+  printf '%s' '{"model":{"id":"claude-fable-5"}}' \
+    | "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g'
+}
+wcache() { # $1=5h $2=7d $3=5h reset $4=7d reset [$5=age seconds]
+  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"sevenDayPercent":%s,"fiveHourReset":"%s","sevenDayReset":"%s"}}\n' \
+    "$1" "$2" "$3" "$4" > "$WDIR/quota-cache.json"
+  [ -n "${5:-}" ] && python3 -c "
+import os, sys, time
+t = time.time() - float(sys.argv[2])
+os.utime(sys.argv[1], (t, t))" "$WDIR/quota-cache.json" "$5"
+  return 0
+}
+iso() { python3 -c "
+import datetime, sys
+print((datetime.datetime.now(datetime.timezone.utc)
+       + datetime.timedelta(seconds=float(sys.argv[1]))).isoformat())" "$1"; }
+
+# The baseline the rest of this section moves away from.
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+case "$(warn_row)" in
+  *"quota 99%"*) ok "a fresh reading over the threshold still warns" ;;
+  *) bad "escape hatch" "no warning on a good reading: $(warn_row)" ;;
+esac
+
+# Age. The cache keeps its last good sample when a refresh fails, so a reading can
+# outlive the window it measured.
+wcache 99 40 "$(iso 3600)" "$(iso 500000)" 3600
+case "$(warn_row)" in
+  *"quota"*) bad "escape hatch" "warned from an hour-old reading: $(warn_row)" ;;
+  *) ok "a reading too old to describe now does not raise the alarm" ;;
+esac
+
+# The window itself. 99% of a five-hour window that reset twenty minutes ago is not a
+# claim about the window running now, however fresh the file is.
+wcache 99 40 "$(iso -1200)" "$(iso 500000)"
+case "$(warn_row)" in
+  *"quota 99%"*) bad "escape hatch" "warned on a window that had already turned over: $(warn_row)" ;;
+  *) ok "a window that has already reset is not counted against the user" ;;
+esac
+# ...while the OTHER window still counts. Same file, same age, weekly over the bound.
+wcache 20 97 "$(iso -1200)" "$(iso 500000)"
+case "$(warn_row)" in
+  *"quota 97%"*) ok "...and a live window over the bound still warns" ;;
+  *) bad "escape hatch" "dropped a live window with the dead one: $(warn_row)" ;;
+esac
+
+# Usable. The dashboard reports its own failures as valid JSON with error=true, and
+# the arming path already refuses those. Each flag is checked on its own: set both at
+# once and an `or` that should have been an `and` passes anyway.
+wflags() { # $1=available $2=error
+  printf '{"claude":{"available":%s,"error":%s,"fiveHourPercent":99,"sevenDayPercent":99,"fiveHourReset":"%s","sevenDayReset":"%s"}}\n' \
+    "$1" "$2" "$(iso 3600)" "$(iso 500000)" > "$WDIR/quota-cache.json"
+}
+wflags false true
+case "$(warn_row)" in
+  *"quota"*) bad "escape hatch" "warned from a failed reading: $(warn_row)" ;;
+  *) ok "a reading that reports itself unusable raises nothing" ;;
+esac
+wflags true true
+case "$(warn_row)" in
+  *"quota"*) bad "escape hatch" "error=true alone was not enough to silence it" ;;
+  *) ok "...error=true alone is enough" ;;
+esac
+wflags false false
+case "$(warn_row)" in
+  *"quota"*) bad "escape hatch" "available=false alone was not enough to silence it" ;;
+  *) ok "...and so is available=false" ;;
+esac
+
+# A reset we cannot read says nothing either way, so its percentage still counts.
+# Silence there would be the worse failure: a user at 99% seeing nothing.
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":99,"sevenDayPercent":40,"fiveHourReset":"R1","sevenDayReset":"D1"}}\n' \
+  > "$WDIR/quota-cache.json"
+case "$(warn_row)" in
+  *"quota 99%"*) ok "an unreadable reset does not disqualify its window" ;;
+  *) bad "escape hatch" "went silent on a window it could not time: $(warn_row)" ;;
+esac
+
+# A swap makes the cache about somebody else. Leaving it in place is what put a red
+# 99% beside a dashboard row reading 3% on the reporter's screen.
+rm -rf "$FAKE/.claude/ccd/accounts"; mkdir -p "$ADIR"
+mk_sl_acct one; mk_sl_acct two
+printf 'one' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+wcache 99 40 "$(iso 3600)" "$(iso 500000)"
+HOME="$FAKE" "$ACCT" --no-color use two --force >/dev/null 2>&1 \
+  && ok "the swap itself succeeds" || bad "swap cache" "the swap failed, so absence proves nothing"
+[ ! -f "$WDIR/quota-cache.json" ] \
+  && ok "a swap drops the reading that was about the account it left" \
+  || bad "swap cache" "kept a reading about the previous account"
+rm -rf "$ADIR"
+
 head_ "28. no claude-dashboard installed"
 # ccd reads Claude quota to do three things: warn before exhaustion, notice a
 # reset, and corroborate a rate_limit before arming a handoff. claude-dashboard
