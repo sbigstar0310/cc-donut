@@ -1841,6 +1841,13 @@ case "$out" in
   *"not active"*) ok "...and says so in words" ;;
   *) bad "inert install" "no explanation: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
 esac
+# The remedy has to be a command that actually installs the line. A bare setup
+# stopped touching PATH when the launcher became the paid hop's, so advising it
+# here sends the user to a command that does nothing about their problem.
+case "$out" in
+  *"setup --auto --yes"*) ok "...and names a command that would fix it" ;;
+  *) bad "inert install" "advised a bare setup, which no longer wires PATH: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
 [ -x "$SHIM" ] \
   && ok "...and the shim stays, so --yes can finish what this run started" \
   || bad "inert install" "removed the shim as well"
@@ -4249,6 +4256,9 @@ printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDay
 SHIMD="$FAKE/.claude/ccd/bin"
 sl_env() { env -u CCD_HANDOFF "$@" HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
              | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:'; }
+# A launcher is only needed by the hop that is authorised here. With the paid hop
+# on, an unsupervised session cannot take it — which is what these cases are about.
+paid_optin_on
 
 # Nothing installed: there is no launcher, so no session can hand off.
 rm -rf "$SHIMD"
@@ -4307,6 +4317,20 @@ case "$row" in
   *"spare backup"*) ok "a session holding the hook's own contract is told nothing" ;;
   *) bad "supervision" "got: $row" ;;
 esac
+
+# Neither is a session that needs no launcher at all. Without the paid opt-in the
+# only hop this install can make happens inside the session, and warning about
+# supervision there marks a correct, complete install as broken.
+paid_optin_off
+rm -rf "$SHIMD"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"not supervised"*) bad "supervision" "warned an install whose only hop needs no launcher: $row" ;;
+  *"spare backup"*) ok "...and an install with no paid hop is not warned about a launcher it does not need" ;;
+  *) bad "supervision" "got: $row" ;;
+esac
+paid_optin_on
+mkdir -p "$SHIMD"; printf '#!/bin/sh\n' > "$SHIMD/claude"; chmod +x "$SHIMD/claude"
 
 # The note and the warning no longer compete: the warning takes its own line, so both
 # can say their piece without either being truncated away.
@@ -5183,7 +5207,7 @@ paid_optin_off
 # The plugin root is passed explicitly. Without it the hook resolves ccd-account
 # through the plugin cache, where an older copy is staged — and the section would
 # test that copy instead of the tree.
-sw_hook() { CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" "$@"; }
+sw_hook() { CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE="${SW_SETTLE:-0}" "$ROOT/scripts/quota-guard.sh" "$@"; }
 # Its own store, every time. Two accounts, the signed-in one spent and the other
 # with room, plus the reading that corroborates it. Seeded per case rather than
 # inherited: a case that ran on the previous one's leftovers would have nothing to
@@ -5266,29 +5290,68 @@ case "$out" in
 esac
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
-# ── At most one swap per account per reset window ───────────────────────────
+# ── The account a swap just left is not where the next one goes ─────────────
 # The ordinary case cannot repeat, because the swap deletes the reading that
-# caused it. What can is a cached row that says "room" about an account that has
-# none: the session would walk back and forth between two spent accounts on one
-# reading. The window that reading names is the key, so a second swap away from
-# the same account inside it is refused.
+# caused it. What can is a cached row claiming room for an account that has none:
+# the session would walk back and forth between two spent accounts. The rule that
+# stops it cannot be "refuse to leave" — a stale row lands you back on a spent
+# account, and refusing to leave it again strands you there while a healthy one is
+# registered. So a swap records where it came FROM, and that account stops being a
+# destination while the record is live. Leaving is never blocked.
+sw_fixture3() { # three accounts; the signed-in one is the most attractive row of all
+  sw_fixture 58 96
+  write_creds spare2; "$ACCT" --no-color add --name spare2 --label "spare2@example.com" >/dev/null 2>&1
+  "$ACCT" --no-color use spent --force >/dev/null 2>&1
+  printf '{"spent":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":1,"seven_day_percent":1},"spare":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":10,"seven_day_percent":20},"spare2":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":30,"seven_day_percent":40}}' \
+    "$(date +%s)" "$(cred_fp "$ADIR/spent.json")" \
+    "$(date +%s)" "$(cred_fp "$ADIR/spare.json")" \
+    "$(date +%s)" "$(cred_fp "$ADIR/spare2.json")" > "$SWD/accounts-quota.json"
+  quota "$1" "$2"
+}
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture3 58 96
 sw_prompt UserPromptSubmit sess-sw5 >/dev/null
-grep -q 'AT-spare' "$CREDS" || bad "flap guard" "the fixture's first swap never happened"
-"$ACCT" --no-color use spent --force >/dev/null 2>&1
-quota 58 96                                  # same account, same window, same numbers
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
+  || bad "flap guard" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
+quota 58 96                        # the account it landed on is spent too
 sw_prompt UserPromptSubmit sess-sw6 >/dev/null
-grep -q 'AT-spent' "$CREDS" \
-  && ok "a second swap away from the same account in the same window is refused" \
-  || bad "flap guard" "swapped again on the reading that had already moved it once"
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"fiveHourReset":"R2","sevenDayPercent":96,"sevenDayReset":"D2"}}\n' \
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
+  && ok "the account a swap just left is not offered as the next destination" \
+  || bad "flap guard" "went to $(cat "$ADIR/.active" 2>/dev/null) — back onto an account it had just left as spent"
+
+# A reading that names no window at all is the same situation, not a hole in the
+# rule: without a record there, one unreadable reading walks the session through
+# every account it owns.
+sw_fixture3 58 96
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"sevenDayPercent":96}}\n' \
   > "$SWD/quota-cache.json"
+sw_prompt UserPromptSubmit sess-sw5b >/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
+  || bad "no-window guard" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"sevenDayPercent":96}}\n' \
+  > "$SWD/quota-cache.json"
+sw_prompt UserPromptSubmit sess-sw6b >/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
+  && ok "...and a reading with no reset timestamp records the departure all the same" \
+  || bad "no-window guard" "went to $(cat "$ADIR/.active" 2>/dev/null) on a reading that names no window"
+
+# Bounded by time, not by how many entries fit: an account left long enough ago is
+# a destination again, whatever else has been recorded since.
+sw_fixture3 58 96
+export CCD_SWAP_GUARD_TTL=1
 sw_prompt UserPromptSubmit sess-sw7 >/dev/null
-grep -q 'AT-spare' "$CREDS" \
-  && ok "...while the next window is a new situation, and moves it again" \
-  || bad "flap guard" "refused a swap in a window it had never left"
+quota 58 96
+sw_prompt UserPromptSubmit sess-sw7b >/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
+  || bad "guard ttl" "the second hop went to $(cat "$ADIR/.active" 2>/dev/null)"
+sleep 2
+quota 58 96
+sw_prompt UserPromptSubmit sess-sw7c >/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spent" ] \
+  && ok "...and a record that has aged out stops excluding anything" \
+  || bad "guard ttl" "still excluded an account left longer ago than the bound: $(cat "$ADIR/.active" 2>/dev/null)"
+unset CCD_SWAP_GUARD_TTL
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
 # ── After the wall: swap, then wake the session that parked ─────────────────
@@ -5329,37 +5392,51 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
 # A wake that lands on the account we just left is a wasted turn: it fails the same
 # way and parks again. The swap writes the live store, but a keychain that refused
-# — or this session writing its own blob back over ours — leaves that store still
-# describing the old account. The plan fields travel with the credential and
-# survive the token rotation a pickup causes, which is why the token itself cannot
-# answer this, and why nothing is woken without an answer.
+# — or this session writing its own refreshed blob back over ours — leaves that
+# store holding the credential we meant to leave. Only the credential's own
+# identity can settle that: a plan is not an account, and two accounts on one plan
+# (which is what this fixture is) agree about every plan field there is.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
 sw_fixture 58 96
-python3 - "$ADIR/spare.json" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-d["subscription_type"] = "team"       # what the store records, and the blob, disagree
-json.dump(d, open(sys.argv[1], "w"))
-PY
-rc=$(sw_stopfail sess-sw9)
+cp "$CREDS" "$FAKE/.creds-before"            # the outgoing account's live blob
+( sleep 0.7; cp "$FAKE/.creds-before" "$CREDS" ) &
+REVERT=$!
+rc=$(SW_SETTLE=2 sw_stopfail sess-sw9)
+wait "$REVERT" 2>/dev/null
 [ "$rc" != "2" ] \
-  && ok "a swap the live store cannot confirm wakes nothing" \
+  && ok "a live store that no longer holds the credential we installed wakes nothing" \
   || bad "unconfirmed wake" "woke the session into the account it had just left"
+
+# ...and a swap it cannot confirm is not a reason to start spending money. The
+# credential, the pointer and the guard record have all moved by then; arming the
+# paid hop on top of that bills the user for a swap that may well have worked.
+paid_optin_on
+sw_fixture 58 96
+cp "$CREDS" "$FAKE/.creds-before"
+( sleep 0.7; cp "$FAKE/.creds-before" "$CREDS" ) &
+REVERT=$!
+rc=$(SW_SETTLE=2 sw_stopfail sess-sw9b)
+wait "$REVERT" 2>/dev/null
+[ ! -f "$SWD/handoff-00000000000000000000000000000002.json" ] \
+  && ok "...and arms no paid hop off a confirmation that failed" \
+  || bad "unconfirmed paid hop" "armed $(hf_get direction) after a swap it could not confirm"
+if kill -0 "$SWPID" 2>/dev/null; then ok "...nor ends the session over one"
+else bad "unconfirmed paid hop" "signalled a session whose swap had already happened"; fi
+paid_optin_off
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
 # ── The wake has to be registered, and has to read like something ccd said ──
 python3 - "$ROOT/hooks/hooks.json" "$ROOT/scripts/quota-guard.sh" <<'PY' \
   && ok "the StopFailure entry is registered as an asyncRewake hook" \
   || bad "hooks.json" "the exit 2 above would wake nothing"
-import json, re, sys
+import json, sys
 groups = json.load(open(sys.argv[1]))["hooks"]["StopFailure"]
 entry = [e for g in groups for e in g["hooks"]][0]
 assert entry.get("asyncRewake") is True, "asyncRewake is not set on the command hook"
-settle = int(re.search(r"CCD_SWAP_SETTLE:-(\d+)", open(sys.argv[2]).read()).group(1))
-t = entry.get("timeout")
-assert isinstance(t, int) and t > settle * 4, \
-    f"timeout {t} does not comfortably exceed a {settle}s confirm wait — a hook killed there wakes nothing"
+# Section 30 owns the arithmetic: a timeout that clears the settle alone says
+# nothing about the pick that runs before it.
+assert isinstance(entry.get("timeout"), int), f"timeout is {entry.get('timeout')!r}"
 PY
 python3 - "$ROOT/hooks/hooks.json" <<'PY' \
   && ok "...carrying wake text of its own, not the blocking-error default" \
@@ -5407,11 +5484,170 @@ esac
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 rm -f "$SWD/run-state.json"
 
+head_ "30. the swap is one transaction, under one lock"
+# Deciding where to go and installing the credential were two processes and no
+# lock: the account was read before anything was held, so the background keepalive
+# could rotate that account's one-time token in between and the swap would install
+# the copy it read — a dead spare, handed to a session that has just run out.
+
+# ── The token that is installed is the token the store holds NOW ────────────
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+# The background job's own single-flight lock, held while it rotates the spare —
+# exactly what `ccd-account keepalive` does behind REFRESH_LOCK.
+python3 - "$ADIR/.refresh.lock" "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY' &
+import fcntl, hashlib, json, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(2)
+d = json.load(open(sys.argv[2]))
+d["claudeAiOauth"]["accessToken"] = "AT-spare-rotated"
+with open(sys.argv[2], "w") as f:
+    json.dump(d, f)
+# The pass re-measures what it rotated, exactly as `keepalive --pick` does: a
+# verdict that still named the retired token would be discarded as somebody
+# else's, and this test would pass for the wrong reason.
+q = json.load(open(sys.argv[3]))
+q["spare"]["cred"] = hashlib.sha256(b"AT-spare-rotated").hexdigest()[:16]
+q["spare"]["checked_at"] = int(time.time())
+with open(sys.argv[3], "w") as f:
+    json.dump(q, f)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+PY
+ROT=$!
+sleep 0.4
+sw_prompt UserPromptSubmit sess-tx1 >/dev/null
+wait "$ROT" 2>/dev/null
+grep -q 'AT-spare-rotated' "$CREDS" \
+  && ok "a swap installs the credential the store holds when it takes the lock" \
+  || bad "rotation race" "installed a snapshot read before the lock — a spent one-time token"
+
+# The same race one lock deeper. `ccd account refresh` takes the store lock and
+# not the single-flight, so holding the single-flight is not enough: the account
+# has to be READ inside the store lock too, or the swap installs a copy that was
+# already stale when it got there.
+sw_fixture 58 96
+python3 - "$ADIR/.lock" "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY' &
+import fcntl, hashlib, json, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(2)
+d = json.load(open(sys.argv[2]))
+d["claudeAiOauth"]["accessToken"] = "AT-spare-rotated"
+with open(sys.argv[2], "w") as f:
+    json.dump(d, f)
+q = json.load(open(sys.argv[3]))
+q["spare"]["cred"] = hashlib.sha256(b"AT-spare-rotated").hexdigest()[:16]
+q["spare"]["checked_at"] = int(time.time())
+with open(sys.argv[3], "w") as f:
+    json.dump(q, f)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+PY
+ROT=$!
+sleep 0.4
+sw_prompt UserPromptSubmit sess-tx1b >/dev/null
+wait "$ROT" 2>/dev/null
+grep -q 'AT-spare-rotated' "$CREDS" \
+  && ok "...read inside that lock too, so a refresh beside it cannot be lost" \
+  || bad "rotation race" "installed the copy it read before the store lock"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
+# ── A decision about an account we are no longer on does nothing ────────────
+# Two sessions can reach the same reading and both decide to leave the same
+# account. The second one has to notice the store moved while it was deciding, or
+# one reading walks the session through two accounts.
+sw_fixture3 58 96
+out=$("$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" --no-probe 2>/dev/null); rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(printf '%s' "$out" | cut -f1)" = "spare" ]; } \
+  && ok "a swap names where it went, and the credential it installed" \
+  || bad "swap command" "rc=$rc out='$(printf '%s' "$out" | tr '\t' ' ')'"
+[ -n "$(printf '%s' "$out" | cut -f2)" ] \
+  && ok "...as an identity the confirmation can check later" \
+  || bad "swap command" "named no credential: '$(printf '%s' "$out" | tr '\t' ' ')'"
+out2=$("$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" --no-probe 2>/dev/null); rc2=$?
+{ [ "$rc2" -ne 0 ] && [ "$(cat "$ADIR/.active")" = "spare" ]; } \
+  && ok "...and a second decision about the account we already left does nothing" \
+  || bad "stale decision" "rc=$rc2, now on $(cat "$ADIR/.active")"
+
+# Both departures stay on the record. Count-based eviction threw away entries that
+# were still current; time is the only bound now.
+"$ACCT" --no-color swap --from spare --window "5h=R1;7d=D1" --no-probe >/dev/null 2>&1
+recs=$(python3 - "$SWD/swapped-windows" <<'PY'
+import sys
+try:
+    lines = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
+except OSError:
+    lines = []
+print(" ".join(sorted(l.split("\t")[1] for l in lines if len(l.split("\t")) >= 2)))
+PY
+)
+[ "$recs" = "spare spent" ] \
+  && ok "every account a swap left stays on the record while it is current" \
+  || bad "guard record" "recorded: '$recs'"
+
+# ── The pick gets a deadline, and the hook's budget covers what follows it ──
+# best_target() probes candidates one after another and a refresh tries two
+# endpoints; nine expired spares ahead of a usable one can eat the whole hook
+# timeout, and a hook killed there wakes nobody.
+export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
+export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
+stage_usage 5 5
+sw_fixture3 58 96
+rm -f "$SWD/accounts-quota.json"        # nothing measured: every candidate needs a probe
+: > "$CCD_FAKE_USAGE_LOG"
+"$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" --deadline 0 >/dev/null 2>&1; rc=$?
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+{ [ "$rc" -ne 0 ] && [ "${calls:-0}" -eq 0 ]; } \
+  && ok "a pick with no budget left probes nothing rather than overrunning the hook" \
+  || bad "pick deadline" "rc=$rc after ${calls:-0} probes"
+: > "$CCD_FAKE_USAGE_LOG"
+"$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" --deadline 30 >/dev/null 2>&1
+[ "$(cat "$ADIR/.active")" != "spent" ] \
+  && ok "...while a budget that allows one measures and moves" \
+  || bad "pick deadline" "measured nothing with 30s of budget ($(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ') probes)"
+unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
+
+python3 - "$ROOT/hooks/hooks.json" "$ROOT/scripts/quota-guard.sh" <<'PY' \
+  && ok "the hook's timeout covers the pick's budget, the settle and the wake" \
+  || bad "hook budget" "the backstop can be killed before it wakes anything"
+import json, re, sys
+src = open(sys.argv[2]).read()
+def env_default(name):
+    m = re.search(rf"{name}:-(\d+)", src)
+    assert m, f"{name} has no default in quota-guard.sh"
+    return int(m.group(1))
+settle = env_default("CCD_SWAP_SETTLE")
+budget = env_default("CCD_SWAP_PICK_BUDGET")
+entry = [e for g in json.load(open(sys.argv[1]))["hooks"]["StopFailure"] for e in g["hooks"]][0]
+t = entry.get("timeout")
+assert isinstance(t, int), f"timeout is {t!r}"
+# The pick may spend its whole budget, the settle runs after it, and the swap,
+# the confirm and the wake all have to fit in what is left.
+assert t >= budget + settle + 30, \
+    f"timeout {t} leaves {t - budget - settle}s for a swap, a confirm and a wake"
+PY
+
+# ── The status screen promises only what this path does ─────────────────────
+# The subscription hop fires when the reading says the account is spent. It does
+# not come back on its own — nothing measures the account you left while you are
+# not on it — and a promise of a return is a promise the user would wait for.
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" 2>&1 | sed -n '/When quota runs out/,/Other commands/p')
+case "$out" in
+  *"back when the window resets"*)
+    bad "status promise" "promised a return the subscription path does not make" ;;
+  *"registered account has room"*)
+    ok "the status screen promises the hop it makes, and no return it does not" ;;
+  *) bad "status promise" "said neither: $(printf '%s' "$out" | tr '\n' ' ' | head -c 140)" ;;
+esac
+
 rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$SWD/accounts-keepalive" \
-       "$FAKE/.sw-out" "$FAKE/.sw-err"
+       "$FAKE/.sw-out" "$FAKE/.sw-err" "$FAKE/.creds-before"
 hf_reset
 unset CCD_USAGE_URL CCD_TOKEN_URL
-unset -f sw_hook sw_fixture sw_prompt sw_stopfail
+unset -f sw_hook sw_fixture sw_fixture3 sw_prompt sw_stopfail
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

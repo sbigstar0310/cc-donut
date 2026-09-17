@@ -29,6 +29,7 @@ Commands:
   ccd account use [<name>] [--json]
   ccd account refresh [--all] [--inactive-only] [<name>]
   ccd account pick [--json]
+  ccd account swap [--from N] [--window K] (internal: called by the hook)
   ccd account keepalive          (internal: called by the hook, at most daily)
   ccd account current [--json]   (internal: statusline / doctor)
 """
@@ -112,6 +113,12 @@ REFRESH_LOCK = os.path.join(ACCOUNTS_DIR, ".refresh.lock")    # see cmd_keepaliv
 ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
 QUOTA_FILE = os.path.join(CCD_DIR, "accounts-quota.json")
 KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
+# Where automatic swaps have come FROM lately, so one is never sent back to an
+# account it just left as spent. Bounded by time: an entry is a statement about
+# the last half hour, not a permanent verdict, and nothing is evicted while it
+# still describes now (see swap_guard_read).
+SWAP_GUARD = os.path.join(CCD_DIR, "swapped-windows")
+SWAP_GUARD_TTL = int(os.environ.get("CCD_SWAP_GUARD_TTL", "1800"))
 # Breadcrumb for the hook. keepalive runs backgrounded with its output discarded,
 # so anything it prints is lost; the hook picks this up on a later tick.
 STALE_FILE = os.path.join(CCD_DIR, "accounts-stale")
@@ -1020,6 +1027,56 @@ def worst(rec):
 # ── The swap ─────────────────────────────────────────────────────────────────
 
 
+def swap_guard_read():
+    """Accounts an automatic swap has left recently, as {name: (when, window)}.
+
+    A swap must not be sent back to the account it just left as spent: a cached
+    row claiming room for a spent account would otherwise walk the session back
+    and forth between two of them. Recording where a swap came FROM, rather than
+    refusing to leave, is what keeps that impossible without ever stranding a
+    session: leaving is always allowed, only returning is held off.
+
+    Lines are `<epoch>TAB<account>TAB<window key>`. Anything else is not a record,
+    and anything older than the TTL has stopped describing now."""
+    live = {}
+    try:
+        with open(SWAP_GUARD) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return live
+    cutoff = now() - SWAP_GUARD_TTL
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            when = int(parts[0])
+        except ValueError:
+            continue
+        if when < cutoff or not parts[1]:
+            continue
+        if parts[1] not in live or when > live[parts[1]][0]:
+            live[parts[1]] = (when, parts[2])
+    return live
+
+
+def swap_guard_record(name, window):
+    """Remember that a swap has just left `name`, and drop what has aged out.
+
+    One line per account, so the file cannot grow past the store, and the bound is
+    time alone — a count evicts entries that still describe now, which is how an
+    account a swap had just left became a destination again."""
+    live = swap_guard_read()
+    live[name] = (now(), window or "none")
+    try:
+        write_atomic(SWAP_GUARD,
+                     "".join(f"{w}\t{n}\t{k}\n" for n, (w, k) in sorted(live.items())))
+    except OSError:
+        pass            # the swap happened; losing the note is not worth failing it
+
+
+
+
 def swap_to(name, force=False):
     """Replace only the claudeAiOauth subtree of the live blob.
 
@@ -1027,18 +1084,25 @@ def swap_to(name, force=False):
     No coordination is needed even so — Claude Code reads this store per request
     and writes it only when it rotates a token, and the write is atomic either
     way. Measured: a swapped session kept working for 16.9 hours across two
-    refreshes without a restart."""
-    target = account_load(name)
-    if not target:
-        die(f"no such account: {name}")
-    oauth = target.get("claudeAiOauth")
-    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
-        die(
-            f"account '{name}' has no usable credentials — run `claude` and sign "
-            f"in with /login as that account"
-        )
+    refreshes without a restart.
 
+    Returns (account, credential fingerprint): the identity of what was actually
+    installed, which is the only thing a later confirmation can check.
+
+    The account is loaded INSIDE the lock. Loaded before it, the copy can already
+    have been replaced by the time it is written — every refresh mints a new
+    one-time token, so installing a snapshot hands the session a token the server
+    has retired, which is a dead spare at the worst possible moment."""
     with Lock(LOCK_FILE):
+        target = account_load(name)
+        if not target:
+            die(f"no such account: {name}")
+        oauth = target.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            die(
+                f"account '{name}' has no usable credentials — run `claude` and "
+                f"sign in with /login as that account"
+            )
         blob, sources = live_read()
         if not blob:
             die("could not read the current Claude credentials")
@@ -1092,6 +1156,11 @@ def swap_to(name, force=False):
                 os.unlink(os.path.join(CCD_DIR, "quota-cache.json"))
             except OSError:
                 pass
+        # What the next confirmation has to match. Taken here, inside the lock,
+        # from the very dict that was written — not from a later read, which a
+        # rotation could already have moved on.
+        installed = _cred_fingerprint(
+            target if cur != name else {"claudeAiOauth": blob.get("claudeAiOauth")})
 
     if not force:
         others = claude_processes()
@@ -1102,7 +1171,7 @@ def swap_to(name, force=False):
             noun = "session is" if others == 1 else "sessions are"
             warn(f"{others} other Claude Code {noun} running — this moves them to "
                  f"{name} too, from their next token refresh.")
-    return target
+    return target, installed
 
 
 def claude_processes():
@@ -1337,7 +1406,7 @@ def cmd_use(args):
                 if why == "all_exhausted"
                 else "no other account is registered — add one with `ccd account add`")
         name = a["name"]
-    target = swap_to(name, force=args.force)
+    target, _ = swap_to(name, force=args.force)
     if args.json:
         print(
             json.dumps(
@@ -1360,6 +1429,56 @@ def cmd_use(args):
         print(f"{C_DIM}  What lags: the model list and limits, Fable access and the "
               f"/status identity keep describing the previous account until the "
               f"next launch.{C_RESET}")
+    return 0
+
+
+def cmd_swap(args):
+    """Decide where to go and install it, as one transaction. Internal: the hook.
+
+    The pick and the install used to be two processes with nothing held between
+    them. In that gap the background keepalive could rotate the chosen account's
+    one-time token, and the swap would then install the copy it had already read;
+    two sessions could also act on one reading and move the store twice. So the
+    whole decision runs under the lock the background job takes, every fact it
+    depends on is read after that lock is held, and `--from` is the caller's claim
+    about which account it measured — if the store has moved on since, this is a
+    decision about a situation that no longer exists.
+
+    Prints `<account>\t<credential fingerprint>`. Exit codes are the caller's
+    fork in the road: 0 swapped, 1 nowhere free to go (the only answer that may
+    justify paying), 4 could not act."""
+    if not account_names():
+        return 1
+    deadline = time.time() + max(0.0, args.deadline)
+    while True:
+        try:
+            with Lock(REFRESH_LOCK, wait=False):
+                return _swap_locked(args, deadline)
+        except LockBusy:
+            # The background pass holds it. Wait inside the same budget the pick
+            # would have spent rather than give up: giving up here is what sends a
+            # session that had a free spare onto a paid backbone.
+            if time.time() >= deadline:
+                return 4
+            time.sleep(0.25)
+
+
+def _swap_locked(args, deadline):
+    cur = active_name()
+    if not cur:
+        return 4                    # signed into an account ccd does not know
+    if args.from_account and args.from_account != cur:
+        return 4                    # the store moved while this was being decided
+    a, _ = best_target(no_probe=args.no_probe,
+                       exclude=set(swap_guard_read()), deadline=deadline)
+    if a is None:
+        return 1
+    try:
+        _, installed = swap_to(a["name"], force=True)
+    except SystemExit:
+        return 4
+    swap_guard_record(cur, args.window)
+    print(f"{a['name']}\t{installed}")
     return 0
 
 
@@ -1403,20 +1522,29 @@ def cmd_refresh(args):
     return rc
 
 
-def best_target(no_probe=False):
+def best_target(no_probe=False, exclude=(), deadline=None):
     """(account, reading) for the best place to hand off, or (None, reason).
 
     One selection rule for every caller — the hook, the statusline, and a person
-    typing `ccd account use` — so they can differ only in what they pass in."""
+    typing `ccd account use` — so they can differ only in what they pass in.
+
+    `exclude` drops accounts a swap has just left (swap_guard_read). `deadline` is
+    a wall-clock instant past which no candidate is worth a network probe: this
+    runs inside a hook that is killed on its timeout, and one usable spare behind
+    nine expired ones can spend the whole budget before the swap even starts. Past
+    it the rest are judged on cache alone, which costs nothing and can still say
+    yes."""
     cur = active_name()
-    candidates = [a for a in accounts_all() if a["name"] != cur]
+    candidates = [a for a in accounts_all()
+                  if a["name"] != cur and a["name"] not in exclude]
     if not candidates:
         return None, "no_candidate"
 
     cache = quota_cache()
+    probed = False
     scored = []
     for a in candidates:
-        if no_probe:
+        if no_probe or (deadline is not None and time.time() >= deadline):
             # Cached-only mode for latency-sensitive callers (the prompt hook).
             # Never opens a socket: a stale answer that costs nothing beats a
             # fresh one that freezes the user's prompt for seconds.
@@ -1432,9 +1560,10 @@ def best_target(no_probe=False):
                 continue
         else:
             rec, cache = quota_for(a["name"], a, cache=cache)
+            probed = True
         if has_headroom(rec):
             scored.append((a.get("priority", 999), worst(rec), a, rec))
-    if not no_probe:
+    if probed:
         quota_cache_save(cache)
 
     if not scored:
@@ -1706,23 +1835,17 @@ def cmd_current(args):
     acct = account_load(cur) if cur else None
     total = len(account_names())
     on_fallback = bool(os.environ.get("CCD_ACTIVE"))
-    # What the STORE says beside what ccd believes it installed. After an
-    # in-session swap the quota hook has to know the credential Claude Code will
-    # actually read became this account's, and these two plan fields are the
-    # answer that survives the token rotation a pickup causes — the token itself
-    # changes on every refresh and so can never settle it.
+    # The identity of the credential Claude Code will actually read. A plan is not
+    # an account — two accounts on one plan agree about every plan field there is,
+    # so only the credential itself can confirm that a swap landed.
     live_oauth = (live_read()[0].get("claudeAiOauth") or {})
     info = {
         "backbone": "openrouter" if on_fallback else "subscription",
         "account": cur,
         "label": (acct or {}).get("label", "") or "",
         "subscription_type": (acct or {}).get("subscription_type"),
-        "rate_limit_tier": (acct or {}).get("rate_limit_tier"),
         "registered": total,
-        "live": {
-            "subscription_type": live_oauth.get("subscriptionType"),
-            "rate_limit_tier": live_oauth.get("rateLimitTier"),
-        },
+        "live": {"cred": _cred_fingerprint({"claudeAiOauth": live_oauth})},
     }
     if args.json:
         print(json.dumps(info, ensure_ascii=False))
@@ -1777,6 +1900,15 @@ def main(argv):
         help="decide from cached quota only; never make a network call",
     )
     a.set_defaults(fn=cmd_pick)
+
+    a = sub.add_parser("swap", help="pick a spare and install it in one transaction (internal)")
+    a.add_argument("--from", dest="from_account", default="",
+                   help="the account the caller measured; refuse if we are elsewhere")
+    a.add_argument("--window", default="", help="the reset windows the reading named")
+    a.add_argument("--no-probe", action="store_true")
+    a.add_argument("--deadline", type=float, default=60.0,
+                   help="seconds this decision may spend, lock wait included")
+    a.set_defaults(fn=cmd_swap)
 
     a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
     a.add_argument("--force", action="store_true")

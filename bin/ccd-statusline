@@ -704,10 +704,16 @@ if not spares:
 # ONE message, not a remedy: whether a restart or a `ccd setup` is the fix turns on
 # facts this path cannot establish without spawning a process, and confident wrong
 # advice is worse than none.
+# ...and only where a launcher is part of the answer. The hop between
+# subscriptions happens inside the session, so an install that never opted into
+# the paid hop needs no launcher at all, and saying "not supervised" there marks a
+# correct, complete install as broken. The opt-in is the condition; #56 owns
+# whether the wording and the remedy are the right ones.
 tok = os.environ.get("CCD_HANDOFF", "")
 supervised = bool(re.fullmatch(r"[0-9a-f]{32}", tok)) and os.environ.get(
     "CCD_HANDOFF_STATE") == os.path.join(os.environ.get("CCD_DIR", ""), f"handoff-{tok}.json")
-if spares and not supervised:
+paid_hop = os.path.exists(os.path.join(os.environ.get("CCD_DIR", ""), "paid-handoff"))
+if spares and paid_hop and not supervised:
     head += f" {Y}(not supervised){RS}"
 
 

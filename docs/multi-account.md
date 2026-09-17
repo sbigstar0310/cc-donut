@@ -264,9 +264,19 @@ cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운�
 
 ### 6.2 절차
 
+자동 스왑은 이 전체가 **하나의 트랜잭션**이다 (`ccd account swap`). 바깥 락은 백그라운드
+keepalive 가 잡는 것과 같은 `.refresh.lock` 이고, 그 안에서 후보 선정과 설치가 연달아
+일어난다. 선정과 설치가 서로 다른 프로세스였을 때는 그 사이에 keepalive 가 토큰을
+회전시킬 수 있었고, 그러면 이미 읽어둔 **은퇴한 일회용 토큰**이 설치됐다.
+
 ```
-swap_to(name):
+swap(--from cur, --window key):
+  0. .refresh.lock 획득 (백그라운드 잡과 단일 실행), 예산 안에서 대기
+  0a. 활성 계정 재확인 — cur 과 다르면 이 결정은 이미 낡았다, 아무것도 하지 않는다
+  0b. 최근 떠난 계정 제외(§5.2) 후 후보 선정 (예산이 없으면 캐시만)
+  ↓ swap_to(name):
   1. 락 획득          ~/.claude/ccd/accounts/.lock  (flock, 5s 타임아웃)
+  1a. 대상 계정 로드   반드시 락 안에서 — 락 밖에서 읽은 사본은 이미 회전됐을 수 있다
   2. 현재 blob 읽기    keychain(macOS) 또는 .credentials.json(Linux)
   3. 현재 계정 백업    live blob 의 claudeAiOauth → accounts/<active>.json 에 갱신 저장
                       (Claude Code 가 세션 중 회전시킨 최신 토큰을 잃지 않기 위함)
@@ -275,7 +285,10 @@ swap_to(name):
   5. atomic write     macOS: security add-generic-password -U -s "Claude Code-credentials" …
                       Linux: tmp 파일 → chmod 600 → os.replace
   6. .active 갱신
-  7. 락 해제
+  7. 설치한 자격증명의 지문을 돌려준다 (확인이 대조할 유일한 신원)
+  8. 락 해제
+  ↑
+  9. 떠나온 계정을 §5.2 기록에 남긴다
 ```
 
 3번이 중요하다. 이걸 빼면 계정 A로 8시간 작업하며 회전된 토큰들이 버려지고, A로 돌아올 때 저장소의 낡은 refresh token을 쓰게 된다.
@@ -422,19 +435,25 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 - 교체된 토큰을 측정한 `dead` 판정이 은퇴하고, 현재 토큰을 측정한 것은 남는가 (§12.0.4)
 - 동시각 프로필이 `swap_to` 를 통해 계정 간 오염을 만들지 않는가 (§12.0.1)
 
-통합 (fake claude 바이너리 + stub HTTP):
-- A 소진 → B 스왑 → 같은 session_id 로 `--resume` 되는가
-- A·B 모두 소진 → OpenRouter 로 떨어지는가
+통합 (fake claude 바이너리 + stub HTTP) — #57 이후의 프로토콜 기준:
+- A 소진 → **세션을 끝내지 않고** B 로 스왑하고, 그 사실을 한 줄로 알리는가 (relaunch 도 `--resume` 도 없다)
+- 벽에 먼저 부딪힌 경우: `StopFailure` 가 스왑한 뒤 exit 2 로 멈춘 턴을 깨우는가
+- A·B 모두 소진 → OpenRouter 로 떨어지는가 (유료 옵트인이 있을 때만)
 - 계정 0개 등록 시 현행과 바이트 단위로 동일하게 동작하는가 (**가장 중요한 회귀 테스트**)
 - 스왑 중 kill -9 후 blob 무결성
 
-루프 방지 (§5.2) — 상수를 없앤 만큼 여기가 촘촘해야 한다:
-- 계정 **5개** 전부 소진 → 5홉 모두 거친 뒤 OpenRouter 에 도달하는가 (예전 `MAX_HOPS=3` 이 잘랐을 시나리오)
-- A→B→A 핑퐁이 3번째 홉에서 멈추는가
-- 목적지가 전부 다른 3홉(A→B→OR)은 통과하는가
-- `HOP_RESET_SECONDS` 넘긴 세션 뒤 `visited` 가 비워져 같은 계정으로 다시 갈 수 있는가
-- `fallback` 까지 `visited` 에 든 상태에서 중단 메시지가 나오는가
-- 백스톱이 `visited` 정상 동작 시 **절대 발동하지 않는가** (발동하면 그건 버그 신호이므로 테스트가 잡아야 한다)
+트랜잭션 (§6.1):
+- 결정과 설치 사이에 백그라운드 keepalive 가 토큰을 회전시켜도, 설치되는 것은 **회전 후** 토큰인가
+- 이미 다른 프로세스가 옮겨놓은 계정에 대한 결정(`--from`)은 아무 일도 하지 않는가
+- pick 이 예산(`--deadline`)을 넘기면 네트워크를 건드리지 않고 캐시만으로 답하는가
+- 훅 timeout 이 `예산 + settle` 을 덮는가 (hooks.json 과 quota-guard.sh 의 기본값으로 산술 검증)
+
+루프 방지 (§5.2):
+- 방금 떠난 계정이 **다음 목적지로 제안되지 않는가** (캐시가 그 계정에 여유가 있다고 말해도)
+- 리셋 타임스탬프가 없는 판독에서도 기록이 남는가 (구멍 없음)
+- 기록이 TTL 을 넘기면 다시 목적지가 되는가 (개수가 아니라 시간으로 만료)
+- 떠나는 것 자체는 **한 번도 막지 않는가** — 소진된 계정에 갇히는 실패가 불가능해야 한다
+- 런처 쪽 `visited`: `to_fallback` 을 한 burst 에 두 번 시도하면 멈추는가, `HOP_RESET_SECONDS` 뒤에는 다시 가는가
 
 ## 12. 알려진 한계 / 미해결 질문
 

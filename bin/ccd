@@ -453,7 +453,8 @@ status() {
   printf '\n%sWhen quota runs out%s\n' "$b" "$r"
   printf '  %sBetween subscriptions:%s in place, inside the session — no restart, nothing to type\n' "$grn" "$r"
   if [ -e "$CCD_DIR/accounts" ] && ls "$CCD_DIR/accounts"/*.json >/dev/null 2>&1; then
-    printf '    %sGoes to whichever registered account has room, and back when the window resets.%s\n' "$d" "$r"
+    printf '    %sGoes to whichever registered account has room, the moment a reading says%s\n' "$d" "$r"
+    printf '    %sthis one is spent. Coming back is a new swap, not automatic.%s\n' "$d" "$r"
   else
     printf '    %sRegister a second subscription first: ccd account add%s\n' "$d" "$r"
   fi
@@ -1247,10 +1248,12 @@ CCD_CLAUDE_SHIM
             printf '  %s✓ that line is already in %s — open a new terminal%s\n' \
               "$grn" "$(tilde "$rc")" "$r"
           else
-            printf '  %sSkipped — automatic handoff is installed but not active yet.%s\n' "$ylw" "$r"
-            printf '  %sAdd that line yourself, or re-run: ccd setup --yes%s\n' "$d" "$r"
-            fail="automatic handoff is installed but not active"
-            fix="ccd setup --yes   (then open a new terminal)"
+            printf '  %sSkipped — the OpenRouter handoff is installed but not active yet.%s\n' "$ylw" "$r"
+            printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
+            fail="the OpenRouter handoff is installed but not active"
+            # --auto, not a bare setup: a bare one installs no launcher now, so it
+            # would not go near the PATH line this is about.
+            fix="ccd setup --auto --yes   (then open a new terminal)"
           fi
         elif [ -n "${rc:-}" ]; then
           printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
