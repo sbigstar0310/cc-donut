@@ -71,11 +71,12 @@ fi
 
 # Extract the fields this script uses. Absent/malformed input leaves them empty,
 # which every caller below treats as "not applicable" rather than an error.
-SESSION_ID=""; HOOK_CWD=""; ERROR_TYPE=""; EXIT_REASON=""
+SESSION_ID=""; HOOK_CWD=""; HOOK_ERROR=""
 if [ -n "$HOOK_INPUT" ]; then
   # Tab-separated so a value containing spaces survives; newlines are impossible
   # in these fields (they are ids, paths, and enum tags).
-  IFS=$'\t' read -r SESSION_ID HOOK_CWD ERROR_TYPE EXIT_REASON <<EOF
+  # StopFailure names the error in `error` — the key this whole arm hangs on.
+  IFS=$'\t' read -r SESSION_ID HOOK_CWD HOOK_ERROR <<EOF
 $(printf '%s' "$HOOK_INPUT" | python3 -c '
 import json, sys
 try:
@@ -83,11 +84,11 @@ try:
     if not isinstance(d, dict):
         raise ValueError
 except Exception:
-    print("\t\t\t"); raise SystemExit(0)
+    print("\t\t"); raise SystemExit(0)
 def s(k):
     v = d.get(k)
     return v if isinstance(v, str) else ""
-print("\t".join((s("session_id"), s("cwd"), s("error_type"), s("exit_reason"))))
+print("\t".join((s("session_id"), s("cwd"), s("error"))))
 ' 2>/dev/null)
 EOF
 fi
@@ -572,7 +573,7 @@ if [ "$EVENT" = "StopFailure" ]; then
   # Corroborate: the error says rate_limit AND the dashboard agrees we are spent.
   # Either alone is not enough — a rate_limit can be transient, and a high
   # reading alone does not mean the request actually failed.
-  if [ "$ERROR_TYPE" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ] && handoff_ready_account; then
+  if [ "$HOOK_ERROR" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ] && handoff_ready_account; then
     peak=$(quota_peak)
     case "$peak" in
       ''|*[!0-9]*) : ;;   # no trustworthy reading → stay disarmed

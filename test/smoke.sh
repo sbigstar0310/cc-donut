@@ -644,7 +644,7 @@ print(json.load(open(p)).get(sys.argv[1],'') if os.path.exists(p) else '')" "$1"
 # Quota cache the hook reads to corroborate a rate_limit error.
 quota() { printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" > "$FAKE/.claude/ccd/quota-cache.json"; }
 # StopFailure payload as Claude Code delivers it.
-stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error_type":"%s"}' "$1" "$2"; }
+stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"%s"}' "$1" "$2"; }
 
 # Arming requires the full readiness set, so these run as a supervised session
 # would: a launcher marker, a key, and a resolvable claude process. Section 19
@@ -678,7 +678,8 @@ set +m 2>/dev/null
 sleep 0.3
 # Signalling is section 17's subject; here we only care what gets armed, so aim
 # CLAUDE_PID at a live stand-in and let it be killed.
-arm_run() { stopfail "$1" "$2" | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
+fire_stopfail() { CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
+arm_run() { stopfail "$1" "$2" | fire_stopfail; }
 
 # rate_limit ALONE is not enough — it can be transient throttling. The dashboard
 # reading has to agree, and a missing reading must never arm.
@@ -690,6 +691,36 @@ arm_run sess-a rate_limit
   || bad "handoff direction" "got: $(hf_get direction)"
 [ "$(hf_get session_id)" = "sess-a" ] && ok "session id recorded for --resume" \
   || bad "session id" "got: $(hf_get session_id)"
+kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
+
+# The payload Claude Code really sends, verbatim from an interactive session
+# driven into a 429 (2.1.274, #60) — stopfail() paraphrases the shape, this IS
+# the shape. A rename of `error` upstream fails here loudly instead of silently
+# disarming the handoff. Seeds its own readiness set rather than inheriting one.
+captured_stopfail() { # $1=session id
+  printf '{"session_id":"%s","transcript_path":"/tmp/w/t.jsonl","cwd":"/tmp/w","prompt_id":"42d3d934-7b41-49f6-91a7-f3355451fcd6","effort":{"level":"xhigh"},"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Request rejected (429)"}' "$1"
+}
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
+"$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
+sleep 0.3
+hf_reset; quota 58 96
+captured_stopfail sess-real | fire_stopfail
+[ "$(hf_get armed)" = "True" ] && ok "the payload Claude Code actually sends arms the handoff" \
+  || bad "arming on the real StopFailure payload" "armed=$(hf_get armed)"
+[ "$(hf_get session_id)" = "sess-real" ] && ok "...and its session id is the one recorded for --resume" \
+  || bad "session id from the real payload" "got: $(hf_get session_id)"
+kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
+
+# No version of Claude Code sends error_type. Reading it as well would let the
+# real key rot unnoticed behind a fixture only this suite ever produces.
+"$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
+sleep 0.3
+hf_reset; quota 58 96
+printf '{"session_id":"sess-legacy","cwd":"/tmp/w","hook_event_name":"StopFailure","error_type":"rate_limit"}' \
+  | fire_stopfail
+[ -z "$(hf_get armed)" ] && ok "the retired error_type key arms nothing" \
+  || bad "error_type must not be read" "armed=$(hf_get armed)"
 kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!

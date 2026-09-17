@@ -228,7 +228,7 @@ mkdir -p "$HOME/.claude/projects/$SLUG"
 printf '{{"type":"user","message":{{"role":"user","content":"내 비밀 단어는 {SECRET}이야"}}}}\\n' \\
   > "$HOME/.claude/projects/$SLUG/$SID.jsonl"
 echo "probe: subscription leg, firing StopFailure" >> {E}/probe.log
-printf '{{"session_id":"%s","cwd":"%s","hook_event_name":"StopFailure","error_type":"rate_limit"}}' "$SID" "{PROJ}" \\
+printf '{{"session_id":"%s","cwd":"%s","hook_event_name":"StopFailure","error":"rate_limit"}}' "$SID" "{PROJ}" \\
   | {PLUG}/scripts/quota-guard.sh StopFailure >> {E}/probe.log 2>&1
 exit 0
 '''
