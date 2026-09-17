@@ -360,6 +360,19 @@ PY
 fi
 
 # ── Normal (subscription) session ────────────────────────────────────────────
+# The row below is only as current as accounts-quota.json, so a render that finds that
+# reading past the quota TTL starts the same job the hook starts (cmd_keepalive, which
+# single-flights it). That is what keeps the reading moving through a turn with no
+# prompt in it: every assistant message re-runs this, and so does the 60s tick `ccd
+# setup` asks for (#54). Detached, because Claude Code cancels a render still running.
+# A reading still fresh, or nothing to measure, costs no process.
+accounts=0
+for f in "$CCD_DIR/accounts"/*.json; do [ -e "$f" ] && accounts=$((accounts + 1)); done
+if [ "$accounts" -ge 2 ] \
+   && [ "$(dash_age "$CCD_DIR/accounts-quota.json")" -ge "${CCD_CANDIDATE_TTL:-300}" ]; then
+  "$SELF_DIR/ccd-account" --no-color keepalive --pick --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
+fi
+
 # WHICH ACCOUNT IS ANSWERING? Always shown, even with nothing registered — after a
 # swap the single most important thing to know is whose quota is being spent, and
 # a row that appears only sometimes is a row you learn not to look at. The ccd row
@@ -389,9 +402,9 @@ try:
 except ValueError:
     HEADROOM = 90
 # Past this, a percentage is not a stale reading but a wrong one — the same call
-# the dashboard row makes about its own cache. Nothing refreshes this file except
-# an `ccd account` command and the hook's background warm, so without a ceiling a
-# row can be served as current for days (#24).
+# the dashboard row makes about its own cache. The background refresh keeps it well
+# inside this, but a machine that was asleep or offline can hand the render a row
+# days old (#24).
 try:
     MAX_STALE = int(os.environ.get("ACCT_MAX_STALE", "3600"))
 except ValueError:

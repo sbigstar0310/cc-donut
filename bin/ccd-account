@@ -108,6 +108,7 @@ ACTIVE_FILE = os.path.join(ACCOUNTS_DIR, ".active")
 # Absent means ccd has never installed anything, and the profile is unopposed.
 ACTIVE_AT_FILE = os.path.join(ACCOUNTS_DIR, ".active-at")
 LOCK_FILE = os.path.join(ACCOUNTS_DIR, ".lock")
+REFRESH_LOCK = os.path.join(ACCOUNTS_DIR, ".refresh.lock")    # see cmd_keepalive
 ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
 QUOTA_FILE = os.path.join(CCD_DIR, "accounts-quota.json")
 KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
@@ -1473,24 +1474,43 @@ def cmd_pick(args):
 
 
 def cmd_keepalive(args):
-    """Keep stored refresh tokens alive.
+    """Keep stored refresh tokens alive, and with --pick re-measure the spares after.
 
     A refresh token lasts ~8.5 days and each successful refresh mints a new one,
     so a daily touch keeps an unused account usable indefinitely. Without this the
     spare account dies quietly and the user finds out at the exact moment they
-    needed it — precisely the failure ccd exists to prevent."""
+    needed it — precisely the failure ccd exists to prevent.
+
+    This is the one background job every trigger starts: each hook tick, and each
+    statusline render whose quota reading is past the TTL (#54). keepalive and the
+    pick both spend one-time refresh tokens — quota_for() refreshes an expired one
+    on the way — so the whole job holds one lock, and a trigger that finds it held
+    has nothing to do. A kernel lock dies with its holder: nothing is left behind to
+    reclaim, so there is no reclaim to race."""
     if len(account_names()) < 2:
         return 0
-    # One transaction under the lock: the due check, every account read, the
-    # refresh, and the stamp. The hook fires on each prompt AND each tool use, so
-    # several of these start within the same second; checked outside the lock
-    # they would all pass the gate, all read the same refresh token, and every
-    # one after the first would submit a token the first had just rotated away.
+    try:
+        with Lock(REFRESH_LOCK, wait=False):
+            stale = keepalive_pass(args.force)
+            if args.pick:
+                best_target(args.exclude, False)
+    except LockBusy:
+        return 0
+    if stale and args.report:
+        print(stale_message(stale))
+    return 0
+
+
+def keepalive_pass(force):
+    """Refresh the spares that are due; returns those still stale, or [] if none ran."""
+    # One transaction under the store lock: the due check, every account read, the
+    # refresh, and the stamp. Checked outside it, a pass could read a refresh token
+    # that a `ccd account` command was rotating away at the same moment.
     try:
         with Lock(LOCK_FILE, wait=False):
             due, fails = keepalive_due()
-            if not due and not args.force:
-                return 0
+            if not due and not force:
+                return []
             cur = active_name()
             failed = []
             for name in account_names():
@@ -1515,11 +1535,9 @@ def cmd_keepalive(args):
                 pass
             stale = stale_spares()
             stale_breadcrumb(stale)
+            return stale
     except LockBusy:
-        return 0
-    if stale and args.report:
-        print(stale_message(stale))
-    return 0
+        return []
 
 
 def keepalive_due():
@@ -1734,6 +1752,8 @@ def main(argv):
     a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
     a.add_argument("--force", action="store_true")
     a.add_argument("--report", action="store_true")
+    a.add_argument("--pick", action="store_true", help="then re-measure the spares")
+    a.add_argument("--exclude", default="")
     a.set_defaults(fn=cmd_keepalive)
 
     a = sub.add_parser("usage", help="live quota for the signed-in login (internal)")

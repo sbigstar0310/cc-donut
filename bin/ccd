@@ -1309,7 +1309,10 @@ if isinstance(hooks, dict):
         if kept_groups: hooks[event] = kept_groups
         else: del hooks[event]
     if not hooks: del data["hooks"]
-data["statusLine"] = {"type": "command", "command": "bash ~/.claude/ccd/statusline-launcher.sh"}
+# The tick keeps an idle session's spare row current; SessionStart in quota-guard.sh
+# brings older installs up to this exact shape.
+data["statusLine"] = {"type": "command", "command": "bash ~/.claude/ccd/statusline-launcher.sh",
+                      "refreshInterval": 60}
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".settings.")
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:

@@ -1,5 +1,8 @@
 {
   "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/quota-guard.sh SessionStart"}]}
+    ],
     "UserPromptSubmit": [
       {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/quota-guard.sh UserPromptSubmit"}]}
     ],

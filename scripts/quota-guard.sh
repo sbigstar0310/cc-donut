@@ -1,5 +1,5 @@
 #!/bin/bash
-# Claude Code hook shared by UserPromptSubmit, PostToolUse, StopFailure, and SessionEnd.
+# Claude Code hook shared by SessionStart, UserPromptSubmit, PostToolUse, StopFailure, and SessionEnd.
 # Checks claude-dashboard usage through a ten-minute cache. In normal sessions it recommends
 # Codex delegation at 85%; in ccd sessions it tracks cost and Claude quota resets only.
 # StopFailure/SessionEnd additionally record automatic-handoff state (see arm_handoff).
@@ -32,6 +32,33 @@ ARM_THRESHOLD=95
 HOOK_INPUT=""
 if [ ! -t 0 ]; then
   IFS= read -r -d '' HOOK_INPUT || true
+fi
+
+# `ccd setup` gives its statusline a 60s tick, so an idle session still redraws — and
+# re-measures — the spare row (#54). Nothing reruns setup after an update, so an install
+# wired before the tick existed gets it here: on ccd's own statusline exactly as setup
+# writes it, and only where no interval is set. Anything else on that key is the user's.
+if [ "$EVENT" = "SessionStart" ]; then
+  python3 - "$HOME/.claude/settings.json" >/dev/null 2>&1 <<'PY'
+import json, os, sys, tempfile
+p = os.path.realpath(sys.argv[1])          # a dotfiles symlink stays a symlink
+with open(p, encoding="utf-8") as f:
+    data = json.load(f)
+s = data.get("statusLine")
+if (not isinstance(s, dict) or "refreshInterval" in s
+        or s.get("command") != "bash ~/.claude/ccd/statusline-launcher.sh"):
+    raise SystemExit(0)
+s["refreshInterval"] = 60
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".settings.")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2); f.write("\n")
+    os.chmod(tmp, os.stat(p).st_mode & 0o777)
+    os.replace(tmp, p)
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+PY
+  exit 0
 fi
 
 # Extract the fields this script uses. Absent/malformed input leaves them empty,
@@ -827,29 +854,17 @@ fi
 # they needed it — the failure ccd exists to prevent. Backgrounded: this must
 # never add latency to a prompt, and it is a no-op on all but one tick a day.
 if [ -z "${CCD_ACTIVE:-}" ] && has_accounts && ka=$(ccd_account_bin); then
-  # Two jobs, ONE background shell, in this order. keepalive refreshes tokens; the
-  # pick probes quota, and quota_for() refreshes a token on the way when the stored
-  # one has expired. Both therefore spend the same one-time refresh token, and only
-  # keepalive takes the store lock — so run as siblings they raced, the loser wrote
-  # `dead`, and the account read as logged out. That is the failure this whole
-  # release is about, arriving by a route we opened.
-  #
-  # Serialising them is the whole fix and costs nothing: keepalive is a no-op on all
-  # but one tick a day, and by the time the pick runs the tokens it needs are the
-  # ones keepalive just rotated.
-  #
-  # The pick is what keeps accounts-quota.json current, which keepalive never does —
-  # it refreshes tokens and never probes, so the statusline's spare row moved only
-  # when the user happened to type a `ccd account` command (#24). quota_for() re-reads
-  # only rows past their cached TTL, so a healthy account is measured about every five
-  # minutes however often the hook fires; an error retries after 60s, and concurrent
-  # pickers from OTHER sessions still do not single-flight (#13). Prompts only —
-  # tool-use ticks would spend a process to be told the cache is still warm.
-  (
-    "$ka" --no-color keepalive
-    [ "$EVENT" = "UserPromptSubmit" ] \
-      && "$ka" --no-color pick --exclude "${CCD_BURST_VISITED:-}"
-  ) >/dev/null 2>&1 &
+  # --pick re-measures the spares into accounts-quota.json, which keepalive never does
+  # and the statusline's spare row reads (#24). On every tick once that reading is past
+  # the TTL, not on prompts alone: an autonomous turn can run tool uses for an hour
+  # without one (#54). A fresh reading adds nothing to the tick. keepalive and the pick
+  # both spend one-time refresh tokens, so they run as one job under one lock, shared
+  # with the statusline's trigger (cmd_keepalive).
+  if [ "$(file_age "$CCD_DIR/accounts-quota.json")" -ge "${CCD_CANDIDATE_TTL:-300}" ]; then
+    "$ka" --no-color keepalive --pick --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
+  else
+    "$ka" --no-color keepalive >/dev/null 2>&1 &
+  fi
 fi
 
 # Deliver keepalive's verdict. It runs backgrounded with its output discarded, so
