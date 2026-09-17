@@ -10,7 +10,14 @@
       {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/quota-guard.sh PostToolUse"}]}
     ],
     "StopFailure": [
-      {"matcher": "rate_limit", "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/quota-guard.sh StopFailure"}]}
+      {"matcher": "rate_limit", "hooks": [{
+        "type": "command",
+        "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/quota-guard.sh StopFailure",
+        "asyncRewake": true,
+        "timeout": 180,
+        "rewakeMessage": "Your claude.ai usage limit was reached and ccd switched this session to another Claude subscription that has quota. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.",
+        "rewakeSummary": "ccd switched accounts — continuing"
+      }]}
     ],
     "SessionEnd": [
       {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/quota-guard.sh SessionEnd"}]}

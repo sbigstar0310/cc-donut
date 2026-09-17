@@ -21,8 +21,17 @@ TTL=600
 STALE_TTL=14400
 THRESHOLD=85
 # Arming needs the quota reading to corroborate the API error: a bare rate_limit
-# can be transient throttling, and a handoff on that would be a false alarm.
+# can be transient throttling, and a handoff on that would be a false alarm. The
+# same reading, at the same threshold, is what moves the session BEFORE the wall
+# (see "Swap before the wall") — one corroboration, two moments.
 ARM_THRESHOLD=95
+# Which (account, reset window) pairs this install has already swapped out of.
+# The window comes from the reading itself; only the fact that we left is new.
+SWAP_MARK="$CCD_DIR/swapped-windows"
+# Measured credential pickup after a swap is 1-11s. The backstop waits that out
+# before it wakes the session, so the woken turn does not retry on the account we
+# just left. The StopFailure hook's timeout is set well past it (hooks/hooks.json).
+SWAP_SETTLE="${CCD_SWAP_SETTLE:-12}"
 
 # Hook payloads arrive on stdin as one JSON object. Read it with pure bash: the
 # obvious `timeout 0.5 cat` is not portable — macOS has no timeout(1), and under
@@ -304,8 +313,12 @@ fi
 # backbone. Writing the file is always safe; only the launcher acts on it, and
 # only when it installed itself (see the CCD_HANDOFF interlock below).
 
-# Highest observed quota percentage, or empty when the data is unusable.
+# Highest observed quota percentage and the reset window it came from, tab
+# separated, or empty when the data is unusable.
 # Unusable is deliberately NOT zero: a missing reading must never arm a handoff.
+# The window id rides along because every caller that acts on the peak also has
+# to say WHICH window it acted on, and re-reading the cache to ask again would be
+# a second answer that could differ from the first.
 #
 # Age is part of usable. The cache keeps its last good sample when a refresh
 # fails, so a reading can outlive the window it measured: a 96% sample taken
@@ -347,13 +360,25 @@ def expired(reset):
     return t <= datetime.datetime.now(datetime.timezone.utc)
 
 
-vals = [p for p, reset in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
-                           (c.get("sevenDayPercent"), c.get("sevenDayReset")))
+vals = [(int(p), reset) for p, reset in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
+                                         (c.get("sevenDayPercent"), c.get("sevenDayReset")))
         if isinstance(p, (int, float)) and not isinstance(p, bool)
         and not expired(reset)]
 if vals:
-    print(int(max(vals)))
+    peak = max(p for p, _ in vals)
+    # Named by the windows that actually back the peak, so "we already left on
+    # this reading" can only ever be said about the same windows again.
+    window = "|".join(sorted(r for p, r in vals if p == peak and isinstance(r, str) and r))
+    print(f"{peak}\t{window}")
 PY
+}
+
+# The peak and its window as two shell variables. Every caller needs both, and a
+# second call would read a cache that may have been replaced in between.
+read_peak() {  # sets $peak and $window
+  IFS=$'\t' read -r peak window <<EOF
+$(quota_peak)
+EOF
 }
 
 # Write handoff state atomically, mode 600 — same discipline as run-state.json.
@@ -560,39 +585,119 @@ has_accounts() {
 #
 # Silent and cheap when the feature is unused: no accounts registered means
 # ccd-account exits 1 immediately without touching the network.
-pick_account() {
+#
+# Extra flags are passed straight through, which is how the prompt path asks for
+# --no-probe: it fires several times a minute and a blocking probe there freezes
+# the user's prompt for seconds.
+pick_account() {  # $@ = extra `pick` flags
   local ab
   has_accounts || return 1
   ab=$(ccd_account_bin) || return 1
-  "$ab" --no-color pick --exclude "${CCD_BURST_VISITED:-}" 2>/dev/null
+  "$ab" --no-color pick --exclude "${CCD_BURST_VISITED:-}" "$@" 2>/dev/null
 }
 
-# StopFailure fires when a turn ends on an API error. Its output is ignored by
-# Claude Code, so this branch exists purely for the side effect.
+# Move this session onto a spare, in place. The credential ccd writes here is the
+# one Claude Code's very next request reads, so nothing has to end and nothing has
+# to be relaunched — that was always the expensive half of the hop, and the
+# measurements in #57 say no part of it was ever needed.
+#
+# $1 is the reset window the reading named; the rest are flags for `pick`. Prints
+# the account it moved to.
+swap_to_spare() {
+  local window="$1" ab cur target key
+  shift
+  ab=$(ccd_account_bin) || return 1
+  cur=$("$ab" --no-color current 2>/dev/null) || return 1
+  [ -n "$cur" ] || return 1
+  key="$cur	$window"
+  # At most once per (account, window). The ordinary case cannot repeat anyway —
+  # the swap deletes the reading that caused it — but a cached row claiming room
+  # for an account that has none would otherwise walk the session through every
+  # spare it owns on that one reading. A reading that names no window cannot say
+  # whether this is still the same one, and refusing on that basis would strand
+  # the session on a spent account, which is the failure this exists to prevent.
+  if [ -n "$window" ] && [ -f "$SWAP_MARK" ] && grep -Fqx "$key" "$SWAP_MARK"; then
+    return 1
+  fi
+  target=$(pick_account "$@") && [ -n "$target" ] || return 1
+  # --force: the warning it suppresses is about THIS session, and the line we
+  # print instead says the same thing where the user is already looking.
+  "$ab" --no-color use "$target" --force >/dev/null 2>&1 || return 1
+  if [ -n "$window" ]; then
+    # Newest first, and only the last few: a window id stops meaning anything
+    # once its window has turned over.
+    { printf '%s\n' "$key"; cat "$SWAP_MARK" 2>/dev/null; } | head -8 \
+      > "$SWAP_MARK.tmp.$$" && mv -f "$SWAP_MARK.tmp.$$" "$SWAP_MARK"
+    rm -f "$SWAP_MARK.tmp.$$"
+  fi
+  printf '%s' "$target"
+}
+
+# Did the credential Claude Code reads actually become this account's? The swap
+# writes the live store, but a keychain that refused — or this session writing its
+# own refreshed blob back over ours — leaves that store describing the account we
+# just left, and waking into it only hits the same wall again. rateLimitTier and
+# subscriptionType travel with the credential and survive the token rotation a
+# pickup causes, which is why the token itself cannot answer this.
+swap_landed() {  # $1=account name
+  local ab
+  ab=$(ccd_account_bin) || return 1
+  # Pickup is 1-11s. Waking before it lands wastes the turn it was meant to save.
+  [ "${SWAP_SETTLE:-0}" -gt 0 ] 2>/dev/null && sleep "$SWAP_SETTLE"
+  "$ab" --no-color current --json 2>/dev/null | CCD_WANT="$1" python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if d.get("account") != os.environ["CCD_WANT"]:
+    raise SystemExit(1)
+live = d.get("live") or {}
+# Only a field the store actually recorded can disagree: an account registered
+# before ccd kept these has nothing to say here, and silence is not a mismatch.
+for k in ("subscription_type", "rate_limit_tier"):
+    if d.get(k) is not None and live.get(k) != d.get(k):
+        raise SystemExit(1)
+raise SystemExit(0)
+' 2>/dev/null
+}
+
+# StopFailure fires when a turn ends on an API error. It is the backstop now, not
+# the primary path: the swap before the wall catches the quota ccd can measure, and
+# what is left for here is what that reading cannot see — a sample up to ten
+# minutes old, or a limit ccd does not measure at all.
 if [ "$EVENT" = "StopFailure" ]; then
   # Corroborate: the error says rate_limit AND the dashboard agrees we are spent.
   # Either alone is not enough — a rate_limit can be transient, and a high
   # reading alone does not mean the request actually failed.
-  if [ "$HOOK_ERROR" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ] && handoff_ready_account; then
-    peak=$(quota_peak)
+  if [ "$HOOK_ERROR" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ]; then
+    read_peak
     case "$peak" in
       ''|*[!0-9]*) : ;;   # no trustworthy reading → stay disarmed
       *) if [ "$peak" -ge "$ARM_THRESHOLD" ]; then
            # Prefer another subscription over paying. Only when every registered
            # account is spent (or none are registered) do we fall to OpenRouter.
-           direction=""; account=""
-           if account=$(pick_account) && [ -n "$account" ]; then
-             direction=to_account
-           elif paid_optin && have_key; then
-             direction=to_fallback; account=""
+           #
+           # The turn has already died, so unlike the path before the wall this one
+           # has to bring the session back. Claude Code never resumes a parked
+           # session by itself — every recovery in the transcripts was a human
+           # typing — so we swap, confirm the credential landed, and exit 2. This
+           # branch's JSON output is ignored, but the asyncRewake entry in
+           # hooks/hooks.json wakes on exit 2, and its rewakeMessage replaces the
+           # "Stop hook blocking error" wording the user would otherwise read.
+           # stderr is what carries the account's name into that wake.
+           if account=$(swap_to_spare "$window") && [ -n "$account" ] \
+              && swap_landed "$account"; then
+             printf '%s\n' "[ccd] Your claude.ai usage limit was reached and ccd switched this session to $account, which has quota. Continue the task you were working on when the limit was reached; do not repeat work that is already complete." >&2
+             exit 2
            fi
-           # Neither arm: nowhere free to go, and going somewhere paid is not ours
-           # to decide. Nothing is armed and the session ends where it is.
+           # Nowhere free to go. Paying is not ours to decide, and ending a session
+           # needs the launcher that will bring it back.
            # Arm first, then signal: the launcher must find the file when the
            # session exits. If the write fails, do NOT signal — ending a session
            # whose handoff was never recorded leaves nothing to bring it back.
-           if [ -n "$direction" ]; then
-             if write_handoff true "$direction" "$SESSION_ID" "$HOOK_CWD" "$account"; then
+           if paid_optin && handoff_ready; then
+             if write_handoff true to_fallback "$SESSION_ID" "$HOOK_CWD" ""; then
                request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
              else
                rm -f "$HANDOFF" 2>/dev/null || true
@@ -876,6 +981,43 @@ if [ -z "${CCD_ACTIVE:-}" ] && has_accounts && ka=$(ccd_account_bin); then
   else
     "$ka" --no-color keepalive --detach >/dev/null 2>&1 &
   fi
+fi
+
+# ── Swap before the wall ─────────────────────────────────────────────────────
+# The reading that corroborates a rate_limit arrives up to ten minutes before the
+# rate_limit does. When it already says the quota is gone and a spare has room,
+# there is nothing to wait for: swap here, say so in one line, and let the turn
+# run on. Nothing ends, nothing is signalled, no launcher is involved — StopFailure
+# above stays for what this cannot see. The pick is cache-only because this fires
+# several times a minute and the block above keeps that cache current.
+#
+# This preempts the two warnings below: both write to stdout, and two JSON objects
+# would not parse as one hook result.
+if has_accounts; then
+  read_peak
+  case "$peak" in
+    ''|*[!0-9]*) : ;;
+    *) if [ "$peak" -ge "$ARM_THRESHOLD" ] \
+          && moved=$(swap_to_spare "$window" --no-probe) && [ -n "$moved" ]; then
+         MOVED="$moved" EVENT="$EVENT" python3 -c '
+import json, os
+name = os.environ["MOVED"]
+print(json.dumps({
+    "systemMessage": f"[ccd] ✓ 쿼타가 바닥나기 전에 {name} 계정으로 갈아탔습니다 "
+                     "— 무과금, 대화 그대로 이어집니다",
+    "hookSpecificOutput": {
+        "hookEventName": os.environ["EVENT"],
+        # The model is mid-turn and about to see the account change under it.
+        "additionalContext":
+            f"[ccd] The Claude subscription behind this session ran out of quota, so ccd "
+            f"switched it to {name}, which has room. Nothing was lost and nothing is "
+            f"billed — carry on with the task. The model list and /status still describe "
+            f"the previous account until this session is next launched.",
+    },
+}, ensure_ascii=False))'
+         exit 0
+       fi ;;
+  esac
 fi
 
 # Deliver keepalive's verdict. It runs backgrounded with its output discarded, so

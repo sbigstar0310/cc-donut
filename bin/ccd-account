@@ -1708,12 +1708,23 @@ def cmd_current(args):
     acct = account_load(cur) if cur else None
     total = len(account_names())
     on_fallback = bool(os.environ.get("CCD_ACTIVE"))
+    # What the STORE says beside what ccd believes it installed. After an
+    # in-session swap the quota hook has to know the credential Claude Code will
+    # actually read became this account's, and these two plan fields are the
+    # answer that survives the token rotation a pickup causes — the token itself
+    # changes on every refresh and so can never settle it.
+    live_oauth = (live_read()[0].get("claudeAiOauth") or {})
     info = {
         "backbone": "openrouter" if on_fallback else "subscription",
         "account": cur,
         "label": (acct or {}).get("label", "") or "",
         "subscription_type": (acct or {}).get("subscription_type"),
+        "rate_limit_tier": (acct or {}).get("rate_limit_tier"),
         "registered": total,
+        "live": {
+            "subscription_type": live_oauth.get("subscriptionType"),
+            "rate_limit_tier": live_oauth.get("rateLimitTier"),
+        },
     }
     if args.json:
         print(json.dumps(info, ensure_ascii=False))

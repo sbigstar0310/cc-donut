@@ -4788,14 +4788,15 @@ set +m 2>/dev/null
 # A fresh stand-in per arm. Arming signals the claude process, so the one that
 # armed is gone by the next call — and a dead pid fails the readiness check for
 # a reason that has nothing to do with what these assertions are about.
-nd_arm() { # $1=session id
+nd_arm() { # $1=session id ; leaves the hook's exit code in $ND_RC
   "$FAKE/sigbin/claude" 8 2>/dev/null & NDPID=$!
   sleep 0.3
   stopfail "$1" rate_limit \
     | CCD_HANDOFF=00000000000000000000000000000002 \
       CCD_HANDOFF_STATE="$CCDD/handoff-00000000000000000000000000000002.json" \
       CLAUDE_PID=$NDPID CCD_STANDIN_PID=$NDPID CLAUDE_PLUGIN_ROOT="$ROOT" \
-      "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+      CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+  ND_RC=$?
   sleep 0.3
   kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
 }
@@ -4823,7 +4824,8 @@ nd_arm sess-nd1b
 
 # Two subscriptions: the spare wins, and nothing is billed. The opt-in stays OFF
 # through this one, because that is the whole point — the free hop is the product
-# and it must not need a flag.
+# and it must not need a flag. Section 29 owns what the hop now looks like; what
+# is being checked here is that a self-measured reading is enough to reach it.
 rm -rf "$ADIR"
 for n in nd_one nd_two; do write_creds "$n"; "$ACCT" --no-color add --name "$n" >/dev/null 2>&1; done
 "$ACCT" --no-color use nd_one --force >/dev/null 2>&1
@@ -4856,10 +4858,10 @@ nd_seed_rows nd_one:99:99 nd_two:10:20
 paid_optin_off
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 nd_arm sess-nd2
-[ "$(hf_get direction)" = "to_account" ] && ok "...and toward the other subscription when one has room" \
-  || bad "direction" "got: $(hf_get direction)"
-[ "$(hf_get account)" = "nd_two" ] && ok "...naming the account with quota left" \
-  || bad "handoff account" "got: $(hf_get account)"
+grep -q 'AT-nd_two' "$CREDS" && ok "...and onto the other subscription when one has room" \
+  || bad "backstop swap" "the credential never moved"
+[ "$ND_RC" = "2" ] && ok "...waking the parked session rather than arming a relaunch" \
+  || bad "wake" "exit code $ND_RC, and a handoff of $(hf_get direction)"
 [ ! -f "$CCDD/paid-handoff" ] \
   && ok "...and it needed no paid opt-in to get there" \
   || bad "free hop" "the fixture left an opt-in behind, so this proved nothing"
@@ -5171,6 +5173,223 @@ esac
 
 unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
 rm -rf "$ADIR" "$SLQ"
+
+head_ "29. the swap that happens inside the session"
+# Ending a session to change account was always the expensive half of the hop: the
+# turn dies, a launcher relaunches it, and the user waits through a cold start. The
+# measurements in #57 say none of that is needed — the credential ccd writes is the
+# one Claude Code's very next request reads, and a swap held for 16.9 hours across
+# two token refreshes in one live process. So the primary path swaps where the
+# session already is, off the reading ccd was taking anyway, ten minutes before the
+# wall; StopFailure stays as the backstop for what that reading cannot see, and
+# wakes the parked session itself instead of asking the user to type.
+SWD="$FAKE/.claude/ccd"
+# Nothing in this section may reach Anthropic: a swap is a real side effect and the
+# tokens here are fixtures. Both endpoints point at a closed port, so a call that
+# escaped fails in milliseconds instead of spending a real account's quota.
+export CCD_USAGE_URL="http://127.0.0.1:1/usage" CCD_TOKEN_URL="http://127.0.0.1:1/token"
+# The free hop needs no opt-in; leaving the paid one armed would let a fallthrough
+# end the stand-in and make these assertions about the wrong thing.
+paid_optin_off
+# The plugin root is passed explicitly. Without it the hook resolves ccd-account
+# through the plugin cache, where an older copy is staged — and the section would
+# test that copy instead of the tree.
+sw_hook() { CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" "$@"; }
+# Its own store, every time. Two accounts, the signed-in one spent and the other
+# with room, plus the reading that corroborates it. Seeded per case rather than
+# inherited: a case that ran on the previous one's leftovers would have nothing to
+# distinguish a swap that happened from one that already had.
+sw_fixture() { # $1=signed-in 5h  $2=signed-in 7d  [$3=spare 5h  $4=spare 7d]
+  rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$FAKE/.claude.json" \
+         "$SWD/handoff-00000000000000000000000000000002.json"
+  mkdir -p "$ADIR"
+  write_creds spent; "$ACCT" --no-color add --name spent --label "spent@example.com" >/dev/null 2>&1
+  write_creds spare; "$ACCT" --no-color add --name spare --label "spare@example.com" >/dev/null 2>&1
+  "$ACCT" --no-color use spent --force >/dev/null 2>&1
+  printf '{"spent":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":99,"seven_day_percent":99},"spare":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":%s,"seven_day_percent":%s}}' \
+    "$(date +%s)" "$(cred_fp "$ADIR/spent.json")" \
+    "$(date +%s)" "$(cred_fp "$ADIR/spare.json")" "${3:-10}" "${4:-20}" > "$SWD/accounts-quota.json"
+  # Nothing here may spend a one-time refresh token, so keepalive is not due.
+  printf '{"fails":0}' > "$SWD/accounts-keepalive"
+  quota "$1" "$2"          # written last: the swap above deletes this file
+  rm -f "$SWD/last-warn" "$SWD/accounts-stale" "$SWD/last-stale-warn" "$SWD/refresh-failed"
+}
+sw_prompt() { # $1=event  $2=session id ; stdout is the hook's own
+  printf '{"session_id":"%s","cwd":"/tmp/w"}' "$2" \
+    | CCD_HANDOFF=00000000000000000000000000000002 \
+      CCD_HANDOFF_STATE="$SWD/handoff-00000000000000000000000000000002.json" \
+      CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID sw_hook "$1" 2>/dev/null
+}
+
+# ── Before the wall: the turn never has to end ──────────────────────────────
+# The whole launcher contract is handed to the hook on purpose. A swap that needs
+# none of it must be seen not to use it.
+set +m 2>/dev/null
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+out=$(sw_prompt UserPromptSubmit sess-sw1)
+grep -q 'AT-spare' "$CREDS" \
+  && ok "a corroborated 96% with a spare in reach swaps the session in place" \
+  || bad "in-session swap" "the credential never moved"
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
+  && ok "...and the active pointer follows it" \
+  || bad "in-session swap" "pointer: $(cat "$ADIR/.active" 2>/dev/null)"
+python3 - "$out" <<'PY' \
+  && ok "...saying so in one line the user sees, and telling the model why" \
+  || bad "swap message" "got: ${out:0:200}"
+import json, sys
+d = json.loads(sys.argv[1])
+msg = d.get("systemMessage") or ""
+ctx = (d.get("hookSpecificOutput") or {}).get("additionalContext") or ""
+assert "spare" in msg, f"systemMessage does not name the account: {msg!r}"
+assert "spare" in ctx, f"additionalContext does not name the account: {ctx!r}"
+PY
+if kill -0 "$SWPID" 2>/dev/null; then ok "...and the session is never signalled — the turn keeps going"
+else bad "in-session swap" "ended the session it was supposed to keep"; fi
+[ ! -f "$SWD/handoff-00000000000000000000000000000002.json" ] \
+  && ok "...and nothing is armed for a launcher to relaunch" \
+  || bad "in-session swap" "armed a handoff for a swap that had already happened"
+
+# An autonomous turn fires tool uses and never a prompt, and that is exactly the
+# turn that burns the last of the quota.
+sw_fixture 58 96
+sw_prompt PostToolUse sess-sw2 >/dev/null
+grep -q 'AT-spare' "$CREDS" \
+  && ok "a tool-use tick swaps too, not only a typed prompt" \
+  || bad "tool-use swap" "the credential never moved"
+
+# ── ...but only when the reading actually says so ───────────────────────────
+sw_fixture 58 90
+sw_prompt UserPromptSubmit sess-sw3 >/dev/null
+grep -q 'AT-spent' "$CREDS" \
+  && ok "a reading below the arm threshold swaps nothing" \
+  || bad "threshold" "swapped on a reading that corroborates nothing"
+
+sw_fixture 58 96 99 99
+out=$(sw_prompt UserPromptSubmit sess-sw4)
+grep -q 'AT-spent' "$CREDS" \
+  && ok "...and neither does a spare with no room left" \
+  || bad "no room" "swapped onto an account that is spent too"
+case "$out" in
+  *"QUOTA NEARLY EXHAUSTED"*) ok "...while the warning that was always there still arrives" ;;
+  *) bad "warning preempted" "got: ${out:0:140}" ;;
+esac
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
+# ── At most one swap per account per reset window ───────────────────────────
+# The ordinary case cannot repeat, because the swap deletes the reading that
+# caused it. What can is a cached row that says "room" about an account that has
+# none: the session would walk back and forth between two spent accounts on one
+# reading. The window that reading names is the key, so a second swap away from
+# the same account inside it is refused.
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+sw_prompt UserPromptSubmit sess-sw5 >/dev/null
+grep -q 'AT-spare' "$CREDS" || bad "flap guard" "the fixture's first swap never happened"
+"$ACCT" --no-color use spent --force >/dev/null 2>&1
+quota 58 96                                  # same account, same window, same numbers
+sw_prompt UserPromptSubmit sess-sw6 >/dev/null
+grep -q 'AT-spent' "$CREDS" \
+  && ok "a second swap away from the same account in the same window is refused" \
+  || bad "flap guard" "swapped again on the reading that had already moved it once"
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"fiveHourReset":"R2","sevenDayPercent":96,"sevenDayReset":"D2"}}\n' \
+  > "$SWD/quota-cache.json"
+sw_prompt UserPromptSubmit sess-sw7 >/dev/null
+grep -q 'AT-spare' "$CREDS" \
+  && ok "...while the next window is a new situation, and moves it again" \
+  || bad "flap guard" "refused a swap in a window it had never left"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
+# ── After the wall: swap, then wake the session that parked ─────────────────
+# Claude Code never resumes a parked session by itself — every recovery in the
+# transcripts was a human typing. So the backstop does not just swap and fall
+# silent: it confirms the credential landed and exits 2, which is the one thing an
+# asyncRewake entry acts on.
+sw_stopfail() { # $1=session id ; prints the hook's exit code
+  printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"rate_limit"}' "$1" \
+    | CCD_HANDOFF=00000000000000000000000000000002 \
+      CCD_HANDOFF_STATE="$SWD/handoff-00000000000000000000000000000002.json" \
+      CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID sw_hook StopFailure \
+      >"$FAKE/.sw-out" 2>"$FAKE/.sw-err"
+  printf '%s' "$?"
+}
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+rc=$(sw_stopfail sess-sw8)
+grep -q 'AT-spare' "$CREDS" \
+  && ok "a limit that arrived before the reading could see it still swaps in place" \
+  || bad "backstop swap" "the credential never moved"
+[ "$rc" = "2" ] \
+  && ok "...and exits 2, the only code an asyncRewake hook wakes on" \
+  || bad "wake" "exit code $rc"
+grep -q 'spare' "$FAKE/.sw-err" \
+  && ok "...naming the account in the text the wake carries" \
+  || bad "wake text" "stderr: $(head -c 140 "$FAKE/.sw-err")"
+grep -qi 'do not repeat work' "$FAKE/.sw-err" \
+  && ok "...and telling the model to continue rather than start the task over" \
+  || bad "wake text" "stderr: $(head -c 180 "$FAKE/.sw-err")"
+if kill -0 "$SWPID" 2>/dev/null; then ok "...without signalling the session it just repaired"
+else bad "backstop" "ended the session instead of waking it"; fi
+[ ! -f "$SWD/handoff-00000000000000000000000000000002.json" ] \
+  && ok "...and without arming a relaunch it no longer needs" \
+  || bad "backstop" "armed a launcher handoff for a swap it had performed itself"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
+# A wake that lands on the account we just left is a wasted turn: it fails the same
+# way and parks again. The swap writes the live store, but a keychain that refused
+# — or this session writing its own blob back over ours — leaves that store still
+# describing the old account. The plan fields travel with the credential and
+# survive the token rotation a pickup causes, which is why the token itself cannot
+# answer this, and why nothing is woken without an answer.
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+python3 - "$ADIR/spare.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["subscription_type"] = "team"       # what the store records, and the blob, disagree
+json.dump(d, open(sys.argv[1], "w"))
+PY
+rc=$(sw_stopfail sess-sw9)
+[ "$rc" != "2" ] \
+  && ok "a swap the live store cannot confirm wakes nothing" \
+  || bad "unconfirmed wake" "woke the session into the account it had just left"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
+# ── The wake has to be registered, and has to read like something ccd said ──
+python3 - "$ROOT/hooks/hooks.json" "$ROOT/scripts/quota-guard.sh" <<'PY' \
+  && ok "the StopFailure entry is registered as an asyncRewake hook" \
+  || bad "hooks.json" "the exit 2 above would wake nothing"
+import json, re, sys
+groups = json.load(open(sys.argv[1]))["hooks"]["StopFailure"]
+entry = [e for g in groups for e in g["hooks"]][0]
+assert entry.get("asyncRewake") is True, "asyncRewake is not set on the command hook"
+settle = int(re.search(r"CCD_SWAP_SETTLE:-(\d+)", open(sys.argv[2]).read()).group(1))
+t = entry.get("timeout")
+assert isinstance(t, int) and t > settle * 4, \
+    f"timeout {t} does not comfortably exceed a {settle}s confirm wait — a hook killed there wakes nothing"
+PY
+python3 - "$ROOT/hooks/hooks.json" <<'PY' \
+  && ok "...carrying wake text of its own, not the blocking-error default" \
+  || bad "hooks.json" "the user would read 'Stop hook blocking error from command …'"
+import json, sys
+entry = [e for g in json.load(open(sys.argv[1]))["hooks"]["StopFailure"] for e in g["hooks"]][0]
+msg = entry.get("rewakeMessage") or ""
+summary = entry.get("rewakeSummary") or ""
+assert "usage limit" in msg, f"rewakeMessage: {msg!r}"
+assert "do not repeat work" in msg.lower(), f"rewakeMessage: {msg!r}"
+assert summary, "rewakeSummary is unset, so the default stands in for it"
+for s in (msg, summary):
+    assert "blocking error" not in s.lower(), f"default phrasing left in: {s!r}"
+PY
+
+rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$SWD/accounts-keepalive" \
+       "$FAKE/.sw-out" "$FAKE/.sw-err"
+unset CCD_USAGE_URL CCD_TOKEN_URL
+unset -f sw_hook sw_fixture sw_prompt sw_stopfail
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
