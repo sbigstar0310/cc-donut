@@ -695,8 +695,9 @@ kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 # The payload Claude Code really sends, verbatim from an interactive session
 # driven into a 429 (2.1.274, #60) — stopfail() paraphrases the shape, this IS
-# the shape. A rename of `error` upstream fails here loudly instead of silently
-# disarming the handoff. Seeds its own readiness set rather than inheriting one.
+# the shape. Being our own literal it cannot notice a rename upstream; what it
+# pins is our end, so the parser cannot drift off the real key again unnoticed.
+# Seeds its own readiness set rather than inheriting one.
 captured_stopfail() { # $1=session id
   printf '{"session_id":"%s","transcript_path":"/tmp/w/t.jsonl","cwd":"/tmp/w","prompt_id":"42d3d934-7b41-49f6-91a7-f3355451fcd6","effort":{"level":"xhigh"},"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Request rejected (429)"}' "$1"
 }
@@ -721,6 +722,14 @@ printf '{"session_id":"sess-legacy","cwd":"/tmp/w","hook_event_name":"StopFailur
   | fire_stopfail
 [ -z "$(hf_get armed)" ] && ok "the retired error_type key arms nothing" \
   || bad "error_type must not be read" "armed=$(hf_get armed)"
+# Positive control. Nothing armed is also what a dead stand-in, a readiness check
+# that failed, or a hook that never ran leaves behind — so the assertion above can
+# pass while proving nothing. The real payload through the SAME stand-in and the
+# SAME fixture must arm: only then was that silence the key being rejected.
+hf_reset
+captured_stopfail sess-legacy-control | fire_stopfail
+[ "$(hf_get armed)" = "True" ] && ok "...on a fixture that arms the moment the key is right" \
+  || bad "positive control for the error_type case" "armed=$(hf_get armed)"
 kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
