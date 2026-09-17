@@ -4550,6 +4550,24 @@ sp_landed && solo_render=yes || solo_render="no ($(sp_reading))"
 [ "$solo_hook" = yes ] && [ "$solo_render" = yes ] \
   && ok "the only registered account is measured too, by a tick and by a render" \
   || bad "single spare" "tick: $solo_hook · render: $solo_render"
+sleep 1
+
+# ── ...unless the burst has already been there ──────────────────────────────
+# best_target() drops the launcher's visited set as well as the active account, and
+# returns before writing anything when that leaves no candidate. A render that asks for
+# a job anyway gets one that measures nothing, leaves the reading stale, and is asked
+# for again by the very next render.
+solo_fixture
+# Comma-separated, the form the launcher exports (export_visited, bin/ccd-handoff).
+CCD_BURST_VISITED=earlier-hop,backup sp_render >/dev/null
+sleep 2
+visited_started=$(cat "$SPLOG" 2>/dev/null)
+solo_fixture
+sp_render >/dev/null
+sp_landed && unvisited=yes || unvisited="no ($(sp_reading))"
+[ -z "$visited_started" ] && [ "$unvisited" = yes ] \
+  && ok "...and not while the burst has already visited the only spare there is" \
+  || bad "visited spare" "visited: ${visited_started:-nothing started} · not visited: $unvisited"
 rm -f "$FAKE/.claude.json"
 sleep 1
 
