@@ -43,7 +43,8 @@ if [ "$EVENT" = "SessionStart" ]; then
 import json, os, sys, tempfile
 p = os.path.realpath(sys.argv[1])          # a dotfiles symlink stays a symlink
 with open(p, encoding="utf-8") as f:
-    data = json.load(f)
+    before = f.read()
+data = json.loads(before)
 s = data.get("statusLine")
 if (not isinstance(s, dict) or "refreshInterval" in s
         or s.get("command") != "bash ~/.claude/ccd/statusline-launcher.sh"):
@@ -54,7 +55,14 @@ try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2); f.write("\n")
     os.chmod(tmp, os.stat(p).st_mode & 0o777)
-    os.replace(tmp, p)
+    # Compare and swap. This rewrites the whole file, so a write that landed while we
+    # worked — Claude Code's own, another session's, or one that made the statusline
+    # somebody else's — would be dropped by replacing it. Sessions start in bunches, so
+    # stand down and let the next one try; a lock Claude Code does not take would not
+    # help anyway.
+    with open(p, encoding="utf-8") as f:
+        if f.read() == before:
+            os.replace(tmp, p)
 finally:
     if os.path.exists(tmp): os.unlink(tmp)
 PY
@@ -859,11 +867,13 @@ if [ -z "${CCD_ACTIVE:-}" ] && has_accounts && ka=$(ccd_account_bin); then
   # the TTL, not on prompts alone: an autonomous turn can run tool uses for an hour
   # without one (#54). A fresh reading adds nothing to the tick. keepalive and the pick
   # both spend one-time refresh tokens, so they run as one job under one lock, shared
-  # with the statusline's trigger (cmd_keepalive).
+  # with the statusline's trigger (cmd_keepalive). --detach because Claude Code kills a
+  # hook that outruns its timeout by process group, and a kill mid token-exchange loses
+  # a token the server has already rotated.
   if [ "$(file_age "$CCD_DIR/accounts-quota.json")" -ge "${CCD_CANDIDATE_TTL:-300}" ]; then
-    "$ka" --no-color keepalive --pick --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
+    "$ka" --no-color keepalive --pick --detach --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
   else
-    "$ka" --no-color keepalive >/dev/null 2>&1 &
+    "$ka" --no-color keepalive --detach >/dev/null 2>&1 &
   fi
 fi
 

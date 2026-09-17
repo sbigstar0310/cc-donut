@@ -1473,6 +1473,22 @@ def cmd_pick(args):
     return 0
 
 
+def detach():
+    """Leave the caller's process group, for a job the caller must not be able to kill.
+
+    Claude Code cancels a statusline render that is still running when the next update
+    arrives, and kills a hook that outruns its timeout — both by process group, which a
+    plain `&` child is still in. Caught there mid token-exchange, the server has already
+    rotated the refresh token and nothing has saved the replacement: the spare dies,
+    which is the failure ccd exists to prevent. The fork is what lets the caller's `&`
+    return at once; setsid is what puts the survivor out of that group's reach."""
+    if not hasattr(os, "fork"):
+        return
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+
+
 def cmd_keepalive(args):
     """Keep stored refresh tokens alive, and with --pick re-measure the spares after.
 
@@ -1487,7 +1503,10 @@ def cmd_keepalive(args):
     on the way — so the whole job holds one lock, and a trigger that finds it held
     has nothing to do. A kernel lock dies with its holder: nothing is left behind to
     reclaim, so there is no reclaim to race."""
-    if len(account_names()) < 2:
+    # One registered account with an unregistered login is a supported install, and that
+    # account IS the spare (#41) — so the pick runs on one, while the keepalive pass
+    # keeps its own bound (there is nothing to keep alive without a spare to keep).
+    if not account_names():
         return 0
     try:
         with Lock(REFRESH_LOCK, wait=False):
@@ -1503,6 +1522,8 @@ def cmd_keepalive(args):
 
 def keepalive_pass(force):
     """Refresh the spares that are due; returns those still stale, or [] if none ran."""
+    if len(account_names()) < 2:
+        return []
     # One transaction under the store lock: the due check, every account read, the
     # refresh, and the stamp. Checked outside it, a pass could read a refresh token
     # that a `ccd account` command was rotating away at the same moment.
@@ -1754,6 +1775,7 @@ def main(argv):
     a.add_argument("--report", action="store_true")
     a.add_argument("--pick", action="store_true", help="then re-measure the spares")
     a.add_argument("--exclude", default="")
+    a.add_argument("--detach", action="store_true", help="run out of the caller's process group")
     a.set_defaults(fn=cmd_keepalive)
 
     a = sub.add_parser("usage", help="live quota for the signed-in login (internal)")
@@ -1765,6 +1787,8 @@ def main(argv):
     a.set_defaults(fn=cmd_current)
 
     args = p.parse_args(argv)
+    if getattr(args, "detach", False):
+        detach()                      # before anything is opened or locked
     color(not args.no_color and sys.stdout.isatty())
     if not getattr(args, "fn", None):
         p.print_help()
