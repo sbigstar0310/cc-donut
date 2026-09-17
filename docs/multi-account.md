@@ -4,6 +4,12 @@
 > 작성일: 2026-08-16
 >
 > 구현하면서 설계에서 바뀐 지점은 §13에 정리했다.
+>
+> **2026-09-17 (#57) 개정.** 계정 간 스왑은 이제 **세션 안에서** 일어난다. 세션을
+> 끝내고 relaunch 하던 `to_account` 방향과, 그걸 위해 있던 계정 사다리 / 방문 집합
+> export 는 전부 제거됐다. 런처(`ccd-handoff`)에 남은 것은 유료 OpenRouter 홉과 거기서
+> 돌아오는 길뿐이고, 그 런처는 `ccd setup --auto` 만 설치한다. 아래 §1·§2·§4.3·§5·§5.2·
+> §6.1 은 그 내용으로 갱신했다.
 
 ## 1. 목표
 
@@ -11,21 +17,24 @@
 
 ```
 계정 A 소진
-  ├─ 등록된 다른 계정 중 여유분 있음  → 계정 B 로 스왑, 같은 대화 계속   (구독, 무과금)
-  └─ 전부 소진                        → OpenRouter 백본                (유료, 최종 방어선)
+  ├─ 등록된 다른 계정 중 여유분 있음  → 계정 B 로 세션 안에서 스왑      (구독, 무과금, 재시작 없음)
+  └─ 전부 소진                        → OpenRouter 백본 (relaunch)     (유료, 최종 방어선)
 ```
 
 ### 비목표
 
 - 로드 밸런싱. ccd는 **소진 시 탈출** 도구다. "덜 쓴 계정으로 미리 분산"은 cswap/clauth의 영역이고, ccd가 흉내내면 정체성이 흐려진다. 전환은 오직 소진 시점에만 일어난다.
-- 세션 중 라이브 스왑. ccd는 세션 경계에서만 크레덴셜을 만진다 (§6 참조).
+- ~~세션 중 라이브 스왑~~. **0.4.0 의 비목표였으나 #57 에서 뒤집혔다.** 계정 간 스왑은
+  이제 살아 있는 세션 안에서 일어난다. Claude Code 는 크레덴셜 저장소를 요청마다 읽고
+  토큰을 회전시킬 때만 쓰며, 양쪽 쓰기가 원자적이라 경합이 없다 — 실측으로 스왑된 세션이
+  토큰 갱신 두 번을 넘겨 16.9시간 동안 재시작 없이 계속 돌았다 (§6.1).
 - 계정 공유 지원. 한 사람이 소유한 여러 구독을 대상으로 한다 (§9).
 
 ## 2. 현재 구조 (변경 대상)
 
 | 파일 | 역할 |
 |---|---|
-| `bin/ccd-handoff` | `~/.local/bin/claude` 로 설치되는 런처. 실제 claude를 돌리고 exit 129를 잡아 반대편 백본으로 relaunch 하는 루프 |
+| `bin/ccd-handoff` | `ccd setup --auto` 가 설치하는 런처. 실제 claude를 돌리고 exit 129를 잡아 **유료 OpenRouter 백본으로 relaunch** 하고 되돌리는 루프. 계정 간 이동은 여기를 지나지 않는다 |
 | `scripts/quota-guard.sh` | 훅 (`UserPromptSubmit`/`PostToolUse`/`StopFailure`/`SessionEnd`). 소진·회복을 판단하고 handoff 상태를 쓴 뒤 claude에 SIGHUP |
 | `bin/ccd` | OpenRouter 백본 런처 (`ANTHROPIC_BASE_URL` 등을 세팅하고 claude exec) |
 | `bin/ccd-statusline` | 상태 표시 |
@@ -37,7 +46,7 @@
 3. claude 가 SessionEnd 훅 실행 후 **129** 로 종료
 4. 런처가 상태 파일을 읽고 `direction` 에 따라 반대편 백본에서 `--resume <sid>` 로 재기동
 
-`direction` 은 현재 `to_fallback` | `to_subscription` 두 값뿐이다. **이 설계는 여기에 세 번째 값을 추가하는 것이 전부다.** 인터록, hop 카운터, transcript 존재 검사, headless 거부, 복원 실패 시 새 세션 폴백은 전부 그대로 재사용된다.
+`direction` 은 `to_fallback` | `to_subscription` 두 값뿐이다. 0.4.0 설계는 여기에 세 번째 값(`to_account`)을 더했지만, #57 에서 다시 두 값으로 돌아왔다 — 계정 간 이동은 세션을 끝내지 않으므로 방향이 필요 없다. 인터록, hop 카운터, transcript 존재 검사, headless 거부, 복원 실패 시 새 세션 폴백은 전부 그대로다.
 
 ## 3. 검증된 사실
 
@@ -169,23 +178,24 @@ User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 {
   "armed": true,
   "token": "<32 hex>",
-  "direction": "to_account",        // ← 신규
-  "account": "work",                // ← 신규. to_account 일 때만
+  "direction": "to_fallback",       // to_fallback | to_subscription
   "session_id": "…",
   "cwd": "…",
   "armed_at": 1755300000
 }
 ```
 
-기존 두 방향의 스키마는 그대로. `account` 는 `to_account` 에서만 읽는다.
+0.4.0 은 여기에 `to_account` 와 `account` 필드를 더했다. #57 에서 **둘 다 제거**됐다:
+OpenRouter 에서 돌아올 때 어느 계정으로 갈지는 훅이 먼저 자격증명을 설치해서 정하므로,
+상태 파일이 계정을 지명할 이유가 없다.
 
 ## 5. 계정 선택 알고리즘
 
-`quota-guard.sh` 의 `StopFailure` 분기에서 호출.
+`quota-guard.sh` 의 프롬프트·툴 틱(벽 앞 스왑)과 `StopFailure` 백스톱에서 호출.
 
 ```
-pick_account(excluded):
-  후보 = 등록된 모든 계정 − 현재 활성 계정 − excluded   // excluded 는 §5.2
+pick_account():
+  후보 = 등록된 모든 계정 − 현재 활성 계정
   각 후보에 대해:
       캐시가 CANDIDATE_TTL(=300s) 이내면 캐시 사용
       아니면: access token 유효? → 조회
@@ -202,47 +212,55 @@ pick_account(excluded):
 
 ### 5.2 루프 방지 — 횟수가 아니라 방문 집합으로
 
-현행 `ccd-handoff` 는 `MAX_HOPS=3` 으로 연속 relaunch 횟수를 센다. 백본이 둘뿐일 때는 맞는 값이었지만, **계정이 늘면 이 상수가 곧 사다리 길이의 상한이 된다.** 계정 3개면 A→B→C 만으로 상한에 닿아 정작 최종 폴백인 OpenRouter 로 못 간다 — 루프 방지 장치가 탈출을 막는 셈이다. 계정 수는 사용자마다 다르므로 이 값은 **하드코딩할 수 없다.**
-
-횟수를 세는 대신 **한 burst 안에서 이미 방문한 목적지를 기억한다.**
+> **#57 개정.** 아래의 "계정 사다리" 는 없어졌다. 계정 간 이동이 relaunch 를 쓰지 않으니
+> 런처가 도는 목적지 공간은 `{fallback, subscription}` 둘뿐이고, 훅으로 방문 집합을
+> 넘기던 `CCD_BURST_VISITED` 도 읽는 쪽과 함께 전부 제거됐다 (`ccd-account pick` 의
+> `--exclude` 포함). 남은 규칙은 아래 두 줄이다.
 
 - **burst** = 사이에 의미 있는 작업(`HOP_RESET_SECONDS` 이상 지속된 세션)이 없이 연달아 일어난 relaunch 묶음
-- 목적지 공간은 유한하고 상태에서 파생된다: `{등록된 계정 이름들} ∪ {fallback}`
-- relaunch 할 때마다 목적지를 `visited` 에 넣는다
-- **`visited` 를 `pick_account()` 의 `excluded` 로 그대로 넘긴다**
-- 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 `visited` 를 통째로 비운다 (기존 `hops=0` 과 같은 자리, 같은 의미)
+- relaunch 할 때마다 목적지를 `visited` 에 넣는다. 한 burst 안에서 같은 목적지를 두 번
+  들어가는 것은 정의상 루프이므로 그 자리에서 멈춘다
+- 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 `visited` 를 통째로 비운다 (`hops=0` 과 같은 자리)
 
-이 규칙의 성질:
+목적지를 기록하지 않는 방향(`to_subscription`)이 스스로를 계속 재무장하는 경우를 위해
+숫자 백스톱을 하나 남겨 둔다: 연속 3홉. 계정 수에서 파생시키던 상한은 사다리와 함께
+없어졌고, 멀티 계정 이전의 상수와 같은 값으로 돌아왔다 (§13.4).
 
-- **자기 스케일링.** 계정 2개면 최대 3홉(A→B→OR), 5개면 최대 6홉. 조정할 상수가 없다
-- **자연스러운 배수(drain).** 소진된 계정이 후보에서 계속 빠지므로 사다리가 알아서 OpenRouter 쪽으로 흘러간다. 별도의 "이제 폴백으로 가라" 판단이 필요 없다
-- **핑퐁에는 더 엄격하다.** A→B→A 는 세 번째 홉에서 즉시 잡힌다. 횟수 카운터라면 3에 우연히 걸려서 잡혔을 뿐이고, `MAX_HOPS` 를 5로 올린 순간 놓쳤을 것이다
-- **정상 이동은 더 관대하다.** A→B→OR 처럼 목적지가 전부 다른 3홉은 (캐시가 낡아 B가 실제로는 소진이었던 경우) 통과된다. 기존 카운터는 이걸 막았다
-
-burst 안에서 갈 곳이 전부 소진되면 — 즉 `fallback` 마저 `visited` 에 있으면 — 그때 멈추고 기존 안내를 낸다:
+burst 안에서 갈 곳이 전부 소진되면 — 즉 `fallback` 이 이미 `visited` 에 있으면 — 멈추고
+기존 안내를 낸다:
 
 ```
 ccd: 갈 수 있는 백본을 모두 시도했습니다 — 중단합니다.
      이어서 하려면: claude --resume <sid>
 ```
 
-**런처 → 훅 전달.** `visited` 는 런처(`ccd-handoff`)의 상태이고 `pick_account()` 는 훅(`quota-guard.sh`)에서 돈다. 서로 다른 프로세스이므로 런처가 relaunch 시 `CCD_BURST_VISITED` (콤마 구분)를 export 하고, 훅이 그대로 `ccd-account pick --exclude` 로 넘긴다. `CCD_HANDOFF` / `CCD_HANDOFF_STATE` 를 넘기는 기존 방식과 동일한 패턴이라 새 메커니즘이 아니다.
-
-**런어웨이 백스톱.** `visited` 가 올바르면 burst 길이는 `|계정| + 1` 로 이미 유한하다. 그래도 저장소가 도중에 변하거나 버그가 나는 경우를 대비해 절대 상한을 하나 둔다 — 단 이것도 매 홉마다 현재 저장소에서 다시 계산한다 (`등록 계정 수 + 2`). **이건 정책 노브가 아니라 "무언가 고장났다" 는 트립와이어**이며, `visited` 가 정상 동작하는 한 도달하지 않는다. 상수로 고정된 정책값은 이 설계에 남지 않는다.
-
-`HOP_RESET_SECONDS=60` 은 그대로 둔다. 이건 시간 임계값이지 사다리 길이에 대한 가정이 아니라서 계정 수와 함께 변하지 않는다.
+`HOP_RESET_SECONDS=60` 은 그대로 둔다. 이건 시간 임계값이지 사다리 길이에 대한 가정이 아니다.
 
 ## 6. 크레덴셜 스왑
 
-### 6.1 타이밍 — ccd의 구조적 이점
+### 6.1 타이밍 — 경합이 없다는 것을 실측으로 확인했다
 
-cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운다. 그래서 Claude Code 자신의 토큰 refresh 와 경합하고, 그걸 막으려 크레덴셜 락을 잡는 코드가 필요하다.
+cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운다. 그래서 Claude Code 자신의
+토큰 refresh 와 경합한다고 여겨졌고, ccd 0.4.0 은 그 경합을 피하려고 스왑을 세션 경계로
+미뤘다 — claude 가 129로 종료한 뒤, relaunch 직전.
 
-ccd 는 다르다. 스왑은 **`ccd-handoff` 루프 안에서, claude 가 129로 종료한 뒤 relaunch 직전에** 일어난다. 그 순간 크레덴셜을 만지는 프로세스가 없다. **경합 자체가 존재하지 않는다.**
+**#57 에서 그 전제를 실측했다.** Claude Code 는 크레덴셜 저장소를 요청마다 읽고, 자기가
+토큰을 회전시킬 때만 쓴다. 양쪽 쓰기가 원자적이라 스왑은 그냥 다음 요청부터 적용된다:
+사용자 트랜스크립트에서 스왑된 세션이 한 프로세스, 한 세션 id 로 **16.9시간** 동안
+1,159번 성공했고, 그 사이 access token 이 최소 두 번 갱신됐다. 재시작은 없었다.
 
-이건 이 기능을 ccd에 넣는 가장 큰 이유다.
+그래서 스왑은 세션 안에서 일어난다. 세션을 끝내는 유일한 홉은 OpenRouter 로 나가는 길과
+거기서 돌아오는 길이다 — 그동안 백본은 프로세스의 환경 변수라서, 파일을 아무리 고쳐도
+그 세션에는 닿지 않는다.
 
-단, 다른 터미널에서 별개의 claude 세션이 돌고 있을 수 있다. 그 세션은 이미 메모리에 토큰을 갖고 있어 즉시 깨지지는 않지만, 다음 refresh 때 남의 계정으로 refresh 하게 된다. → **다중 세션 감지 시 경고 후 진행**, 문서에 명시 (§8 표).
+다른 터미널에서 돌고 있는 세션도 같은 저장소를 읽으므로 함께 옮겨간다. 즉시 깨지지 않고,
+다음 refresh 부터 새 계정으로 refresh 한다. → **다중 세션 감지 시 안내 후 진행**, 다만
+"재시작하라" 가 아니라 "그대로 계속 돌아간다" 로 말한다 (§8 표).
+
+계정의 절반은 늦게 따라온다: 모델 목록, Fable 사용 가능 여부, `/status` 신원은 시작할 때
+한 번 읽힌 값이라 다음 실행 전까지 떠나온 계정을 가리킨다 (#12, §12.0.5). 이건 사용자가
+발견하게 두면 안 되는 유일한 항목이라서 `ccd account use` 출력과 `ccd doctor` 가 직접
+말한다.
 
 ### 6.2 절차
 
@@ -307,11 +325,10 @@ refresh token 8.5일 만료 때문에, 등록만 해두고 안 쓰는 계정은 
 | 후보 계정 refresh 실패 | `status=dead`, 후보에서 제외, 다음 후보로. 전부 실패하면 `to_fallback` |
 | 쿼타 조회 네트워크 오류 | `status=error`, 제외. **낙관적 스왑을 하지 않는다** — 읽히지 않는 값은 절대 "여유 있음" 이 아니다 (기존 `quota_peak` 의 원칙과 동일) |
 | 스왑 도중 크래시 | `.lock` + atomic write 로 blob 은 항상 온전. `.active` 가 어긋나면 다음 실행 시 live blob 과 대조해 복구 |
-| 스왑 후 relaunch 가 즉시 실패 | 기존 로직 재사용: 15초 내 비정상 종료면 새 세션으로 이어가고 `--resume <sid>` 안내 |
-| 다른 터미널에 세션 존재 | 경고 출력 후 진행. 그 세션은 다음 refresh 때 계정이 바뀐다 |
-| 무한 전환 루프 | §5.2 의 방문 집합이 커버. burst 당 각 목적지 1회로 제한되므로 계정 수와 무관하게 유한 |
-| 계정 N개 전부 거치기 | 정상 동작. 방문 집합은 계정 수에 따라 자동으로 늘어나므로 사다리가 잘리지 않는다 |
-| OpenRouter 키 없음 + 다른 계정 있음 | **전환은 가능해야 한다.** 현행 `handoff_ready()` 는 `have_key()` 를 무조건 요구하는데, `to_account` 경로에는 키가 필요 없다 → 조건 분리 필요 (§10) |
+| 유료 홉 후 relaunch 가 즉시 실패 | 기존 로직 재사용: 15초 내 비정상 종료면 새 세션으로 이어가고 `--resume <sid>` 안내 |
+| 다른 터미널에 세션 존재 | 안내 후 진행. 그 세션도 다음 refresh 때 새 계정으로 옮겨가며, **재시작할 필요는 없다** (§6.1) |
+| 무한 전환 루프 | §5.2. 계정 간 이동은 relaunch 를 하지 않으므로 루프 대상이 아니고, `(계정, 리셋 창)` 당 한 번으로 따로 제한된다 |
+| OpenRouter 키 없음 + 다른 계정 있음 | **전환은 가능해야 한다.** 계정 간 스왑 경로에는 키 검사가 아예 없고, `launcher_ready()` 도 키를 요구하지 않는다 (§10) |
 
 ## 9. 보안
 
@@ -362,22 +379,16 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 
 ### `scripts/quota-guard.sh`
 
-- `handoff_ready()` 를 `handoff_ready_account()` / `handoff_ready_fallback()` 으로 분리. 전자는 `have_key()` 를 요구하지 않는다 (§8 마지막 행)
-- `StopFailure` 분기: `peak >= ARM_THRESHOLD` 확인 후 `ccd-account pick --json --exclude "${CCD_BURST_VISITED:-}"` 먼저 시도 → 결과 있으면 `write_handoff true to_account <sid> <cwd> --account <name>`, 없으면 현행 `to_fallback`
-- `write_handoff()` 에 `account` 인자 추가
+- `handoff_ready()` 를 `launcher_ready()` / `handoff_ready()` 로 분리. 전자는 `have_key()` 를 요구하지 않는다 — OpenRouter 에서 **돌아오는** 길에는 키가 필요 없다 (§8 마지막 행)
+- 프롬프트·툴 틱: `peak >= ARM_THRESHOLD` 이고 여유 있는 계정이 있으면 **그 자리에서** `ccd-account use <name> --force` (#57 전에는 `StopFailure` 에서 `to_account` 로 무장했다)
+- `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 갈 계정이 없을 때만 `to_fallback`
 - keep-alive: 하루 1회 `ccd-account refresh --all --inactive-only` 를 백그라운드로
-- `SessionEnd` 안내 문구에 `to_account` 케이스 추가 — 어느 계정으로 가는지 label 표시
+- `SessionEnd` 안내 문구는 `to_fallback` / `to_subscription` 두 가지
 
 ### `bin/ccd-handoff`
 
-- **`MAX_HOPS=3` 상수 제거.** `hops` 카운터를 §5.2 의 `visited` 집합으로 교체하고, relaunch 직전 `CCD_BURST_VISITED` 로 export. 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 비운다 (기존 `hops=0` 자리)
-- `hf account` 필드 읽기
-- `case "$dir"` 에 `to_account)` 분기:
-  ```
-  ccd-account use "$acct" || { fallback 으로 강등하거나 안내 후 exit }
-  printf '▶ 🍩 <A> 쿼타 소진 — <B> 계정으로 같은 대화를 이어갑니다 (구독, 무과금)'
-  args=(--resume "$sid"); resuming=1; backbone=subscription
-  ```
+- `hops` 카운터 옆에 §5.2 의 `visited` 집합을 둔다. 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 둘 다 비운다
+- `case "$dir"` 은 `to_fallback` / `to_subscription` 두 분기. #57 에서 `to_account` 분기와 `hf account`, 계정 수에서 파생하던 상한, `CCD_BURST_VISITED` export 가 전부 삭제됐다
 - `to_subscription` (OpenRouter → 구독 복귀) 은 **손대지 않는다.** §13.1 참조
 
 ### `bin/ccd-statusline`
@@ -678,14 +689,16 @@ A 가 자기 토큰을 회전시켜 공유 블롭에 덮어쓸 수 있다. 프�
 
 `pick` 은 활성 계정을 후보에서 제외한다. 그런데 기존 복귀 신호(`to_subscription`)는 *활성 계정의* 쿼타 창이 리셋됐다는 뜻이다. 여기에 `pick` 을 끼우면 "A가 회복됐다" 는 신호를 받고 **A가 아닌 B로** 가게 된다. 신호의 의미와 행동이 어긋난다.
 
-그래서 기존 복귀 경로는 그대로 두고, 별도의 **탈출 경로**를 추가했다: OpenRouter 위에 있는 동안 등록된 다른 계정 중 여유가 있는 것이 생기면 즉시 `to_account` 로 빠져나간다. 회복을 기다리지 않는다.
+그래서 기존 복귀 경로는 그대로 두고, 별도의 **탈출 경로**를 추가했다: OpenRouter 위에 있는 동안 등록된 다른 계정 중 여유가 있는 것이 생기면 즉시 빠져나간다. 회복을 기다리지 않는다.
 
 두 경로는 이렇게 나뉜다.
 
 | 신호 | 의미 | 행동 |
 |---|---|---|
 | 활성 계정의 창이 리셋됨 | 떠나온 그 계정이 살아남 | `to_subscription` — 그 계정으로 복귀 (기존 로직 그대로) |
-| 다른 계정에 여유가 생김 | 더 싼 집이 비었음 | `to_account` — 그리로 이동 (신규) |
+| 다른 계정에 여유가 생김 | 더 싼 집이 비었음 | 훅이 먼저 그 계정의 자격증명을 설치하고, 같은 `to_subscription` 으로 relaunch (#57 전에는 `to_account`) |
+
+**#57 개정.** 탈출 경로도 방향을 따로 갖지 않는다. relaunch 는 살아 있는 저장소를 읽으므로, 훅이 `ccd-account use <name> --force` 로 목적지를 먼저 확정해 두면 런처는 "구독으로 돌아가라" 한 가지만 알면 된다.
 
 결과적으로 검증된 기존 코드는 한 줄도 바뀌지 않았고, 새 기능은 순수 추가분이다. 그리고 원래 의도했던 "돈 그만 쓰기" 효과는 오히려 더 빨리 난다 — 떠나온 계정이 회복될 때까지 기다릴 필요가 없으므로.
 
@@ -704,6 +717,8 @@ A 가 자기 토큰을 회전시켜 공유 블롭에 덮어쓸 수 있다. 프�
 ### 13.4 hop 상한의 하한선 3
 
 `등록 계정 수 + 2` 로 파생시켰더니 계정 0개에서 상한이 2가 되어 **기존 동작(3)이 바뀌었다.** 회귀다. `max(3, 계정수 + 2)` 로 바닥을 깔아 계정이 없으면 기존과 바이트 단위로 동일하게, 계정이 있으면 올라가기만 하도록 고쳤다.
+
+**#57:** 사다리가 없어지면서 계정 수는 런처의 홉 수와 아무 관계가 없어졌다. 파생식을 버리고 그 하한선(3)만 남겼다 — 멀티 계정 이전과 같은 상수다.
 
 ### 13.5 방문 집합은 기존 hop 카운터보다 한 홉 일찍 잡는다
 

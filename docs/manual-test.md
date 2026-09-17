@@ -179,10 +179,6 @@ seed 99 99 99 99 && ./bin/ccd-account pick --json; echo "rc=$?"
 seed 99 99 5 99 && ./bin/ccd-account pick --json; echo "rc=$?"
 #   기대: all_exhausted, rc=1
 
-# 런처의 방문 집합이 전달되는 경로
-seed 99 99 10 20 && ./bin/ccd-account pick --exclude "$B" --json; echo "rc=$?"
-#   기대: no_candidate, rc=1
-
 mv $Q.bak $Q 2>/dev/null || rm -f $Q          # 캐시 원복
 ```
 
@@ -210,11 +206,40 @@ echo '{"model":{"id":"claude-opus-5"},"workspace":{"current_dir":"/tmp"}}' | ./b
 
 ---
 
-## Stage 7 — 진짜 end-to-end 핸드오프 (선택, 가장 확실함)
+## Stage 7 — 진짜 end-to-end 계정 스왑 (선택, 가장 확실함)
 
-실제 런처가 세션을 끝내고 → 계정을 갈아끼우고 → **같은 대화를 복원**하는 전 과정.
+세션을 끝내지 않고 **살아 있는 그 세션이** 계정을 갈아끼우는 전 과정. 런처도, 신호도,
+relaunch 도 없다 (#57).
 
-쿼타를 실제로 소진시킬 수 없으므로, 런처가 감시하는 상태 파일을 직접 무장시킨다. 스모크 테스트가 하는 것과 동일한 경로다.
+쿼타를 실제로 소진시킬 수 없으므로, 훅이 읽는 쿼타 캐시를 직접 소진 상태로 만든다.
+스모크 테스트 §29 가 하는 것과 동일한 경로다.
+
+평소처럼 `claude` 로 세션을 하나 띄우고, 아무 대화나 한 번 주고받는다. 그 다음 **같은
+세션 안에서** `!` 를 붙여 실행한다 (한 줄 유지 — `!` 는 `eval` 을 거친다):
+
+```
+!python3 -c "import json,os;p=os.path.expanduser('~/.claude/ccd/quota-cache.json');json.dump({'claude':{'available':True,'error':False,'fiveHourPercent':58,'fiveHourReset':'R1','sevenDayPercent':96,'sevenDayReset':'D1'}},open(p,'w'))" && rm -f ~/.claude/ccd/swapped-windows
+```
+
+그리고 아무 프롬프트나 하나 더 보낸다. 다음 틱에서 훅이 스왑하고 한 줄로 알린다:
+
+```
+[ccd] ✓ 쿼타가 바닥나기 전에 <TARGET> 계정으로 갈아탔습니다 — 무과금, 대화 그대로 이어집니다
+```
+
+세션은 그대로 살아 있다. `./bin/ccd-account current` 로 계정이 바뀌었는지 확인한다.
+`/status` 와 모델 목록은 **다음 실행 전까지 이전 계정을 가리킨다** — 정상이고, 그게
+`ccd account use` 출력이 미리 말해주는 내용이다 (#12).
+
+> 스왑은 `(계정, 리셋 창)` 당 한 번이다. 다시 해보려면 위 명령의 `swapped-windows`
+> 삭제를 반드시 포함하거나 `sevenDayReset` 값을 바꾼다.
+
+---
+
+## Stage 7b — 유료 홉 (OpenRouter) end-to-end (선택)
+
+런처가 세션을 끝내고 → OpenRouter 로 relaunch 하고 → **같은 대화를 복원**하는 과정.
+`ccd setup --auto` 로 설치되는 런처와 OpenRouter 키가 있어야 한다.
 
 터미널 하나만 쓴다. 신호는 **세션이 자기 자신에게** 보내므로 다른 프로세스를 맞힐
 길이 없다 — Claude Code 가 `CLAUDE_PID` 를 자식에게 내려주기 때문이다.
@@ -229,10 +254,10 @@ CCD_HANDOFF_TOKEN=00000000000000000000000000000001 ./bin/ccd-handoff
 Claude Code가 뜨면 **아무 대화나 한 번 주고받는다** (복원할 내용이 있어야 하므로).
 
 그 다음, **같은 세션 안에서** 프롬프트에 `!` 를 붙여 실행한다. 세션 ID 도 환경변수로
-들어오므로 따로 옮겨 적을 필요가 없다. `<옮겨갈 계정 이름>` 만 바꾼다:
+들어오므로 따로 옮겨 적을 필요가 없다:
 
 ```
-!python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_account','account':sys.argv[1],'session_id':sys.argv[2],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" <옮겨갈 계정 이름> "$CLAUDE_CODE_SESSION_ID" && ps -p $CLAUDE_PID -o pid=,comm= && kill -HUP $CLAUDE_PID
+!python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_fallback','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$CLAUDE_CODE_SESSION_ID" && ps -p $CLAUDE_PID -o pid=,comm= && kill -HUP $CLAUDE_PID
 ```
 
 `ps` 가 `<pid> claude` 한 줄만 찍고 나서 신호가 간다. 다른 창은 건드릴 수 없다.
@@ -276,10 +301,9 @@ Claude Code가 뜨면 **아무 대화나 한 번 주고받는다** (복원할 �
 
 ```sh
 SID=<터미널1의 session id>
-TARGET=<옮겨갈 계정 이름>
 PID=<터미널1에서 확인한 CLAUDE_PID>
 
-python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_account','account':sys.argv[1],'session_id':sys.argv[2],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$TARGET" "$SID"
+python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_fallback','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$SID"
 
 # 보내기 전에 확인 — comm 이 정확히 'claude' 인 프로세스 하나여야 한다
 ps -p "$PID" -o pid=,tty=,comm=
@@ -300,15 +324,15 @@ ps -t "$TTY1" -o pid=,comm= | awk '$2=="claude"{print $1}'
 터미널 1에서 기대하는 동작:
 
 ```
-[ccd] ✓ <TARGET> 계정으로 갈아탑니다 — 구독 그대로, 대화 그대로 이어집니다
+[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다
 
-▶ ✓ 쿼타 소진 — <TARGET> 계정으로 같은 대화를 이어갑니다 (구독, 무과금)
+▶ 🍩 Claude 쿼타 소진 — 같은 대화를 OpenRouter에서 이어갑니다 (유료)
 ```
 
-그리고 **직전 대화가 그대로 복원된 채** 새 세션이 뜬다. `/status`로 계정이 바뀌었는지 확인.
+그리고 **직전 대화가 그대로 복원된 채** 새 세션이 OpenRouter 위에서 뜬다.
 
-터미널 1 이 통째로 죽으면 런처도 같이 끌려가므로 스왑은 **일어나지 않는다.** 그때는
-`./bin/ccd-account current` 가 그대로일 뿐 저장소는 멀쩡하니, 다시 하면 된다.
+터미널 1 이 통째로 죽으면 런처도 같이 끌려가므로 relaunch 는 **일어나지 않는다.** 그때는
+상태 파일만 남으니 지우고 다시 하면 된다.
 
 ---
 
@@ -325,7 +349,7 @@ rm -P ~/claude-creds-backup.json
 rm -f ~/.claude/ccd/accounts-quota.json
 ```
 
-`ccd setup --auto`는 이 문서에서 한 번도 실행하지 않았으므로 PATH와 shim은 건드려지지 않았다. 실제로 자동 핸드오프까지 켜보려면 그때 실행하고, 되돌릴 때는 `ccd setup --no-auto`.
+`ccd setup --auto`는 Stage 7b 를 하지 않는 한 실행되지 않으므로 PATH와 shim은 건드려지지 않는다. 계정 간 스왑(Stage 7)에는 필요 없다. 되돌릴 때는 `ccd setup --no-auto`.
 
 ---
 

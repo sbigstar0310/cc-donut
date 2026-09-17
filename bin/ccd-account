@@ -28,7 +28,7 @@ Commands:
   ccd account rm <name>
   ccd account use [<name>] [--json]
   ccd account refresh [--all] [--inactive-only] [<name>]
-  ccd account pick [--exclude a,b] [--json]
+  ccd account pick [--json]
   ccd account keepalive          (internal: called by the hook, at most daily)
   ccd account current [--json]   (internal: statusline / doctor)
 """
@@ -561,12 +561,12 @@ def drop_account_scoped_config():
     The credential move is what matters and must never be held hostage to the
     state of somebody else's file.
 
-    Safe next to a running session, and needed there most of all — that session is
-    about to be restarted, and the restart reads this file. Claude Code's own
-    writer re-reads under a lock and applies its change to what it finds on disk,
-    and it watches the file for other processes, so a deletion survives its next
-    write. What it cannot pick up is its own in-memory copy, which is why the
-    caller still tells the user that only a restart makes the swap real."""
+    Safe next to a running session, and needed there most of all — that session
+    goes on running, and its NEXT launch reads this file. Claude Code's own writer
+    re-reads under a lock and applies its change to what it finds on disk, and it
+    watches the file for other processes, so a deletion survives its next write.
+    What it cannot pick up is its own in-memory copy, which is why the caller says
+    plainly which half of the account only moves at the next launch."""
     for path in config_paths():
         cfg = read_json(path)
         if cfg is None:
@@ -1023,9 +1023,11 @@ def worst(rec):
 def swap_to(name, force=False):
     """Replace only the claudeAiOauth subtree of the live blob.
 
-    Called by ccd-handoff between sessions — after claude exited and before the
-    relaunch — which is the one moment no process owns the credentials. That is
-    why this needs no coordination with a running Claude Code."""
+    Called with a session live and mid-turn: the quota hook swaps in place (#57).
+    No coordination is needed even so — Claude Code reads this store per request
+    and writes it only when it rotates a token, and the write is atomic either
+    way. Measured: a swapped session kept working for 16.9 hours across two
+    refreshes without a restart."""
     target = account_load(name)
     if not target:
         die(f"no such account: {name}")
@@ -1094,13 +1096,12 @@ def swap_to(name, force=False):
     if not force:
         others = claude_processes()
         if others:
-            # A live session read its entitlements once, at startup, and holds
-            # them in memory — no file we write reaches them. Saying so is what
-            # keeps the user from reading a working swap as a failed one.
+            # One credential store, so the swap reaches them as well. What that
+            # does and does not move is the same everywhere, and the caller prints
+            # it next — so this line says only what is specific to them.
             noun = "session is" if others == 1 else "sessions are"
-            warn(f"{others} other Claude Code {noun} running. The swap applies to "
-                 "them too; their model list and limits keep describing the "
-                 "previous account until they next start.")
+            warn(f"{others} other Claude Code {noun} running — this moves them to "
+                 f"{name} too, from their next token refresh.")
     return target
 
 
@@ -1327,9 +1328,7 @@ def cmd_rm(args):
 def cmd_use(args):
     """Switch the active account. With no name, take the best spare as measured
     right now — the one place a person still had to supply a fact ccd measures
-    anyway. `--exclude` is deliberately not passed: it is the launcher's per-burst
-    ladder, not a verdict on an account, and a person asking for the best spare
-    means the best one, whether or not the ladder happened to touch it."""
+    anyway."""
     name = args.name
     if name is None:              # `use ""` stays a bad name, not a request to choose
         a, why = best_target()
@@ -1353,6 +1352,14 @@ def cmd_use(args):
     else:
         label = target.get("label") or target.get("subscription_type") or ""
         print(f"{C_GRN}✓{C_RESET} switched to {C_BOLD}{name}{C_RESET} {C_DIM}{label}{C_RESET}")
+        # The half that moves needs no explanation; the half that does not is the
+        # one people read as a failed swap (#12). Say it here, once, rather than
+        # leave it to be discovered from a model list that names the old plan.
+        print(f"{C_DIM}  Running sessions keep working — their requests bill to "
+              f"{name} from the next token refresh. No restart.{C_RESET}")
+        print(f"{C_DIM}  What lags: the model list and limits, Fable access and the "
+              f"/status identity keep describing the previous account until the "
+              f"next launch.{C_RESET}")
     return 0
 
 
@@ -1396,22 +1403,13 @@ def cmd_refresh(args):
     return rc
 
 
-def best_target(exclude="", no_probe=False):
+def best_target(no_probe=False):
     """(account, reading) for the best place to hand off, or (None, reason).
 
-    One selection rule for every caller — the hook, the launcher, and a person
-    typing `ccd account use` — so they can differ only in what they pass in.
-
-    `exclude` carries the launcher's per-burst visited set (docs §5.2), which is
-    what keeps the ladder finite without hardcoding a hop count."""
-    excluded = {
-        x.strip() for x in (exclude or "").replace(",", " ").split() if x.strip()
-    }
+    One selection rule for every caller — the hook, the statusline, and a person
+    typing `ccd account use` — so they can differ only in what they pass in."""
     cur = active_name()
-    if cur:
-        excluded.add(cur)
-
-    candidates = [a for a in accounts_all() if a["name"] not in excluded]
+    candidates = [a for a in accounts_all() if a["name"] != cur]
     if not candidates:
         return None, "no_candidate"
 
@@ -1449,7 +1447,7 @@ def best_target(exclude="", no_probe=False):
 
 def cmd_pick(args):
     """Print where a handoff would go. Exit 0 with a pick, 1 without."""
-    a, rec = best_target(args.exclude, args.no_probe)
+    a, rec = best_target(args.no_probe)
     if a is None:
         if args.json:
             print(json.dumps({"account": None, "reason": rec}))
@@ -1512,7 +1510,7 @@ def cmd_keepalive(args):
         with Lock(REFRESH_LOCK, wait=False):
             stale = keepalive_pass(args.force)
             if args.pick:
-                best_target(args.exclude, False)
+                best_target(False)
     except LockBusy:
         return 0
     if stale and args.report:
@@ -1772,7 +1770,6 @@ def main(argv):
     a.set_defaults(fn=cmd_refresh)
 
     a = sub.add_parser("pick", help="choose the best handoff target")
-    a.add_argument("--exclude", default="")
     a.add_argument("--json", action="store_true")
     a.add_argument(
         "--no-probe",
@@ -1785,7 +1782,6 @@ def main(argv):
     a.add_argument("--force", action="store_true")
     a.add_argument("--report", action="store_true")
     a.add_argument("--pick", action="store_true", help="then re-measure the spares")
-    a.add_argument("--exclude", default="")
     a.add_argument("--detach", action="store_true", help="run out of the caller's process group")
     a.set_defaults(fn=cmd_keepalive)
 

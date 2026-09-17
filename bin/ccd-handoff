@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Automatic quota handoff — runs the real claude and relaunches it on the other
-# backbone when the quota-guard hook asks for it.
+# Automatic quota handoff — runs the real claude and relaunches it on OpenRouter
+# when the quota-guard hook asks for it, and back when the quota returns.
+#
+# Only the PAID hop comes through here. Moving to another Claude subscription
+# happens inside the live session (scripts/quota-guard.sh, #57): the credential
+# ccd writes is the one the next request reads, so nothing ends and nothing is
+# relaunched for it.
 #
 # Installed indirectly: `ccd setup --auto` writes a small resolver at
 # ~/.local/bin/claude that execs the newest copy of THIS file, so a plugin
@@ -19,15 +24,8 @@
 set -u
 
 # A session that lasted at least this long was doing real work, so the burst
-# ends. Tunable only so the test suite can exercise both sides. This is a time
-# threshold, not an assumption about how long the backbone ladder is, so it does
-# not need to scale with the number of registered accounts.
+# ends. Tunable only so the test suite can exercise both sides.
 HOP_RESET_SECONDS=${CCD_HOP_RESET_SECONDS:-60}
-
-# Same literal every other component uses. Kept as a plain $HOME derivation, not
-# an override, so the handoff-state path this script computes can never drift
-# from the one quota-guard.sh computes for its interlock check.
-CCD_HOME="$HOME/.claude/ccd"
 
 # Resolve the real claude WITHOUT `command -v`, which would find the resolver
 # that invoked us. Skip by identity rather than by directory name: comparing
@@ -82,52 +80,14 @@ ccd_bin() {
 # a `ccd setup --no-auto` inside that window must not be outrun by an older hop.
 paid_optin() { [ -f "$HOME/.claude/ccd/paid-handoff" ]; }
 
-# ccd-account ships beside this file; prefer the sibling so a plugin update moves
-# both together, and fall back to the newest installed copy when this script was
-# invoked through a path that does not carry its siblings.
-SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || SELF_DIR=""
-ccd_account_bin() {
-  [ -n "$SELF_DIR" ] && [ -x "$SELF_DIR/ccd-account" ] && {
-    printf '%s' "$SELF_DIR/ccd-account"; return 0; }
-  local t
-  t=$(ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd-account 2>/dev/null | sort -V | tail -1)
-  [ -n "$t" ] && { printf '%s' "$t"; return 0; }
-  return 1
-}
-
 # ── Burst tracking (docs/multi-account.md §5.2) ──────────────────────────────
 # Loop protection remembers WHERE we have been rather than HOW MANY times we
-# moved. A hop counter has to encode the ladder length as a constant, and the
-# ladder is `registered accounts + 1` — a number that differs per user. With
-# three accounts a cap of 3 would be reached before the final OpenRouter fallback
-# was ever tried, so the guard against looping would block the escape instead.
-#
-# A burst is a run of relaunches with no real work between them. Each destination
-# may be visited once per burst; the set is handed to `ccd-account pick` as its
-# exclusion list, so an exhausted account simply stops being offered and the
-# ladder drains naturally toward the final fallback.
+# moved. A burst is a run of relaunches with no real work between them, and a
+# destination entered twice inside one is a loop by definition — which catches a
+# hop earlier, and more honestly, than any numeric cap.
 visited=""
 visited_has() { case " $visited " in *" $1 "*) return 0 ;; esac; return 1; }
 visited_add() { visited_has "$1" || visited="${visited:+$visited }$1"; }
-
-# Comma-separated for the hook, which passes it straight to `ccd-account pick`.
-export_visited() {
-  if [ -n "$visited" ]; then
-    CCD_BURST_VISITED=$(printf '%s' "$visited" | tr ' ' ',')
-  else
-    CCD_BURST_VISITED=""
-  fi
-  export CCD_BURST_VISITED
-}
-
-# Runaway backstop, recomputed from the store each hop rather than fixed. If the
-# visited set is doing its job this is never reached — tripping it means a bug,
-# not a user with many accounts.
-account_count() {
-  local n
-  n=$(ls "$CCD_HOME/accounts"/*.json 2>/dev/null | wc -l | tr -d ' ')
-  case "$n" in ''|*[!0-9]*) echo 0 ;; *) echo "$n" ;; esac
-}
 
 # Does a transcript exist for this session? A session that ended before its first
 # exchange has none, and `--resume` on it fails with "No conversation found",
@@ -220,7 +180,6 @@ for a in ${1+"$@"}; do
 done
 while :; do
   session_start=$(date +%s 2>/dev/null || echo 0)
-  export_visited
   if [ "$backbone" = "fallback" ]; then
     t=$(ccd_bin)
     if [ -z "$t" ]; then
@@ -271,16 +230,13 @@ while :; do
     exit "$rc"
   fi
   dir=$(hf direction)
-  acct=$(hf account)
   [ -n "$sid" ] || exit "$rc"
 
-  # Where this hop is headed, as a single name in the destination space
-  # {account names} ∪ {fallback}. Visiting one twice inside a burst is the
-  # definition of a loop.
+  # Where this hop is headed. Only the paid backbone is a destination worth
+  # remembering: going there twice inside one burst is the loop this guards.
   case "$dir" in
-    to_account)      dest="$acct" ;;
-    to_fallback)     dest="fallback" ;;
-    *)               dest="" ;;
+    to_fallback) dest="fallback" ;;
+    *)           dest="" ;;
   esac
   if [ -n "$dest" ] && visited_has "$dest"; then
     printf 'ccd: 갈 수 있는 백본을 모두 시도했습니다 — 중단합니다.\n     이어서 하려면: claude --resume %s\n' "$sid" >&2
@@ -299,17 +255,11 @@ while :; do
   # finds no armed state and exits instead of looping.
   rm -f "$CCD_STATE" 2>/dev/null || true
 
-  # Backstop, derived from the store rather than hardcoded: accounts + fallback,
-  # plus one for the return-to-subscription leg. `visited` already bounds a burst
-  # to exactly this, so reaching it means something is wrong (the store changed
-  # mid-burst, or a destination is not being recorded) — not that the user owns
-  # a lot of accounts.
-  # Floor at 3 so a store with no accounts behaves EXACTLY as before this feature
-  # existed — same cap, same message, same exit. Multi-account only ever raises it.
+  # Runaway backstop. `visited` is the real guard and catches a repeat first; this
+  # is here for the one direction that records no destination — a return that
+  # arms itself again would otherwise cycle unbounded.
   hops=$((hops + 1))
-  ceiling=$(( $(account_count) + 2 ))
-  [ "$ceiling" -lt 3 ] && ceiling=3
-  if [ "$hops" -ge "$ceiling" ]; then
+  if [ "$hops" -ge 3 ]; then
     printf 'ccd: too many consecutive handoffs — stopping.\n     Resume with: claude --resume %s\n' "$sid" >&2
     exit "$rc"
   fi
@@ -317,42 +267,6 @@ while :; do
   [ -n "$dest" ] && visited_add "$dest"
 
   case "$dir" in
-    to_account)
-      # Another Claude subscription still has quota. This is the cheap hop: the
-      # conversation stays on the subscription backbone, nothing is billed, and
-      # only the credential underneath changes.
-      ab=$(ccd_account_bin)
-      if [ -z "$ab" ] || [ -z "$acct" ]; then
-        printf 'ccd: 계정 전환 도구를 찾지 못했습니다 — 이어서 하려면: claude --resume %s\n' "$sid" >&2
-        exit "$rc"
-      fi
-      # The swap happens HERE, between sessions: claude has exited and the
-      # relaunch has not started, so nothing else holds the credentials. That is
-      # what lets this be a plain write with no coordination.
-      if ! swap_out=$("$ab" --no-color use "$acct" --force 2>&1); then
-        printf 'ccd: %s 계정으로 전환하지 못했습니다 — 이어서 하려면: claude --resume %s\n' "$acct" "$sid" >&2
-        printf '%s\n' "$swap_out" >&2
-        exit "$rc"
-      fi
-      # Coming back from OpenRouter this is essential, and from the subscription
-      # it is a no-op — either way the new session must not inherit a backbone
-      # override that would silently keep billing.
-      unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
-            ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
-            ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
-            ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
-            CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS \
-            CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_OUTPUT_TOKENS \
-            CCD_ACTIVE 2>/dev/null || true
-      if [ "$resumed" -eq 1 ]; then
-        printf '\n\033[32m▶ ✓ 쿼타 소진 — %s 계정으로 같은 대화를 이어갑니다 (구독, 무과금)\033[0m\n' "$acct"
-        args=(--resume "$sid"); resuming=1; last_sid="$sid"
-      else
-        printf '\n\033[32m▶ ✓ 쿼타 소진 — %s 계정에서 새 세션으로 시작합니다 (구독, 무과금)\033[0m\n' "$acct"
-        args=()
-      fi
-      backbone=subscription
-      ;;
     to_fallback)
       # Revoked since this was armed: stop rather than bill on a permission that
       # no longer exists. The conversation is still there.
@@ -387,10 +301,10 @@ while :; do
             CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_OUTPUT_TOKENS \
             CCD_ACTIVE 2>/dev/null || true
       if [ "$resumed" -eq 1 ]; then
-        printf '\n\033[32m▶ ✓ Claude 쿼타 회복 — 같은 대화를 구독으로 이어갑니다 (과금 종료)\033[0m\n'
+        printf '\n\033[32m▶ ✓ 구독으로 돌아왔습니다 — 같은 대화를 이어갑니다 (OpenRouter 과금 종료)\033[0m\n'
         args=(--resume "$sid"); resuming=1; last_sid="$sid"
       else
-        printf '\n\033[32m▶ ✓ Claude 쿼타 회복 — 구독으로 돌아왔습니다 (OpenRouter 과금 종료)\033[0m\n'
+        printf '\n\033[32m▶ ✓ 구독으로 돌아왔습니다 — 새 세션으로 시작합니다 (OpenRouter 과금 종료)\033[0m\n'
         args=()
       fi
       backbone=subscription

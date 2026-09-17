@@ -144,9 +144,12 @@ prices move and new models ship), do this:
   conversation they were in.
 - **If a second Claude account is registered, OpenRouter is no longer the first
   stop.** Quota exhaustion moves the conversation to the spare subscription —
-  free, still real Claude — and only reaches OpenRouter when every registered
-  account is spent. `ccd account list` shows which account is active and whether
-  a spare has room; the statusline shows the same as `● claude:<name> │ spare …`.
+  free, still real Claude, inside the running session with no restart and nothing
+  to type — and only reaches OpenRouter when every registered account is spent.
+  `ccd account list` shows which account is active and whether a spare has room;
+  the statusline shows the same as `● claude:<name> │ spare …`. After a swap the
+  model list, Fable access and `/status` keep naming the previous account until
+  the next launch; the credential and the billing have already moved.
 - A spare account that reports `needs re-login` is the one failure worth raising
   unprompted. It looks healthy in every other view and only surfaces at the
   moment of the handoff, which is the moment the user cannot fix it. Signing in

@@ -31,18 +31,27 @@ never echo a full key back, never write it anywhere but through `ccd key`.
 Never edit files directly; the script owns all writes. If the script fails,
 show the error and stop.
 
+## A bare setup installs no launcher, and needs none
+
+The hop between registered Claude subscriptions happens inside the running
+session, so a plain `ccd setup` shadows nothing and edits no startup file. There
+is no PATH line to relay and no restart to ask for. If the user has a second
+subscription, `ccd account add` is the rest of that setup — not a flag here.
+
+`--auto` is a separate question and the only one that installs a launcher: it
+grants consent for the paid OpenRouter hop when every subscription is spent. Never
+reach for it unprompted, and never as a remedy for something else.
+
 ## A non-zero exit is not always a dead end
 
-`ccd setup` exits non-zero when it finished everything else but could not put the
-launcher on PATH, so automatic handoff is installed and inert. Its last line says
-so. That is worth relaying prominently — a quota handoff cannot fire until it is
-fixed — but it is not a reason to abandon the rest of this skill: the statusline,
-hooks and `ccd` command are all already wired by that point. Relay that last line
-verbatim, including the remedy it names, and carry on with the key and `ccd doctor`
-steps above. Stop only when setup failed before doing any of that.
+`ccd setup --auto` exits non-zero when it finished everything else but could not
+put that launcher on PATH, so the paid hop is installed and inert. Its last line
+says so. Relay it verbatim, including the remedy it names — but it is not a reason
+to abandon the rest of this skill: the statusline, hooks and `ccd` command are all
+already wired by that point, and the subscription hop is unaffected. Carry on with
+the key and `ccd doctor` steps above; stop only when setup failed before doing any
+of that.
 
-Do not substitute your own remedy, and never reach for `--auto`. `ccd setup --yes`
-is what repairs a declined PATH prompt; `--auto` additionally grants consent for the
-paid OpenRouter hop, so offering it here would opt the user into billing to fix a
-shell startup file. An unwritable startup file, or a shell ccd will not edit, needs
-the user to place the line by hand — setup says which case it hit.
+Do not substitute your own remedy. `ccd setup --auto --yes` is what repairs a
+declined PATH prompt. An unwritable startup file, or a shell ccd will not edit,
+needs the user to place the line by hand — setup says which case it hit.

@@ -783,12 +783,6 @@ print("\n".join(x for x in (acct, warn) if x), end="")
 # registered account a spare (#41), and the cache's age is one stat. Deciding it in
 # the shell instead would cost a second python on every render and a second copy of
 # that rule. A future stamp is not freshness, the same call dash_age makes.
-#
-# The launcher's visited set comes off too, the way best_target() takes it off: a
-# spare it will not probe is one the job would measure nothing about, and it returns
-# without writing the cache — so the reading would stay stale and the next render
-# would ask again. The row above still names that spare; this is only about work.
-visited = set(os.environ.get("CCD_BURST_VISITED", "").replace(",", " ").split())
 try:
     TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
 except ValueError:
@@ -797,8 +791,7 @@ try:
     age = time.time() - os.path.getmtime(qfile)
 except OSError:
     age = float("inf")
-measurable = [n for n in spares if n not in visited]
-raise SystemExit(3 if measurable and not 0 <= age < TTL else 0)
+raise SystemExit(3 if spares and not 0 <= age < TTL else 0)
 PY
 )
 refresh=$?
@@ -808,7 +801,7 @@ refresh=$?
 # still running by killing its process group, and a kill mid token-exchange loses a
 # refresh token the server has already rotated. Nothing here is waited on.
 if [ "$refresh" -eq 3 ]; then
-  "$SELF_DIR/ccd-account" --no-color keepalive --pick --detach --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
+  "$SELF_DIR/ccd-account" --no-color keepalive --pick --detach >/dev/null 2>&1 &
 fi
 
 if [ -n "$base" ] && [ -n "$row" ]; then

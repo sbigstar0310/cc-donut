@@ -117,9 +117,10 @@ python3 -c "import json;json.load(open('$FAKE/.claude/ccd/quota-cache.json'))" 2
 [ -z "$(ls "$FAKE/.claude/ccd"/quota-cache.json.tmp* 2>/dev/null)" ] && ok "no leftover tmp files" || bad "no leftover tmp files"
 
 head_ "6. ccd setup / statusline / uninstall"
-# --yes and an explicit SHELL on BOTH calls: a bare setup installs the launcher now,
-# so without them the first would block on a consent prompt and the second would be
-# completing that install rather than repeating it.
+# --yes and an explicit SHELL on both calls: harmless for a bare setup, which asks
+# nothing now that the launcher belongs to `--auto`, and they keep this pair honest
+# if a prompt ever comes back — a blocked first call would make the second one the
+# install rather than a repeat of it.
 SHELL=/bin/zsh "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
 [ -x "$FAKE/.local/bin/ccd" ] && ok "launcher installed" || bad "launcher installed"
 grep -qF 'bash ~/.claude/ccd/statusline-launcher.sh' "$FAKE/.claude/settings.json" 2>/dev/null && ok "statusLine wired to the ccd path" || bad "statusLine wired"
@@ -1754,6 +1755,13 @@ case "$out" in
   *"off"*"ccd setup"*) ok "doctor: off says how to turn it on" ;;
   *) bad "doctor handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 80)" ;;
 esac
+# ...but "off" may only ever describe the paid hop. The hop between subscriptions
+# happens inside the session, so with nothing installed it is still on — reporting
+# it off the launcher's state is how a working escape route reads as a broken one.
+case "$out" in
+  *"no launcher"*) ok "doctor: the subscription hop is reported working with nothing installed" ;;
+  *) bad "doctor handoff" "no launcher, so it claimed there was no hop: $(printf '%s' "$out" | tr '\n' ' ' | head -c 110)" ;;
+esac
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 out=$(CLAUDECODE=1 "$ROOT/bin/ccd" doctor 2>&1 | sed -n '/Automatic handoff/,/^$/p')
 case "$out" in
@@ -1882,16 +1890,22 @@ grep -q 'ccd-auto-handoff-path' "$RC" \
   && bad "already wired" "claimed a line the user wrote by adding our marker" \
   || ok "...and their line is still theirs, unmarked"
 
-# A bare `ccd setup` installs the launcher too, so it fails the same way --auto
-# does when the wiring cannot be completed — and succeeds the same way when it can.
-rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path"; printf '# my own file\n' > "$RC"
-HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1; st=$?
-[ "$st" -eq 0 ] && ok "a bare setup that wires PATH exits 0" || bad "bare setup" "exited $st"
+# A bare `ccd setup` has no launcher to leave unreachable — the hop it sets up runs
+# inside the session — so the inert install this section is about cannot happen to
+# it. What must hold instead is that it succeeds with no terminal to ask at, and
+# still wires everything it does own.
 rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path"; printf '# my own file\n' > "$RC"
 python3 "$FAKE/ttyask.py" bare none "$FAKE/.ask-out" \
   env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup >/dev/null 2>&1; st=$?
-[ "$st" -ne 0 ] && ok "...and one that cannot exits non-zero (got $st)" \
-  || bad "bare setup" "exited 0 while leaving the launcher unreachable"
+{ [ "$st" -eq 0 ] && [ ! -e "$SHIM" ] \
+  && [ "$(grep -c 'ccd-auto-handoff-path' "$RC")" = "0" ]; } \
+  && ok "a bare setup with nowhere to prompt is still a complete install" \
+  || bad "bare setup" "exited $st with shim=$([ -e "$SHIM" ] && echo yes || echo no)"
+[ "$(python3 -c "
+import json;d=json.load(open('$FAKE/.claude/settings.json'))
+print('statusline-launcher.sh' in ((d.get('statusLine') or {}).get('command') or ''))")" = "True" ] \
+  && ok "...with the statusline it does own still wired" \
+  || bad "bare setup" "left the statusline unwired"
 
 # Turning the feature off on purpose is not a failure.
 rm -f "$RC"; printf '# my own file\n' > "$RC"
@@ -1919,8 +1933,8 @@ HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
   || bad "paid opt-in" "consent survived --no-auto"
 
 # Consent must not be re-granted by a run that never asked for it. A bare setup
-# installs the launcher and nothing more, so it must leave this alone in both
-# directions.
+# installs neither the launcher nor the opt-in, so it must leave this alone in
+# both directions.
 HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
   && ok "a bare setup does not grant it" \
@@ -1972,24 +1986,47 @@ case "$out" in
   *) bad "status promise" "never names the paid hop: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 
-head_ "18e. the launcher needs no flag"
-# The free hop between registered subscriptions is the product, not an extra. A bare
-# `ccd setup` installs the launcher that carries it; --auto adds permission for the
-# paid OpenRouter hop on top of that, and --no-auto removes the launcher entirely.
+head_ "18e. the launcher is the paid hop's, and nothing else's"
+# The hop between registered subscriptions happens inside the session now (§29):
+# the credential ccd writes is the one the next request reads, so nothing is
+# relaunched and nothing shadows `claude`. What is left for the launcher is the
+# paid OpenRouter hop and the return from it — so it arrives with `--auto`, the
+# paid opt-in, and a bare `ccd setup` neither installs it nor edits PATH for it.
 export SHELL=/bin/zsh
 RC="$FAKE/.zshrc"
 HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
 rm -f "$RC" "$SHIM" "$FAKE/.claude/ccd/auto-path" "$FAKE/.claude/ccd/paid-handoff"
 printf '# my own file\n' > "$RC"
 
-HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
-[ -x "$SHIM" ] && ok "a bare setup installs the launcher" \
-  || bad "default launcher" "no shim after a bare setup"
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" setup --yes 2>&1); rc=$?
+[ ! -e "$SHIM" ] && ok "a bare setup installs no launcher" \
+  || bad "default install" "a bare setup shadowed claude for a hop that needs no launcher"
+grep -q 'ccd-auto-handoff-path' "$RC" \
+  && bad "default install" "edited PATH for a launcher it did not install" \
+  || ok "...and leaves PATH alone"
+{ [ "$rc" -eq 0 ] && [ -x "$FAKE/.local/bin/ccd" ] \
+  && grep -qF 'bash ~/.claude/ccd/statusline-launcher.sh' "$FAKE/.claude/settings.json"; } \
+  && ok "...while still being a complete install that reports success" \
+  || bad "default install" "rc=$rc — an install with nothing missing must not fail"
+case "$out" in
+  *"no restart"*) ok "...saying the subscription hop needs none of it" ;;
+  *) bad "default install" "said nothing about the hop that does work: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+# The status screen promises the same thing the install does, and with no launcher
+# anywhere it must still promise it — otherwise the one working escape route reads
+# as something the user forgot to switch on.
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" 2>&1)
+case "$out" in
+  *"no restart"*) ok "...and \`ccd\` says it too, with no launcher installed" ;;
+  *) bad "status" "sent the user to /exit for a hop that needs neither: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+
+# The paid road and the permission to take it arrive together.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+[ -x "$SHIM" ] && ok "--auto installs the launcher that carries the paid hop" \
+  || bad "paid install" "no shim after --auto"
 grep -qxF 'export PATH="$HOME/.claude/ccd/bin:$PATH"' "$RC" \
-  && ok "...and wires it onto PATH" || bad "default launcher" "no PATH line"
-[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
-  && ok "...without authorising the paid hop" \
-  || bad "default launcher" "a bare setup granted the paid opt-in"
+  && ok "...and wires it onto PATH" || bad "paid install" "no PATH line"
 
 # --no-auto takes back both halves, so the directory it pointed at is not left on
 # PATH after the shim that lived there is gone.
@@ -1999,19 +2036,15 @@ grep -q 'ccd-auto-handoff-path' "$RC" \
   && bad "opt-out" "left PATH pointing at a directory it just emptied" \
   || ok "...and takes its PATH line with it"
 
-# Running setup again reinstalls it — every call here is a deliberate act, and the
-# consent that matters is asked on the way through, not remembered from last time.
+# Consent is asked on the way through, never remembered from last time.
 python3 "$FAKE/ttyask.py" ctty n "$FAKE/.ask-out" \
-  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup >/dev/null 2>&1
+  env HOME="$FAKE" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --auto >/dev/null 2>&1
 grep -q 'ccd-auto-handoff-path' "$RC" \
   && bad "consent" "shadowed claude after the user declined" \
-  || ok "a later setup asks again, and n still means no"
-HOME="$FAKE" "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1
-[ -x "$SHIM" ] && ok "...and yes puts it back" || bad "consent" "y did not reinstall"
-[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
-  && ok "...still without authorising the paid hop" \
-  || bad "consent" "a bare setup granted the paid opt-in"
+  || ok "a later --auto asks again, and n still means no"
 HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+grep -qxF 'export PATH="$HOME/.claude/ccd/bin:$PATH"' "$RC" \
+  && ok "...and yes wires it" || bad "consent" "y did not wire the PATH line"
 
 head_ "19. automatic handoff: readiness gates"
 # Each of these ends a session, so each must fail closed. A key ccd would later
@@ -2880,6 +2913,13 @@ case "$out" in
   *"switched to two"*) ok "...and says which account it chose" ;;
   *) bad "bare use" "did not name the destination: $out" ;;
 esac
+# The credential, the billing and both rate-limit windows move. The model list, the
+# Fable entitlement and the `/status` identity were read once at startup and do not
+# (#12) — the one thing about a swap the user should never have to discover alone.
+case "$out" in
+  *"/status"*"next launch"*) ok "...and what a swap does not move, before it is discovered" ;;
+  *) bad "use output" "silent about the half that lags: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
 
 # Naming one still means that one, even when it is not what pick would choose.
 "$ACCT" --no-color use one --force >/dev/null 2>&1
@@ -2936,12 +2976,6 @@ seed_quota "{$(q one 99 99),\"two\":{\"status\":\"dead\",\"checked_at\":$NOW}}"
   && bad "dead handling" "offered an account that needs re-login" \
   || ok "an account needing re-login is not offered"
 
-# The exclusion list is how the launcher's visited set reaches the picker.
-seed_quota "{$(q one 99 99),$(q two 10 20)}"
-"$ACCT" --no-color pick --exclude two >/dev/null 2>&1 \
-  && bad "exclude" "returned an excluded account" \
-  || ok "--exclude removes an account already visited this burst"
-
 # Priority decides, not raw usage: the primary account is preferred while it has
 # room, even when a lower-priority one is emptier.
 write_creds three
@@ -2970,18 +3004,18 @@ seed_quota "{$(q one 99 99),\"two\":{\"status\":\"ok\",\"checked_at\":1,\"five_h
   && bad "name validation" "accepted a traversing account name" \
   || ok "a path-traversing account name is refused"
 
-head_ "24. multi-account: handoff to another subscription"
+head_ "24. multi-account: the account hop left the launcher"
+# Moving to another subscription no longer ends anything (§29), so `to_account` is
+# state nothing writes any more and the ladder of accounts it was walked with is
+# gone with it. What must not survive the deletion is the reading of it: a stale
+# armed file — from an older install, or a hand-written one — must not make the
+# launcher install somebody else's credential and relaunch on it.
 cp "$ACCT" "$HB/ccd-account"; chmod +x "$HB/ccd-account"
 mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-m.jsonl"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
-# The cheap hop: quota dies, another subscription has room, the conversation
-# continues on the subscription backbone with nothing billed.
 seed_quota "{$(q one 99 99),$(q two 10 20)}"
 "$ACCT" --no-color use one --force >/dev/null 2>&1
-fake_real '#!/bin/sh
-echo "SUB:$*"
-exit 0'
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"two","session_id":"sess-m","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 cat > "$FAKE/realbin/claude" <<'EOF'
 #!/bin/sh
@@ -2991,63 +3025,23 @@ exit 129
 EOF
 chmod +x "$FAKE/realbin/claude"
 rm -f "$FAKE/.hopped"
-out=$(PATH="$SHIMPATH" CCD_CREDENTIALS_BACKEND=file shim_run "$SHIM" 2>/dev/null)
+out=$(PATH="$SHIMPATH" CCD_CREDENTIALS_BACKEND=file shim_run "$SHIM" 2>&1)
 case "$out" in
-  *"SUB2:--resume sess-m"*) ok "a quota handoff to another account resumes the same conversation" ;;
-  *) bad "to_account relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 110)" ;;
+  *SUB2*) bad "to_account" "the launcher still walks a ladder of accounts" ;;
+  *"--resume sess-m"*) ok "an account handoff is a direction the launcher no longer knows" ;;
+  *) bad "to_account" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 110)" ;;
 esac
-grep -q 'AT-two' "$CREDS" \
-  && ok "...on the other account's credentials" || bad "to_account swap" "credentials unchanged"
-case "$out" in
-  *"무과금"*) ok "...and says plainly that nothing is being billed" ;;
-  *) bad "to_account message" "no free-of-charge signal" ;;
-esac
+grep -q 'AT-one' "$CREDS" \
+  && ok "...and it installs no credential on the way out" \
+  || bad "to_account" "swapped an account for a direction it refuses to act on"
 rm -f "$HSTATE" "$FAKE/.hopped"
 
-# THE ladder test. Five accounts, every one spent: the run must traverse all of
-# them and still reach OpenRouter. A hardcoded hop cap of 3 would have stopped
-# this two accounts short of the escape it exists to provide.
-for n in a b c d e; do
-  write_creds "$n"
-  "$ACCT" --no-color add --name "acct$n" >/dev/null 2>&1
-done
-rm -f "$ADIR/one.json" "$ADIR/two.json" "$ADIR/three.json"
-"$ACCT" --no-color use accta --force >/dev/null 2>&1
-rm -f "$FAKE/.ladder"
-# Each leg arms the next rung; the last one has nowhere left but the fallback.
-cat > "$FAKE/realbin/claude" <<'EOF'
-#!/bin/sh
-n=$(cat "$HOME/.rung" 2>/dev/null || echo 0)
-n=$((n + 1)); printf '%s' "$n" > "$HOME/.rung"
-printf 'L%s\n' "$n" >> "$HOME/.ladder"
-case "$n" in
-  1) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctb","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
-  2) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctc","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
-  3) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctd","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
-  4) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"accte","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
-  *) d='{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-m","cwd":"/tmp","armed_at":1}' ;;
-esac
-printf '%s' "$d" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
-exit 129
-EOF
-chmod +x "$FAKE/realbin/claude"
-cat > "$HB/ccd" <<'EOF'
-#!/bin/sh
-printf 'FALLBACK\n' >> "$HOME/.ladder"
-exit 0
-EOF
-chmod +x "$HB/ccd"
-rm -f "$FAKE/.rung"
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"acctb","session_id":"sess-m","cwd":"/tmp","armed_at":1}' > "$HSTATE"
-PATH="$SHIMPATH" CCD_CREDENTIALS_BACKEND=file shim_run "$SHIM" >/dev/null 2>&1
-rungs=$(grep -c '^L' "$FAKE/.ladder" 2>/dev/null || echo 0)
-[ "$rungs" -eq 5 ] \
-  && ok "five spent accounts are all traversed (ran $rungs legs)" \
-  || bad "ladder length" "expected 5 account legs, ran $rungs"
-grep -q FALLBACK "$FAKE/.ladder" \
-  && ok "...and the run still reaches OpenRouter at the end" \
-  || bad "ladder end" "never reached the final fallback"
-rm -f "$HSTATE" "$FAKE/.rung" "$FAKE/.ladder"
+# The launcher's per-burst visited set was only ever exported so the hook could
+# hand it to the picker as an exclusion list. With no ladder there is nothing to
+# exclude, and a variable no writer sets is a variable every reader must lose.
+grep -rlF CCD_BURST_VISITED "$ROOT/bin" "$ROOT/scripts" >/dev/null 2>&1 \
+  && bad "burst export" "a reader survived the writer" \
+  || ok "...and nothing is left reading the ladder's exclusion list"
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
 
 head_ "25. multi-account: a spare must not die in silence"
@@ -4592,22 +4586,17 @@ sp_landed && solo_render=yes || solo_render="no ($(sp_reading))"
   || bad "single spare" "tick: $solo_hook · render: $solo_render"
 sleep 1
 
-# ── ...unless the burst has already been there ──────────────────────────────
-# best_target() drops the launcher's visited set as well as the active account, and
-# returns before writing anything when that leaves no candidate. A render that asks for
-# a job anyway gets one that measures nothing, leaves the reading stale, and is asked
-# for again by the very next render.
+# ── ...and an exclusion list nothing writes any more excludes nothing ───────
+# The row used to drop the launcher's per-burst visited set before deciding whether
+# a refresh was worth starting. That set left with the account ladder, so a stale
+# `CCD_BURST_VISITED` in some long-lived shell must not be able to silence the one
+# spare there is — a reading that stops moving is exactly how a spare dies unseen.
 solo_fixture
-# Comma-separated, the form the launcher exports (export_visited, bin/ccd-handoff).
 CCD_BURST_VISITED=earlier-hop,backup sp_render >/dev/null
-sleep 2
-visited_started=$(cat "$SPLOG" 2>/dev/null)
-solo_fixture
-sp_render >/dev/null
-sp_landed && unvisited=yes || unvisited="no ($(sp_reading))"
-[ -z "$visited_started" ] && [ "$unvisited" = yes ] \
-  && ok "...and not while the burst has already visited the only spare there is" \
-  || bad "visited spare" "visited: ${visited_started:-nothing started} · not visited: $unvisited"
+sp_landed && stale_env=yes || stale_env="no ($(sp_reading))"
+[ "$stale_env" = yes ] \
+  && ok "...and a leftover burst variable no longer stops the only spare being measured" \
+  || bad "stale exclusion" "an unwritten variable still excluded the spare: $stale_env"
 rm -f "$FAKE/.claude.json"
 sleep 1
 
@@ -5386,8 +5375,41 @@ for s in (msg, summary):
     assert "blocking error" not in s.lower(), f"default phrasing left in: {s!r}"
 PY
 
+# ── Coming back off OpenRouter is the one hop that still ends a session ─────
+# While the session runs on OpenRouter its backbone is an environment variable, so
+# writing a credential reaches nothing — leaving really does take a relaunch, and
+# that is what the launcher is still for. What changed is that it is no longer told
+# WHICH account to install: the hook swaps to the spare in place first and arms the
+# plain return, so the relaunch simply lands on whatever is live.
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+printf '{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5}\n' > "$SWD/run-state.json"
+hf_reset
+out=$(printf '{"session_id":"sess-sw10","cwd":"/tmp/w"}' \
+  | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
+    CCD_HANDOFF=00000000000000000000000000000002 \
+    CCD_HANDOFF_STATE="$SWD/handoff-00000000000000000000000000000002.json" \
+    CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID sw_hook UserPromptSubmit 2>/dev/null)
+grep -q 'AT-spare' "$CREDS" \
+  && ok "a spare with room takes the session off the paid backbone, credential first" \
+  || bad "return hop" "armed a relaunch onto an account it never installed"
+[ "$(hf_get direction)" = "to_subscription" ] \
+  && ok "...arming the plain return, not an account the launcher would have to install" \
+  || bad "return direction" "got: $(hf_get direction)"
+[ -z "$(hf_get account)" ] \
+  && ok "...naming no account, because the live store already is one" \
+  || bad "return state" "still carries an account field: $(hf_get account)"
+case "$out" in
+  *spare*) ok "...and says where the session is going, in the user's own screen" ;;
+  *) bad "return message" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 140)" ;;
+esac
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+rm -f "$SWD/run-state.json"
+
 rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$SWD/accounts-keepalive" \
        "$FAKE/.sw-out" "$FAKE/.sw-err"
+hf_reset
 unset CCD_USAGE_URL CCD_TOKEN_URL
 unset -f sw_hook sw_fixture sw_prompt sw_stopfail
 
