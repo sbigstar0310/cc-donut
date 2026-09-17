@@ -4242,6 +4242,200 @@ case "$row" in
 esac
 rm -rf "$ADIR" "$SHIMD"; mkdir -p "$ADIR"
 
+head_ "27e. the spare's reading keeps pace with the row"
+# #54. The row is only as current as accounts-quota.json, and only a typed prompt
+# refreshed it: an autonomous turn fires tool uses and assistant messages, never a
+# prompt, so a healthy spare aged into `spare ?` exactly while quota burned fastest.
+# The reading has to move on the row's own cadence (prompt, tool use, render, and a
+# timer for an idle session), a fresh one must cost no process, and two refreshes must
+# never run at once, because a pick can spend a one-time refresh token.
+#
+# Every trigger runs from a copy of the plugin whose ccd-account logs, then execs the
+# real one. The log tells "nothing needed refreshing" apart from "nothing was started";
+# a local usage endpoint says whether a refresh landed, and how many overlapped.
+SPD="$FAKE/.claude/ccd"; SPQ="$SPD/accounts-quota.json"
+SPROOT="$FAKE/spareroot"; SPLOG="$FAKE/.spare-calls"; SPHITS="$FAKE/.spare-hits"
+rm -rf "$SPROOT"; mkdir -p "$SPROOT"
+cp -R "$ROOT/bin" "$ROOT/scripts" "$SPROOT/"
+cat > "$SPROOT/bin/ccd-account" <<EOF
+#!/bin/sh
+echo "\$*" >> "$SPLOG"
+exec "$ROOT/bin/ccd-account" "\$@"
+EOF
+chmod +x "$SPROOT/bin/ccd-account"
+
+# Each request records how many were in flight when it arrived, and holds long enough
+# for a pick started by any other trigger to overlap it.
+cat > "$FAKE/usage54.py" <<'USRV'
+import http.server, json, os, socketserver, sys, threading, time
+port_file, hits = sys.argv[1], sys.argv[2]
+lock, live = threading.Lock(), [0]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with lock:
+            live[0] += 1
+            with open(hits, "a") as f: f.write(f"{live[0]}\n")
+        time.sleep(3)
+        with lock: live[0] -= 1
+        body = json.dumps({
+            "five_hour": {"utilization": 12, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 30, "resets_at": "2099-01-01T00:00:00Z"},
+        }).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+class S(http.server.ThreadingHTTPServer):
+    def server_bind(self):                      # skip getfqdn(), see the token server
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+srv = S(("127.0.0.1", 0), H)
+with open(port_file + ".tmp", "w") as f: f.write(str(srv.server_address[1]))
+os.replace(port_file + ".tmp", port_file)
+srv.serve_forever()
+USRV
+rm -f "$FAKE/.uport54"
+python3 "$FAKE/usage54.py" "$FAKE/.uport54" "$SPHITS" </dev/null >/dev/null 2>&1 &
+sp_srv=$!
+n=0; while [ ! -s "$FAKE/.uport54" ] && [ $n -lt 75 ]; do sleep 0.2; n=$((n+1)); done
+[ -s "$FAKE/.uport54" ] || bad "spare refresh" "local usage endpoint never came up"
+
+# Live access tokens, so a refresh probes without spending a refresh token, and a dead
+# token URL besides: nothing in this section may reach Anthropic.
+sp_env() {
+  env CCD_USAGE_URL="http://127.0.0.1:$(cat "$FAKE/.uport54" 2>/dev/null)/usage" \
+      CCD_TOKEN_URL="http://127.0.0.1:1/token" CCD_HTTP_TIMEOUT=10 "$@"
+}
+sp_hook() { sp_env CLAUDE_PLUGIN_ROOT="$SPROOT" "$SPROOT/scripts/quota-guard.sh" "$1" </dev/null >/dev/null 2>&1; }
+# Claude Code hands the statusline no plugin root, so neither does this.
+sp_render() {
+  printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+    | sp_env env -u CLAUDE_PLUGIN_ROOT "$SPROOT/bin/ccd-statusline" 2>/dev/null
+}
+spare_fixture() { # $1 = age of every reading on file, in seconds
+  rm -rf "$ADIR" "$SPQ" "$SPLOG" "$SPHITS" "$FAKE/.claude.json"; mkdir -p "$ADIR"
+  python3 - "$ADIR" "$SPQ" "$1" <<'PY'
+import datetime, hashlib, json, os, sys, time
+adir, qfile, age = sys.argv[1], sys.argv[2], int(sys.argv[3])
+now = time.time()
+iso = lambda s: datetime.datetime.fromtimestamp(now + s, datetime.timezone.utc).isoformat()
+rows = {}
+for name in ("main", "backup"):
+    at = "AT-" + name
+    json.dump({"name": name, "label": name, "account_uuid": "uuid-" + name, "priority": 1,
+               "claudeAiOauth": {"accessToken": at, "refreshToken": "RT-" + name,
+                                 "expiresAt": int((now + 8 * 3600) * 1000)}},
+              open(os.path.join(adir, name + ".json"), "w"))
+    rows[name] = {"status": "ok", "checked_at": int(now - age), "uuid": "uuid-" + name,
+                  "cred": hashlib.sha256(at.encode()).hexdigest()[:16],
+                  "five_hour_percent": 50, "seven_day_percent": 50,
+                  "five_hour_reset": iso(3600), "seven_day_reset": iso(3 * 86400)}
+json.dump(rows, open(qfile, "w"))
+os.utime(qfile, (now - age, now - age))
+PY
+  printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+  # Parked: neither keepalive nor the hook's reading of the signed-in account is what
+  # this section measures, and both would otherwise go looking for a network.
+  printf '{"fails": 0}' > "$SPD/accounts-keepalive"
+  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
+    > "$SPD/quota-cache.json"
+}
+sp_reading() {
+  python3 - "$SPQ" <<'PY'
+import json, sys, time
+try: r = json.load(open(sys.argv[1]))["backup"]
+except Exception: print("unreadable"); raise SystemExit
+t = r.get("checked_at")
+fresh = isinstance(t, (int, float)) and time.time() - t < 60
+print(f"{r.get('status')}:{'fresh' if fresh else 'stale'}:{r.get('five_hour_percent')}")
+PY
+}
+sp_landed() { # the endpoint's reading, on file
+  n=0; while [ "$(sp_reading)" != "ok:fresh:12" ] && [ $n -lt 40 ]; do sleep 0.25; n=$((n+1)); done
+  [ "$(sp_reading)" = "ok:fresh:12" ]
+}
+
+# ── A tool use refreshes, not only a typed prompt ───────────────────────────
+spare_fixture 600
+sp_hook PostToolUse
+sp_landed \
+  && ok "a tool-use tick brings a stale spare reading current" \
+  || bad "tool-use refresh" "only a typed prompt refreshes the spare: $(sp_reading)"
+sleep 1
+
+# ── A fresh reading costs no process ────────────────────────────────────────
+# Judged before anything is spawned. A pick that starts only to find the cache warm is
+# exactly the process ruled out: the hook fires on every tool use.
+spare_fixture 10
+sp_hook UserPromptSubmit; sp_hook PostToolUse
+sleep 2
+started=$(grep -vw keepalive "$SPLOG" 2>/dev/null)
+[ -z "$started" ] \
+  && ok "a fresh reading starts no refresh, on a prompt or a tool use" \
+  || bad "fresh reading" "started for a reading seconds old: $(printf '%s' "$started" | tr '\n' '/')"
+
+# ── An idle session still ticks ─────────────────────────────────────────────
+# Event triggers go quiet while the session idles, so the row needs a timer of its own.
+# Seeded with today's wiring, which is what a re-run of setup meets.
+SPH="$FAKE/home54"; rm -rf "$SPH"; mkdir -p "$SPH/.claude"
+printf '{"statusLine":{"type":"command","command":"bash ~/.claude/ccd/statusline-launcher.sh"}}\n' \
+  > "$SPH/.claude/settings.json"
+HOME="$SPH" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+sl=$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get('statusLine'),sort_keys=True))" \
+       "$SPH/.claude/settings.json" 2>/dev/null)
+[ "$sl" = '{"command": "bash ~/.claude/ccd/statusline-launcher.sh", "refreshInterval": 60, "type": "command"}' ] \
+  && ok "setup gives the statusline a 60s tick, beside the command it already wires" \
+  || bad "refreshInterval" "statusLine: $sl"
+rm -rf "$SPH"
+
+# ── A render refreshes too, and waits for none of it ────────────────────────
+# The statusline re-runs on each assistant message and on that timer, which makes it the
+# trigger an idle session still has. Claude Code cancels a run still in flight, so the
+# refresh must leave the render behind. Paired with the fresh case: on its own that
+# half passes against a statusline that never refreshes anything.
+spare_fixture 10
+sp_render >/dev/null; sleep 2
+fresh_started=$(cat "$SPLOG" 2>/dev/null)
+spare_fixture 600
+sl_start=$(date +%s)
+row=$(sp_render)
+sl_elapsed=$(( $(date +%s) - sl_start ))
+# Waited for whatever the verdict, or a refresh still in flight lands in the next case.
+sp_landed && landed=1 || landed=0
+if [ -n "$fresh_started" ]; then
+  bad "render refresh" "a render started ccd-account for a reading seconds old: $fresh_started"
+elif [ "$landed" -eq 0 ]; then
+  bad "render refresh" "a render left a stale spare reading stale: $(sp_reading)"
+elif [ "$sl_elapsed" -gt 2 ]; then
+  bad "render refresh" "the render waited ${sl_elapsed}s for the refresh"
+else
+  ok "a render refreshes a stale reading behind itself, and leaves a fresh one alone"
+fi
+sleep 1
+
+# ── However many triggers, one refresh at a time ────────────────────────────
+# Three sessions' prompts, tool uses and renders landing together, which the new
+# triggers make routine. Whatever the lock, the endpoint sees the overlap.
+spare_fixture 600
+sp_pids=""
+for _ in 1 2 3; do
+  sp_hook UserPromptSubmit & sp_pids="$sp_pids $!"
+  sp_hook PostToolUse & sp_pids="$sp_pids $!"
+  sp_render >/dev/null & sp_pids="$sp_pids $!"
+done
+wait $sp_pids
+# A refresh queued behind the first arrives within one more hold of the endpoint.
+sp_landed; sleep 4
+peak=$(sort -n "$SPHITS" 2>/dev/null | tail -n 1)
+[ "${peak:-0}" = "1" ] \
+  && ok "prompts, tool uses and renders at once never run two refreshes together" \
+  || bad "single-flight" "peak refreshes in flight at the endpoint: ${peak:-none ran}"
+
+kill "$sp_srv" 2>/dev/null; wait "$sp_srv" 2>/dev/null
+rm -rf "$SPROOT" "$ADIR" "$SPQ" "$SPLOG" "$SPHITS" "$FAKE/usage54.py" "$FAKE/.uport54" \
+       "$SPD/accounts-keepalive"
+mkdir -p "$ADIR"
+unset -f sp_env sp_hook sp_render spare_fixture sp_reading sp_landed
+
 head_ "28. no claude-dashboard installed"
 # ccd reads Claude quota to do three things: warn before exhaustion, notice a
 # reset, and corroborate a rate_limit before arming a handoff. claude-dashboard
