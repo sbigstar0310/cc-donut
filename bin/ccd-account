@@ -80,6 +80,7 @@ KEEPALIVE_INTERVAL = int(os.environ.get("CCD_KEEPALIVE_INTERVAL", "86400"))
 # to KEEPALIVE_INTERVAL. A flat daily cadence gave a spare ~8 one-shot tries in
 # its token's life; it backs off rather than retrying fast because the failure
 # may itself be the endpoint refusing us.
+KEEPALIVE_BUDGET = int(os.environ.get("CCD_KEEPALIVE_BUDGET", "120"))
 KEEPALIVE_RETRY_MIN = int(os.environ.get("CCD_KEEPALIVE_RETRY_MIN", "900"))
 # Warn once a spare's stored token has gone unrefreshed this long. Deliberately
 # well inside the ~8.5-day refresh token life so there is room to act.
@@ -205,8 +206,17 @@ class LockBusy(Exception):
 class Lock:
     """flock around every mutation of the store or the live blob.
 
+    Reentrant within one process. The rule is "whoever writes a stored credential
+    holds the store lock", and the writers nest — a swap holds it and banks the
+    outgoing account, a probe holds it and rotates a token. flock is per open file
+    description, so a second open here would queue behind the first and deadlock;
+    counting the depth is what lets the rule be stated once, at the bottom, rather
+    than remembered at every call site.
+
     fcntl is absent on some platforms; degrade to no locking rather than refusing
     to run, since the alternative is the feature simply not working there."""
+
+    _depth = {}
 
     def __init__(self, path, timeout=LOCK_TIMEOUT, wait=True):
         self.path = path
@@ -215,11 +225,16 @@ class Lock:
         # finds another one running has nothing to do and nobody to tell.
         self.wait = wait
         self.fd = None
+        self.nested = False
 
     def __enter__(self):
         try:
             import fcntl
         except ImportError:
+            return self
+        if Lock._depth.get(self.path):
+            Lock._depth[self.path] += 1
+            self.nested = True
             return self
         ensure_dirs()
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -227,6 +242,7 @@ class Lock:
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                Lock._depth[self.path] = 1
                 return self
             except OSError as e:
                 if e.errno not in (errno.EAGAIN, errno.EACCES):
@@ -240,7 +256,12 @@ class Lock:
                 time.sleep(0.1)
 
     def __exit__(self, *exc):
+        if self.nested:
+            Lock._depth[self.path] -= 1
+            self.nested = False
+            return False
         if self.fd is not None:
+            Lock._depth.pop(self.path, None)
             try:
                 import fcntl
 
@@ -388,8 +409,12 @@ def account_load(name):
 
 
 def account_save(name, obj):
+    """The one place a stored account is written, and therefore the one place the
+    store lock has to be taken. Reading inside a lock only protects against
+    writers that take it."""
     obj.setdefault("storage", "file")
-    write_json(account_path(name), obj, 0o600)
+    with Lock(LOCK_FILE):
+        write_json(account_path(name), obj, 0o600)
 
 
 def account_names():
@@ -686,9 +711,28 @@ def bank_live_oauth():
 # ── OAuth ────────────────────────────────────────────────────────────────────
 
 
+# The instant this process's network work must be over, or None. urllib bounds
+# each socket operation rather than the request, so this is what keeps a decision
+# inside the budget the hook that started it actually has: every call is given
+# what is left, and a call with nothing left is not made at all.
+NET_DEADLINE = None
+
+
+def net_left():
+    """Seconds of network budget remaining, or None when unbounded."""
+    if NET_DEADLINE is None:
+        return None
+    return NET_DEADLINE - time.time()
+
+
 def _http_json(url, data=None, headers=None, timeout=HTTP_TIMEOUT):
     """Return (status, parsed_json_or_None). Never raises for HTTP errors —
     the caller needs the status to distinguish 401 (dead) from 503 (retry)."""
+    left = net_left()
+    if left is not None:
+        if left <= 0:
+            return 0, None      # the budget is gone; a request now cannot finish
+        timeout = min(timeout, left)
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", USER_AGENT)
@@ -836,7 +880,19 @@ def account_refresh(name, acct):
     Ordering matters: the rotated refresh token is written to disk BEFORE the new
     access token is used for anything. Crashing between the two costs one wasted
     access token; the reverse order costs the whole account."""
-    oauth = acct.get("claudeAiOauth") or {}
+    with Lock(LOCK_FILE):
+        return _refresh_locked(name, acct)
+
+
+def _refresh_locked(name, acct):
+    # Re-read under the lock. The caller's copy may be minutes old — a pick reads
+    # every account before it measures any — and rotating from it would write a
+    # stale base over whatever landed in between, losing that writer's change and
+    # sometimes the rotation before it.
+    fresh = account_load(name)
+    if fresh is None:
+        fresh = acct
+    oauth = fresh.get("claudeAiOauth") or {}
     rt = oauth.get("refreshToken")
     if not rt:
         return False, "dead"
@@ -851,14 +907,19 @@ def account_refresh(name, acct):
     # a fresh ~8.5-day window, so advance it ourselves. Without this the account
     # would look dead to refresh_token_dead() forever after the original expiry.
     merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
-    acct["claudeAiOauth"] = merged
-    acct["refreshed_at"] = now()
+    fresh["claudeAiOauth"] = merged
+    fresh["refreshed_at"] = now()
     # Two different facts, and conflating them is what let six consecutive failures
     # pass unreported. refreshed_at says the snapshot on disk is this fresh, which
     # bank_live_oauth() and swap_to() can write truthfully after a copy. This says
     # the token exchange itself worked, which only happens here.
-    acct["refresh_ok_at"] = now()
-    account_save(name, acct)
+    fresh["refresh_ok_at"] = now()
+    account_save(name, fresh)
+    # The caller measures the credential it is holding, so hand it what was
+    # actually stored rather than what it walked in with.
+    if fresh is not acct:
+        acct.clear()
+        acct.update(fresh)
     return True, "ok"
 
 
@@ -1086,8 +1147,9 @@ def swap_to(name, force=False):
     way. Measured: a swapped session kept working for 16.9 hours across two
     refreshes without a restart.
 
-    Returns (account, credential fingerprint): the identity of what was actually
-    installed, which is the only thing a later confirmation can check.
+    Returns (account, installed credential, replaced credential). The first names
+    what a confirmation should find live; the second names what it must NOT find,
+    which is what lets a legitimate rotation during the settle still confirm.
 
     The account is loaded INSIDE the lock. Loaded before it, the copy can already
     have been replaced by the time it is written — every refresh mints a new
@@ -1161,6 +1223,7 @@ def swap_to(name, force=False):
         # rotation could already have moved on.
         installed = _cred_fingerprint(
             target if cur != name else {"claudeAiOauth": blob.get("claudeAiOauth")})
+        replaced = _cred_fingerprint({"claudeAiOauth": blob.get("claudeAiOauth")})
 
     if not force:
         others = claude_processes()
@@ -1171,7 +1234,7 @@ def swap_to(name, force=False):
             noun = "session is" if others == 1 else "sessions are"
             warn(f"{others} other Claude Code {noun} running — this moves them to "
                  f"{name} too, from their next token refresh.")
-    return target, installed
+    return target, installed, replaced
 
 
 def claude_processes():
@@ -1406,7 +1469,7 @@ def cmd_use(args):
                 if why == "all_exhausted"
                 else "no other account is registered — add one with `ccd account add`")
         name = a["name"]
-    target, _ = swap_to(name, force=args.force)
+    target, _, _ = swap_to(name, force=args.force)
     if args.json:
         print(
             json.dumps(
@@ -1444,9 +1507,11 @@ def cmd_swap(args):
     about which account it measured — if the store has moved on since, this is a
     decision about a situation that no longer exists.
 
-    Prints `<account>\t<credential fingerprint>`. Exit codes are the caller's
-    fork in the road: 0 swapped, 1 nowhere free to go (the only answer that may
-    justify paying), 4 could not act."""
+    Prints `<account>TAB<installed credential>TAB<the credential it replaced>`.
+    Exit codes are the caller's fork in the road, and the fork costs money: 0
+    swapped, 1 nowhere free to go — the ONLY answer that may justify paying — and
+    4 could not act. An account store that does not exist is the one operational
+    answer that is also 1: nothing free can exist there."""
     if not account_names():
         return 1
     deadline = time.time() + max(0.0, args.deadline)
@@ -1456,29 +1521,38 @@ def cmd_swap(args):
                 return _swap_locked(args, deadline)
         except LockBusy:
             # The background pass holds it. Wait inside the same budget the pick
-            # would have spent rather than give up: giving up here is what sends a
-            # session that had a free spare onto a paid backbone.
+            # would have spent rather than give up — but the budget is the
+            # caller's: a prompt tick passes a short one, because a frozen prompt
+            # is worse than a swap one tick later.
             if time.time() >= deadline:
                 return 4
             time.sleep(0.25)
+        except Exception:
+            # Anything unexpected is "could not act". Letting it escape as exit 1
+            # would tell the hook that every subscription is spent, which is the
+            # one sentence here that authorises spending money.
+            return 4
 
 
 def _swap_locked(args, deadline):
     cur = active_name()
-    if not cur:
-        return 4                    # signed into an account ccd does not know
-    if args.from_account and args.from_account != cur:
+    # No name for the signed-in login is a supported install, not a refusal: with
+    # one account registered, that account IS the spare (#41). There is simply
+    # nothing to compare the caller's claim against, and nothing to record.
+    if args.from_account and cur and args.from_account != cur:
         return 4                    # the store moved while this was being decided
-    a, _ = best_target(no_probe=args.no_probe,
-                       exclude=set(swap_guard_read()), deadline=deadline)
+    a, _ = best_target(
+        no_probe=args.no_probe, deadline=deadline,
+        exclude={n: w for n, (_when, w) in swap_guard_read().items()})
     if a is None:
         return 1
     try:
-        _, installed = swap_to(a["name"], force=True)
+        _, installed, replaced = swap_to(a["name"], force=True)
     except SystemExit:
         return 4
-    swap_guard_record(cur, args.window)
-    print(f"{a['name']}\t{installed}")
+    if cur:
+        swap_guard_record(cur, args.window)
+    print(f"{a['name']}\t{installed}\t{replaced}")
     return 0
 
 
@@ -1502,8 +1576,7 @@ def cmd_refresh(args):
         acct = account_load(name)
         if not acct:
             continue
-        with Lock(LOCK_FILE):
-            ok, why = account_refresh(name, acct)
+        ok, why = account_refresh(name, acct)
         if ok:
             print(f"{C_GRN}✓{C_RESET} {name}")
         else:
@@ -1522,47 +1595,81 @@ def cmd_refresh(args):
     return rc
 
 
-def best_target(no_probe=False, exclude=(), deadline=None):
+def _window_key(rec):
+    """The reset timestamps a reading names, in the shape the guard records."""
+    return ";".join(
+        f"{label}={rec.get(key)}"
+        for label, key in (("5h", "five_hour_reset"), ("7d", "seven_day_reset"))
+        if isinstance(rec.get(key), str) and rec.get(key)
+    )
+
+
+def _guard_holds(name, rec, exclude):
+    """Is this account still the one a swap just left?
+
+    Only a window both sides can name can say the situation has changed. When the
+    record says `none`, or the candidate's own reading names no window, we cannot
+    tell — and cannot tell is not permission to go back."""
+    recorded = (exclude or {}).get(name)
+    if recorded is None:
+        return False
+    if not recorded or recorded == "none":
+        return True
+    theirs = _window_key(rec)
+    return not theirs or theirs == recorded
+
+
+def best_target(no_probe=False, exclude=None, deadline=None):
     """(account, reading) for the best place to hand off, or (None, reason).
 
     One selection rule for every caller — the hook, the statusline, and a person
     typing `ccd account use` — so they can differ only in what they pass in.
 
-    `exclude` drops accounts a swap has just left (swap_guard_read). `deadline` is
-    a wall-clock instant past which no candidate is worth a network probe: this
-    runs inside a hook that is killed on its timeout, and one usable spare behind
-    nine expired ones can spend the whole budget before the swap even starts. Past
-    it the rest are judged on cache alone, which costs nothing and can still say
-    yes."""
+    `exclude` is {name: window} for the accounts a swap has just left
+    (swap_guard_read). A name alone is not enough to keep one out: the record says
+    which windows it was written in, and an account whose own reading now names
+    different resets has had a reset since — a new situation, and a destination
+    again. On a two-account install that difference is the whole escape.
+
+    `deadline` is a wall-clock instant past which no candidate is worth a network
+    probe: this runs inside a hook that is killed on its timeout, and one usable
+    spare behind nine expired ones can spend the whole budget before the swap even
+    starts. Past it the rest are judged on cache alone, which costs nothing and
+    can still say yes. It bounds each request too (NET_DEADLINE), because urllib
+    bounds socket operations rather than requests."""
+    global NET_DEADLINE
     cur = active_name()
-    candidates = [a for a in accounts_all()
-                  if a["name"] != cur and a["name"] not in exclude]
+    candidates = [a for a in accounts_all() if a["name"] != cur]
     if not candidates:
         return None, "no_candidate"
 
     cache = quota_cache()
     probed = False
     scored = []
-    for a in candidates:
-        if no_probe or (deadline is not None and time.time() >= deadline):
-            # Cached-only mode for latency-sensitive callers (the prompt hook).
-            # Never opens a socket: a stale answer that costs nothing beats a
-            # fresh one that freezes the user's prompt for seconds.
-            rec = cache.get(a["name"])
-            # The identity check earns its place most here: this path hands off
-            # on a cached `ok` without opening a socket, so a row left behind by
-            # a name that now points at another account would spend that
-            # account's quota.
-            if not _cache_row_valid(rec, a) or rec.get("status") != "ok":
-                continue
-            ts = rec.get("checked_at")
-            if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
-                continue
-        else:
-            rec, cache = quota_for(a["name"], a, cache=cache)
-            probed = True
-        if has_headroom(rec):
-            scored.append((a.get("priority", 999), worst(rec), a, rec))
+    outer, NET_DEADLINE = NET_DEADLINE, deadline
+    try:
+        for a in candidates:
+            if no_probe or (deadline is not None and time.time() >= deadline):
+                # Cached-only mode for latency-sensitive callers (the prompt hook).
+                # Never opens a socket: a stale answer that costs nothing beats a
+                # fresh one that freezes the user's prompt for seconds.
+                rec = cache.get(a["name"])
+                # The identity check earns its place most here: this path hands off
+                # on a cached `ok` without opening a socket, so a row left behind by
+                # a name that now points at another account would spend that
+                # account's quota.
+                if not _cache_row_valid(rec, a) or rec.get("status") != "ok":
+                    continue
+                ts = rec.get("checked_at")
+                if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
+                    continue
+            else:
+                rec, cache = quota_for(a["name"], a, cache=cache)
+                probed = True
+            if has_headroom(rec) and not _guard_holds(a["name"], rec, exclude):
+                scored.append((a.get("priority", 999), worst(rec), a, rec))
+    finally:
+        NET_DEADLINE = outer
     if probed:
         quota_cache_save(cache)
 
@@ -1635,11 +1742,20 @@ def cmd_keepalive(args):
     # keeps its own bound (there is nothing to keep alive without a spare to keep).
     if not account_names():
         return 0
+    global NET_DEADLINE
     try:
         with Lock(REFRESH_LOCK, wait=False):
-            stale = keepalive_pass(args.force)
-            if args.pick:
-                best_target(False)
+            # Nothing waits on this pass, but a swap waits on the lock it holds.
+            # An endpoint that answers slowly enough would starve every swap on
+            # the machine; an unfinished pass costs nothing and is retried next
+            # tick.
+            outer, NET_DEADLINE = NET_DEADLINE, time.time() + KEEPALIVE_BUDGET
+            try:
+                stale = keepalive_pass(args.force)
+                if args.pick:
+                    best_target(False, deadline=NET_DEADLINE)
+            finally:
+                NET_DEADLINE = outer
     except LockBusy:
         return 0
     if stale and args.report:
@@ -1817,7 +1933,11 @@ def cmd_usage(args):
                 }
                 rc = 0
     if args.json:
-        print(json.dumps({"claude": claude}, ensure_ascii=False))
+        # Whose reading this is. A decision taken on it is only about that
+        # account, and between taking one and acting on it another session can
+        # swap — at which point the numbers describe somebody else entirely.
+        print(json.dumps({"claude": claude, "account": active_name()},
+                         ensure_ascii=False))
     else:
         parts = [
             f"{lab} {claude[k]}%"

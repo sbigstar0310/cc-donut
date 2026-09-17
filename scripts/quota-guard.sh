@@ -34,6 +34,11 @@ SWAP_SETTLE="${CCD_SWAP_SETTLE:-12}"
 # its timeout, and one usable spare behind nine expired ones would otherwise eat
 # the whole of it and wake nobody. hooks.json budgets for this plus the settle.
 SWAP_PICK_BUDGET="${CCD_SWAP_PICK_BUDGET:-60}"
+# What a PROMPT tick may spend on the same decision. This fires several times a
+# minute, so waiting on a background pass here is a frozen prompt — and the next
+# tick decides just as well. Only the backstop, where the turn has already died
+# and nothing else is coming, gets the long budget above.
+SWAP_TICK_BUDGET="${CCD_SWAP_TICK_BUDGET:-3}"
 
 # Hook payloads arrive on stdin as one JSON object. Read it with pure bash: the
 # obvious `timeout 0.5 cat` is not portable — macOS has no timeout(1), and under
@@ -335,7 +340,8 @@ quota_peak() {
   python3 - "$CACHE" 2>/dev/null <<'PY'
 import datetime, json, sys
 try:
-    c = (json.load(open(sys.argv[1])).get("claude") or {})
+    d = json.load(open(sys.argv[1]))
+    c = (d.get("claude") or {})
 except Exception:
     raise SystemExit(0)
 if c.get("available") is not True or c.get("error") is not False:
@@ -369,20 +375,24 @@ vals = [(label, int(p), reset)
         and not expired(reset)]
 if vals:
     peak = max(p for _, p, _ in vals)
+    # Whose reading this is, when the producer said so. ccd's own probe does;
+    # claude-dashboard has no idea, and then the caller has to ask.
+    acct = d.get("account")
+    acct = acct if isinstance(acct, str) else ""
     # Named by BOTH windows the reading carries, not by whichever happens to be
     # higher: a key that changes when the peak moves from one window to the other
     # describes a different situation every time the two numbers cross.
     key = ";".join(f"{label}={reset}" for label, _, reset in vals
                    if isinstance(reset, str) and reset)
-    print(f"{peak}\t{key or 'none'}")
+    print(f"{peak}\t{key or 'none'}\t{acct}")
 PY
 }
 
 # The peak and the key naming the windows it came from, as two shell variables.
 # Every caller needs both, and a second call would read a cache that may have been
 # replaced in between.
-read_peak() {  # sets $peak and $wkey
-  IFS=$'\t' read -r peak wkey <<EOF
+read_peak() {  # sets $peak, $wkey and $racct (the account the reading measured)
+  IFS=$'\t' read -r peak wkey racct <<EOF
 $(quota_peak)
 EOF
 }
@@ -597,18 +607,31 @@ has_accounts() {
 # $1 is the key naming the reading's windows; the rest are flags for the pick.
 # Prints `<account>TAB<credential fingerprint>`. The exit code says which kind of
 # no it was: 1 is nowhere free to go, and only that may ever justify paying.
-swap_to_spare() {
-  local wkey="$1" ab cur
-  shift
-  # No account machinery at all is not "could not act" — it is the answer that
-  # there is nowhere free to go, which is the one case the paid hop exists for.
+swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=budget
+  local wkey="$1" from="$2" budget="$3" ab
+  shift 3
+  # No account tool at all: if there is also no store, nothing free can exist and
+  # the paid hop is the honest answer (1). If accounts ARE registered, this is a
+  # tool that cannot answer — an operational failure (4), and paying on it would
+  # bill the user for a spare that is sitting right there.
+  if ! ab=$(ccd_account_bin); then
+    has_accounts && return 4
+    return 1
+  fi
+  "$ab" --no-color swap --from "$from" --window "$wkey" \
+        --deadline "$budget" "$@" 2>/dev/null
+}
+
+# Which account is a reading about? The reading says so when ccd took it; a
+# dashboard reading does not, and then this asks — accepting that the answer is
+# only as fresh as the moment it is asked.
+# `CCD_ACTIVE=` because on the paid backbone `current` answers "openrouter", and
+# the account store is what this is a claim about.
+reading_account() {  # $1=what the reading itself said
+  local ab
+  [ -n "$1" ] && { printf '%s' "$1"; return 0; }
   ab=$(ccd_account_bin) || return 1
-  # Which ACCOUNT, not which backbone: on the paid backbone `current` answers
-  # "openrouter", and the account store is still the thing this is a claim about.
-  cur=$(CCD_ACTIVE= "$ab" --no-color current 2>/dev/null) || return 1
-  [ -n "$cur" ] || return 1
-  "$ab" --no-color swap --from "$cur" --window "$wkey" \
-        --deadline "$SWAP_PICK_BUDGET" "$@" 2>/dev/null
+  CCD_ACTIVE= "$ab" --no-color current 2>/dev/null
 }
 
 # Did the credential Claude Code reads actually become the one we installed? The
@@ -616,20 +639,21 @@ swap_to_spare() {
 # writing its own refreshed blob back over ours — leaves that store holding the
 # credential we meant to leave, and waking into it only hits the same wall again.
 #
-# The identity checked is the credential's own. A plan is not an account: two
-# accounts on one plan agree about every plan field there is, and an account that
-# recorded none of them agreed with an empty store. The swap names the exact token
-# it installed, and nothing rotates that token inside the settle window without
-# this session making a request first — which is the thing that has just stopped.
-# Anything this cannot check is a no.
-swap_landed() {  # $1=account name  $2=the credential the swap installed
+# What is checked is whose credential is live, not which string it is. A plan is
+# not an account — two accounts on one plan agree about every plan field there is
+# — but neither is a token: twelve seconds is long enough for another session to
+# refresh the account we just installed, and calling that a failed swap leaves a
+# parked turn asleep for no reason. So: the pointer must name the target, there
+# must be a credential, and it must not be the one we just replaced. A rotation
+# passes; a restoration of the outgoing blob does not.
+swap_landed() {  # $1=account  $2=the credential installed  $3=the one it replaced
   local ab
   [ -n "$2" ] || return 1
   ab=$(ccd_account_bin) || return 1
   # Pickup is 1-11s. Waking before it lands wastes the turn it was meant to save.
   [ "${SWAP_SETTLE:-0}" -gt 0 ] 2>/dev/null && sleep "$SWAP_SETTLE"
   "$ab" --no-color current --json 2>/dev/null \
-    | CCD_WANT="$1" CCD_CRED="$2" python3 -c '
+    | CCD_WANT="$1" CCD_CRED="$2" CCD_OLD="$3" python3 -c '
 import json, os, sys
 try:
     d = json.load(sys.stdin)
@@ -638,7 +662,8 @@ except Exception:
 if d.get("account") != os.environ["CCD_WANT"]:
     raise SystemExit(1)
 cred = (d.get("live") or {}).get("cred")
-raise SystemExit(0 if cred and cred == os.environ["CCD_CRED"] else 1)
+old = os.environ.get("CCD_OLD") or ""
+raise SystemExit(0 if cred and cred != old else 1)
 ' 2>/dev/null
 }
 
@@ -666,14 +691,17 @@ if [ "$EVENT" = "StopFailure" ]; then
            # hooks/hooks.json wakes on exit 2, and its rewakeMessage replaces the
            # "Stop hook blocking error" wording the user would otherwise read.
            # stderr is what carries the account's name into that wake.
-           swapped=$(swap_to_spare "$wkey"); swap_rc=$?
-           account=${swapped%%	*}; cred=${swapped#*	}
+           from=$(reading_account "$racct")
+           swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_PICK_BUDGET"); swap_rc=$?
+           IFS=$'\t' read -r account cred oldcred <<EOF
+$swapped
+EOF
            if [ "$swap_rc" -eq 0 ] && [ -n "$account" ]; then
              # The swap happened: credentials, the pointer and the guard record
              # have all moved. Whether it is safe to WAKE is a second question —
              # but either way this session is now somebody else's, and paying for
              # it on top would bill the user for a hop that has already been made.
-             if swap_landed "$account" "$cred"; then
+             if swap_landed "$account" "$cred" "$oldcred"; then
                printf '%s\n' "[ccd] Your claude.ai usage limit was reached and ccd switched this session to $account, which has quota. Continue the task you were working on when the limit was reached; do not repeat work that is already complete." >&2
                exit 2
              fi
@@ -860,7 +888,8 @@ if [ -n "${CCD_ACTIVE:-}" ]; then
     # The same transaction the subscription path takes: deciding and installing
     # here too must not straddle a token rotation, or the relaunch lands on a
     # credential the server has already retired.
-    esc=$(swap_to_spare none --no-probe) && esc=${esc%%	*} || esc=""
+    esc=$(swap_to_spare none "$(reading_account "")" "$SWAP_PICK_BUDGET" --no-probe) \
+      && esc=${esc%%	*} || esc=""
     if [ -n "$esc" ]; then
       if write_handoff true to_subscription "$SESSION_ID" "$HOOK_CWD"; then
         ESC="$esc" EVENT="$EVENT" python3 -c '
@@ -1000,7 +1029,8 @@ if has_accounts; then
   case "$peak" in
     ''|*[!0-9]*) : ;;
     *) if [ "$peak" -ge "$ARM_THRESHOLD" ] \
-          && swapped=$(swap_to_spare "$wkey" --no-probe) \
+          && from=$(reading_account "$racct") \
+          && swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe) \
           && moved=${swapped%%	*} && [ -n "$moved" ]; then
          MOVED="$moved" EVENT="$EVENT" python3 -c '
 import json, os
