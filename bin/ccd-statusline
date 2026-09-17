@@ -193,6 +193,10 @@ if dash_present; then
   # draws — the context bar, the session cost, the burn rate — it computes from
   # the payload Claude Code just handed us, so a row held even for a minute shows
   # a context bar that has stopped moving. Single-flight keeps that to one child.
+  #
+  # Backgrounded, not detached: this one stays in the render's process group. Losing
+  # it to a cancelled render costs a redraw, where the spare refresh below would lose
+  # a refresh token the server had already rotated (detach(), bin/ccd-account).
   if dash_lock; then
     ( dash_refresh ) >/dev/null 2>&1 &
   fi
@@ -360,6 +364,12 @@ PY
 fi
 
 # ── Normal (subscription) session ────────────────────────────────────────────
+# The row below is only as current as accounts-quota.json, so when it finds that reading
+# aged out it asks (exit 3, see the end of the block) for the same background job the
+# hook runs. That is what keeps the reading moving through a turn with no prompt in it:
+# every assistant message re-runs this, and so does the 60s tick `ccd setup` asks for
+# (#54). A reading still fresh, or no spare to measure, costs nothing at all.
+#
 # WHICH ACCOUNT IS ANSWERING? Always shown, even with nothing registered — after a
 # swap the single most important thing to know is whose quota is being spent, and
 # a row that appears only sometimes is a row you learn not to look at. The ccd row
@@ -389,9 +399,9 @@ try:
 except ValueError:
     HEADROOM = 90
 # Past this, a percentage is not a stale reading but a wrong one — the same call
-# the dashboard row makes about its own cache. Nothing refreshes this file except
-# an `ccd account` command and the hook's background warm, so without a ceiling a
-# row can be served as current for days (#24).
+# the dashboard row makes about its own cache. The background refresh keeps it well
+# inside this, but a machine that was asleep or offline can hand the render a row
+# days old (#24).
 try:
     MAX_STALE = int(os.environ.get("ACCT_MAX_STALE", "3600"))
 except ValueError:
@@ -766,9 +776,40 @@ if (fresh_enough and c.get("available") is True and c.get("error") is False
 # quota is actually spent, buys both.
 acct = f" {DIM}│{RS} ".join(x for x in (head, tail) if x)
 print("\n".join(x for x in (acct, warn) if x), end="")
+
+# ── Ask for a background refresh ─────────────────────────────────────────────
+# Exit 3 means "this reading has aged out and there is a spare the job could measure".
+# Both facts are already here: `spares` applies the identity rule that makes a lone
+# registered account a spare (#41), and the cache's age is one stat. Deciding it in
+# the shell instead would cost a second python on every render and a second copy of
+# that rule. A future stamp is not freshness, the same call dash_age makes.
+#
+# The launcher's visited set comes off too, the way best_target() takes it off: a
+# spare it will not probe is one the job would measure nothing about, and it returns
+# without writing the cache — so the reading would stay stale and the next render
+# would ask again. The row above still names that spare; this is only about work.
+visited = set(os.environ.get("CCD_BURST_VISITED", "").replace(",", " ").split())
+try:
+    TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
+except ValueError:
+    TTL = 300
+try:
+    age = time.time() - os.path.getmtime(qfile)
+except OSError:
+    age = float("inf")
+measurable = [n for n in spares if n not in visited]
+raise SystemExit(3 if measurable and not 0 <= age < TTL else 0)
 PY
 )
+refresh=$?
 
+# The row asked for one (exit 3). It is the job the hook runs, so it single-flights
+# itself, and --detach puts it in a session of its own: Claude Code cancels a render
+# still running by killing its process group, and a kill mid token-exchange loses a
+# refresh token the server has already rotated. Nothing here is waited on.
+if [ "$refresh" -eq 3 ]; then
+  "$SELF_DIR/ccd-account" --no-color keepalive --pick --detach --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
+fi
 
 if [ -n "$base" ] && [ -n "$row" ]; then
   printf '%s\n%s' "$base" "$row"

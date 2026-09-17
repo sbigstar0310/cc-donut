@@ -3015,6 +3015,12 @@ head_ "25. multi-account: a spare must not die in silence"
 # sixteen days with a 429, the code only reported "dead", and the user met the
 # re-login at the moment of the handoff. Nothing here touches the network — the
 # refresh endpoint has no shim, and these are the decisions around it.
+#
+# Nor does anything from here on: a test that wants an endpoint stands one up locally
+# and names it, and everything else points at a dead port rather than at Anthropic.
+# Relying on a neighbour's probe-backoff marker for that is how a real request slipped
+# through before.
+export CCD_USAGE_URL="http://127.0.0.1:1/usage" CCD_TOKEN_URL="http://127.0.0.1:1/token"
 rm -rf "$ADIR"; mkdir -p "$ADIR"
 ka() { HOME="$FAKE" python3 - "$@" <<'PY'
 import json, os, sys, time, types
@@ -3207,41 +3213,15 @@ CCD_TOKEN_URL="http://127.0.0.1:1/x" "$ACCT" --no-color refresh >/dev/null 2>&1
   && ok "...and a sweep with a failure in it does not clear it either" \
   || bad "keepalive counter" "cleared on a failed sweep: $(ka_fails)"
 
-# ── One refresher at a time ─────────────────────────────────────────────────
-# keepalive rotates tokens; the quota warm probes, and quota_for() refreshes a token
-# on the way when the stored one has expired. Both therefore spend the same one-time
-# refresh token, and only keepalive takes the store lock. Run as siblings they raced,
-# the loser got `dead`, and the account read as logged out — which is the failure this
-# release is about, arriving by a route we opened.
-#
-# Ordering is the property, so measure ordering: a stub ccd-account records when each
-# command starts and ends. No network, and nothing to flake on but the ordering itself.
-RACEDIR="$FAKE/raceroot"; mkdir -p "$RACEDIR/bin"
-cat > "$RACEDIR/bin/ccd-account" <<'RACEEOF'
-#!/bin/sh
-for a in "$@"; do case "$a" in keepalive|pick) cmd=$a ;; esac; done
-[ -n "${cmd:-}" ] || exit 0
-echo "start $cmd" >> "$HOME/.race"
-sleep 0.4
-echo "end $cmd" >> "$HOME/.race"
-RACEEOF
-chmod +x "$RACEDIR/bin/ccd-account"
-rm -f "$FAKE/.race"
-CLAUDE_PLUGIN_ROOT="$RACEDIR" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit </dev/null >/dev/null 2>&1
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ "$(grep -c end "$FAKE/.race" 2>/dev/null || echo 0)" -ge 2 ] && break; sleep 0.3
-done
-[ "$(cat "$FAKE/.race" 2>/dev/null | tr '\n' ' ')" = "start keepalive end keepalive start pick end pick " ] \
-  && ok "a prompt runs the two refreshers in sequence, never at once" \
-  || bad "refresher race" "interleaved: $(cat "$FAKE/.race" 2>/dev/null | tr '\n' ' ')"
-rm -rf "$RACEDIR" "$FAKE/.race"
-
 # Park keepalive AND the picker: hook runs below must not fire a background token
 # refresh or a quota probe. These fixtures carry the refresh token "r" and an
 # expired access token, so anything that reaches the network here is a test
 # reaching Anthropic for real — a bug in the test, not a slow one.
 ka quiet
 ka warm
+# The signed-in account's reading is parked too: without it the hook goes to measure it.
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
+  > "$FAKE/.claude/ccd/quota-cache.json"
 rm -f "$FAKE/.claude/ccd/last-stale-warn"
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
 case "$out" in
@@ -3290,6 +3270,8 @@ QDIR="$FAKE/.claude/ccd"
 rm -f "$QDIR/quota-cache.json"
 : > "$QDIR/quota-cache.json.tmp.999001"; touch -t 202001010000 "$QDIR/quota-cache.json.tmp.999001"
 : > "$QDIR/quota-cache.json.tmp.999002"
+# The sweep lives on the cache-refresh path, so the cache has to be missing — which
+# sends the hook off to measure the signed-in account, at the dead port above.
 "$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null >/dev/null 2>&1
 [ ! -e "$QDIR/quota-cache.json.tmp.999001" ] \
   && ok "a tmp file stranded by an earlier hard kill is swept" \
@@ -3319,6 +3301,80 @@ mkdir -p "$FAKE/pybin"; ln -sf "$(command -v python3)" "$FAKE/pybin/python3"
   && ok "...and falls back to the newest in the store only when PATH has none" \
   || bad "claude_ua" "got: $(PATH="$FAKE/pybin" ka ua)"
 rm -rf "$VS" "$FAKE/clbin" "$FAKE/pybin"
+
+# ── One refresher at a time ─────────────────────────────────────────────────
+# keepalive rotates tokens; the quota warm probes, and quota_for() refreshes a token
+# on the way when the stored one has expired. Both therefore spend the same one-time
+# refresh token. Run as siblings they raced, the loser got `dead`, and the account read
+# as logged out — which is the failure this release is about, arriving by a route we
+# opened.
+#
+# Ordering is the property, so measure it where the token is spent. A stand-in for
+# both endpoints a refresh reaches logs when each request starts, with how many were in
+# flight, and when it ends, holding long enough between for a sibling to overlap.
+endpoint_up() { # $1=log $2=seconds each request holds; sets EP_URL and EP_PID
+  cat > "$FAKE/endpoint.py" <<'EPY'
+import http.server, json, os, socketserver, sys, threading, time
+port_file, log, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])
+lock, live = threading.Lock(), [0]
+def note(line):
+    with open(log, "a") as f: f.write(line + "\n")
+class H(http.server.BaseHTTPRequestHandler):
+    def answer(self, kind, reply):
+        with lock:
+            live[0] += 1; note(f"start {kind} {live[0]}")
+        time.sleep(hold)
+        with lock:
+            live[0] -= 1; note(f"end {kind}")
+        body = json.dumps(reply).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def do_POST(self):                          # a token refresh
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        t = str(time.time())
+        self.answer("token", {"access_token": "A" + t, "refresh_token": "R" + t, "expires_in": 28800})
+    def do_GET(self):                           # a usage probe
+        w = {"utilization": 12, "resets_at": "2099-01-01T00:00:00Z"}
+        self.answer("usage", {"five_hour": w, "seven_day": dict(w, utilization=30)})
+    def log_message(self, *a): pass
+class S(http.server.ThreadingHTTPServer):
+    def server_bind(self):                      # skip getfqdn(), see the token server below
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+srv = S(("127.0.0.1", 0), H)
+with open(port_file + ".tmp", "w") as f: f.write(str(srv.server_address[1]))
+os.replace(port_file + ".tmp", port_file)
+srv.serve_forever()
+EPY
+  rm -f "$FAKE/.ep-port"
+  python3 "$FAKE/endpoint.py" "$FAKE/.ep-port" "$1" "$2" </dev/null >/dev/null 2>&1 &
+  EP_PID=$!
+  local n=0
+  while [ ! -s "$FAKE/.ep-port" ] && [ $n -lt 75 ]; do sleep 0.2; n=$((n+1)); done
+  EP_URL="http://127.0.0.1:$(cat "$FAKE/.ep-port" 2>/dev/null)"
+  [ -s "$FAKE/.ep-port" ]
+}
+# A spare due for a keepalive, holding an expired token, behind a stale reading: a
+# prompt has both refreshers to run. The signed-in account's reading is current, so
+# the hook measures nothing else.
+rm -rf "$ADIR"; mkdir -p "$ADIR"
+ka mk active-acct 0 8; ka mk race-spare 0 8
+printf 'active-acct\n' > "$ADIR/.active"
+rm -f "$FAKE/.claude/ccd/accounts-keepalive" "$FAKE/.claude/ccd/accounts-quota.json" "$FAKE/.race"
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
+  > "$FAKE/.claude/ccd/quota-cache.json"
+endpoint_up "$FAKE/.race" 0.4 || bad "refresher race" "local endpoint never came up"
+CLAUDE_PLUGIN_ROOT="$ROOT" CCD_TOKEN_URL="$EP_URL/token" CCD_USAGE_URL="$EP_URL/usage" \
+  CCD_HTTP_TIMEOUT=10 "$ROOT/scripts/quota-guard.sh" UserPromptSubmit </dev/null >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(grep -c '^end' "$FAKE/.race" 2>/dev/null)" = "2" ] && break; sleep 0.3
+done
+sleep 0.5    # long enough for a straggler to show
+[ "$(cut -d' ' -f1-2 "$FAKE/.race" 2>/dev/null | tr '\n' ' ')" = "start token end token start usage end usage " ] \
+  && ok "a prompt runs the two refreshers in sequence, never at once" \
+  || bad "refresher race" "interleaved: $(tr '\n' ' ' < "$FAKE/.race" 2>/dev/null)"
+kill "$EP_PID" 2>/dev/null; wait "$EP_PID" 2>/dev/null
+rm -f "$FAKE/.race"
 
 # The hook fires on each prompt and each tool use, so keepalive passes start
 # within the same second. Each must not read a refresh token another is about
@@ -4094,10 +4150,11 @@ row=$(hatch)
 
 # Measured-and-none is not the same as never-measured. The row says "spare ?" for the
 # second, and the warning must not turn not knowing into a claim. Registered accounts
-# with no rows at all is what "never measured" looks like.
+# with no rows at all is what "never measured" looks like — in a cache written just now,
+# since a missing one sends the render off to measure them (#54).
 mk_sl_acct here; mk_sl_acct unseen
 printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
-rm -f "$SLQ"
+printf '{}' > "$SLQ"
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
 [ "$row" = "⚠ quota 99% → no known spare, no OpenRouter key" ] \
@@ -4241,6 +4298,311 @@ case "$row" in
   *) bad "supervision" "the row did not render at all: '$row'" ;;
 esac
 rm -rf "$ADIR" "$SHIMD"; mkdir -p "$ADIR"
+
+head_ "27e. the spare's reading keeps pace with the row"
+# #54. The row is only as current as accounts-quota.json, and only a typed prompt
+# refreshed it: an autonomous turn fires tool uses and assistant messages, never a
+# prompt, so a healthy spare aged into `spare ?` exactly while quota burned fastest.
+# The reading has to move on the row's own cadence (prompt, tool use, render, and a
+# timer for an idle session), a fresh one must cost no process, and no refresh may
+# overlap another, because keepalive and a pick can both spend a one-time refresh token.
+#
+# Every trigger runs from a copy of the plugin whose ccd-account logs, then execs the
+# real one. The log tells "nothing needed refreshing" apart from "nothing was started";
+# the local endpoint (section 25) says whether a refresh landed, and how many overlapped.
+SPD="$FAKE/.claude/ccd"; SPQ="$SPD/accounts-quota.json"
+SPROOT="$FAKE/spareroot"; SPLOG="$FAKE/.spare-calls"; SPHITS="$FAKE/.spare-hits"
+rm -rf "$SPROOT"; mkdir -p "$SPROOT"
+cp -R "$ROOT/bin" "$ROOT/scripts" "$SPROOT/"
+cat > "$SPROOT/bin/ccd-account" <<EOF
+#!/bin/sh
+echo "\$*" >> "$SPLOG"
+exec "$ROOT/bin/ccd-account" "\$@"
+EOF
+chmod +x "$SPROOT/bin/ccd-account"
+endpoint_up "$SPHITS" 3 || bad "spare refresh" "local endpoint never came up"
+
+sp_env() { env CCD_USAGE_URL="$EP_URL/usage" CCD_TOKEN_URL="$EP_URL/token" CCD_HTTP_TIMEOUT=10 "$@"; }
+sp_hook() { sp_env CLAUDE_PLUGIN_ROOT="$SPROOT" "$SPROOT/scripts/quota-guard.sh" "$1" </dev/null >/dev/null 2>&1; }
+# Claude Code hands the statusline no plugin root, so neither does this.
+sp_render() {
+  printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+    | sp_env env -u CLAUDE_PLUGIN_ROOT "$SPROOT/bin/ccd-statusline" 2>/dev/null
+}
+spare_fixture() { # $1 = age of every reading on file, in seconds; $2 = "due" for a spare
+                  # whose keepalive is due and whose access token has expired
+  rm -rf "$ADIR" "$SPQ" "$SPLOG" "$SPHITS" "$FAKE/.claude.json"; mkdir -p "$ADIR"
+  python3 - "$ADIR" "$SPQ" "$1" "${2:-}" <<'PY'
+import datetime, hashlib, json, os, sys, time
+adir, qfile, age, due = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "due"
+now = time.time()
+iso = lambda s: datetime.datetime.fromtimestamp(now + s, datetime.timezone.utc).isoformat()
+rows = {}
+for name in ("main", "backup"):
+    at = "AT-" + name
+    expires = now - 3600 if due and name == "backup" else now + 8 * 3600
+    json.dump({"name": name, "label": name, "account_uuid": "uuid-" + name, "priority": 1,
+               "claudeAiOauth": {"accessToken": at, "refreshToken": "RT-" + name,
+                                 "expiresAt": int(expires * 1000)}},
+              open(os.path.join(adir, name + ".json"), "w"))
+    rows[name] = {"status": "ok", "checked_at": int(now - age), "uuid": "uuid-" + name,
+                  "cred": hashlib.sha256(at.encode()).hexdigest()[:16],
+                  "five_hour_percent": 50, "seven_day_percent": 50,
+                  "five_hour_reset": iso(3600), "seven_day_reset": iso(3 * 86400)}
+json.dump(rows, open(qfile, "w"))
+os.utime(qfile, (now - age, now - age))
+PY
+  printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
+  # The hook's own reading of the signed-in account is not what this section measures.
+  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
+    > "$SPD/quota-cache.json"
+  if [ "${2:-}" = "due" ]; then rm -f "$SPD/accounts-keepalive"; else printf '{"fails": 0}' > "$SPD/accounts-keepalive"; fi
+}
+sp_reading() {
+  python3 - "$SPQ" <<'PY'
+import json, sys, time
+try: r = json.load(open(sys.argv[1]))["backup"]
+except Exception: print("unreadable"); raise SystemExit
+t = r.get("checked_at")
+fresh = isinstance(t, (int, float)) and time.time() - t < 60
+print(f"{r.get('status')}:{'fresh' if fresh else 'stale'}:{r.get('five_hour_percent')}")
+PY
+}
+sp_landed() { # the endpoint's reading, on file
+  n=0; while [ "$(sp_reading)" != "ok:fresh:12" ] && [ $n -lt 60 ]; do sleep 0.25; n=$((n+1)); done
+  [ "$(sp_reading)" = "ok:fresh:12" ]
+}
+
+# ── A tool use refreshes, not only a typed prompt ───────────────────────────
+spare_fixture 600
+sp_hook PostToolUse
+sp_landed \
+  && ok "a tool-use tick brings a stale spare reading current" \
+  || bad "tool-use refresh" "only a typed prompt refreshes the spare: $(sp_reading)"
+sleep 1
+
+# ── A fresh reading costs no process ────────────────────────────────────────
+# Judged before anything is spawned. A pick that starts only to find the cache warm is
+# exactly the process ruled out: the hook fires on every tool use. The bare keepalive
+# every tick already ran is the one call allowed.
+spare_fixture 10
+sp_hook UserPromptSubmit; sp_hook PostToolUse
+sleep 2
+started=$(grep -vxF -- '--no-color keepalive --detach' "$SPLOG" 2>/dev/null)
+[ -z "$started" ] \
+  && ok "a fresh reading starts no refresh, on a prompt or a tool use" \
+  || bad "fresh reading" "started for a reading seconds old: $(printf '%s' "$started" | tr '\n' '/')"
+
+# ── An idle session still ticks ─────────────────────────────────────────────
+# Event triggers go quiet while the session idles, so the row needs a timer of its own.
+# Seeded with today's wiring, which is what a re-run of setup meets.
+SPH="$FAKE/home54"; rm -rf "$SPH"; mkdir -p "$SPH/.claude"
+printf '{"statusLine":{"type":"command","command":"bash ~/.claude/ccd/statusline-launcher.sh"}}\n' \
+  > "$SPH/.claude/settings.json"
+HOME="$SPH" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+sl=$(python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get('statusLine'),sort_keys=True))" \
+       "$SPH/.claude/settings.json" 2>/dev/null)
+[ "$sl" = '{"command": "bash ~/.claude/ccd/statusline-launcher.sh", "refreshInterval": 60, "type": "command"}' ] \
+  && ok "setup gives the statusline a 60s tick, beside the command it already wires" \
+  || bad "refreshInterval" "statusLine: $sl"
+
+# Nothing reruns setup after an update, so an install wired before the tick existed gets
+# it at session start, through the hook as hooks.json registers it. Only ccd's own
+# statusline, exactly as setup writes it: never a wrapper around it, never one whose
+# interval the user already chose, never a statusline where there was none. The last
+# three pass against a hook that does nothing, so they ride with the first.
+ss_out=$(HOME="$SPH" CLAUDE_PLUGIN_ROOT="$ROOT" python3 - "$SPH/.claude/settings.json" "$ROOT/hooks/hooks.json" 2>&1 <<'PY'
+import json, subprocess, sys
+settings, hooks = sys.argv[1], sys.argv[2]
+ours = json.load(open(settings))["statusLine"]
+ours.pop("refreshInterval", None)                      # what an older setup wrote
+cmds = [h["command"] for g in json.load(open(hooks))["hooks"].get("SessionStart", [])
+        for h in g.get("hooks", [])]
+if not cmds:
+    print("no SessionStart hook is registered")
+for seed, want in ((ours, dict(ours, refreshInterval=60)),
+                   (dict(ours, command=ours["command"] + " --wrapped"), None),
+                   (dict(ours, refreshInterval=5), None),
+                   ("absent", None)):
+    with open(settings, "w") as f:
+        json.dump({} if seed == "absent" else {"statusLine": seed}, f)
+    before = open(settings).read()
+    out = "".join(subprocess.run(["bash", "-c", c], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True).stdout for c in cmds)
+    got = json.load(open(settings)).get("statusLine", "absent")
+    if (got != want if want else open(settings).read() != before) or out:
+        print(f"{seed} became {got}" + (f", printing {out.strip()}" if out else ""))
+print("checked")                                       # reached only if nothing above threw
+PY
+)
+[ "$ss_out" = "checked" ] \
+  && ok "...and a session start gives it to an older install's statusline, and to nothing else" \
+  || bad "statusline upgrade" "$(printf '%s' "$ss_out" | tr '\n' '/')"
+
+# Several sessions start at once and Claude Code writes settings.json itself, so a write
+# that lands between our read and our replace must not be discarded — including one that
+# stops the statusline being ours. The interleave is staged from outside the hook: a
+# sitecustomize makes the foreign write happen as the hook opens its temp file.
+mkdir -p "$FAKE/pysite54"
+cat > "$FAKE/pysite54/sitecustomize.py" <<'SCEOF'
+import json, os, tempfile
+_target = os.environ.get("CCD_TEST_INTERLEAVE")
+if _target:
+    _mkstemp = tempfile.mkstemp
+
+    def mkstemp(*a, **k):                    # after the hook's read, before its replace
+        d = json.load(open(_target))
+        d["theirs"] = "kept"
+        with open(_target, "w") as f:
+            json.dump(d, f)
+        tempfile.mkstemp = _mkstemp          # once is enough to open the window
+        return _mkstemp(*a, **k)
+
+    tempfile.mkstemp = mkstemp
+SCEOF
+cas_state() {
+  python3 -c "import json,sys
+d = json.load(open(sys.argv[1]))
+print(d.get('theirs'), (d.get('statusLine') or {}).get('refreshInterval'))" "$SPH/.claude/settings.json" 2>&1
+}
+printf '{"statusLine":{"type":"command","command":"bash ~/.claude/ccd/statusline-launcher.sh"}}\n' \
+  > "$SPH/.claude/settings.json"
+HOME="$SPH" CLAUDE_PLUGIN_ROOT="$ROOT" CCD_TEST_INTERLEAVE="$SPH/.claude/settings.json" \
+  PYTHONPATH="$FAKE/pysite54${PYTHONPATH:+:$PYTHONPATH}" \
+  "$ROOT/scripts/quota-guard.sh" SessionStart </dev/null >/dev/null 2>&1
+raced=$(cas_state)
+# Standing down is only safe because the next session start tries again.
+HOME="$SPH" CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" SessionStart </dev/null >/dev/null 2>&1
+retried=$(cas_state)
+[ "$raced" = "kept None" ] && [ "$retried" = "kept 60" ] \
+  && ok "...and stands down on a settings write that lands mid-flight, then retries" \
+  || bad "settings race" "during: $raced · after: $retried"
+rm -rf "$SPH" "$FAKE/pysite54"
+
+# ── A render refreshes too, and waits for none of it ────────────────────────
+# The statusline re-runs on each assistant message and on that timer, which makes it the
+# trigger an idle session still has. Claude Code cancels a run still in flight, so the
+# refresh must leave the render behind. Paired with the fresh case: on its own that
+# half passes against a statusline that never refreshes anything.
+spare_fixture 10
+sp_render >/dev/null; sleep 2
+fresh_started=$(cat "$SPLOG" 2>/dev/null)
+spare_fixture 600
+sl_start=$(date +%s)
+row=$(sp_render)
+sl_elapsed=$(( $(date +%s) - sl_start ))
+# Waited for whatever the verdict, or a refresh still in flight lands in the next case.
+sp_landed && landed=1 || landed=0
+if [ -n "$fresh_started" ]; then
+  bad "render refresh" "a render started ccd-account for a reading seconds old: $fresh_started"
+elif [ "$landed" -eq 0 ]; then
+  bad "render refresh" "a render left a stale spare reading stale: $(sp_reading)"
+elif [ "$sl_elapsed" -gt 2 ]; then
+  bad "render refresh" "the render waited ${sl_elapsed}s for the refresh"
+else
+  ok "a render refreshes a stale reading behind itself, and leaves a fresh one alone"
+fi
+sleep 1
+
+# ── ...and outlives the trigger being cancelled ─────────────────────────────
+# Claude Code cancels a render that is still running when the next update arrives, and
+# kills a hook that outruns its timeout — both by process group. A refresh caught there
+# mid token-exchange loses a refresh token the server has already rotated: the spare
+# dies, which is the failure ccd exists to prevent.
+sp_cancelled() { # run a trigger in a session of its own, then kill that session
+  sp_env python3 - "$@" >/dev/null 2>&1 <<'PY'
+import os, signal, subprocess, sys, time
+p = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+p.communicate(b'{"model":{"id":"claude-opus-5"}}')
+time.sleep(0.5)                              # the refresh is at the endpoint by now
+os.killpg(p.pid, signal.SIGKILL)
+PY
+}
+spare_fixture 600
+sp_cancelled env -u CLAUDE_PLUGIN_ROOT "$SPROOT/bin/ccd-statusline"
+sp_landed && cancel_render=yes || cancel_render="no ($(sp_reading))"
+sleep 1
+spare_fixture 600
+sp_cancelled env CLAUDE_PLUGIN_ROOT="$SPROOT" "$SPROOT/scripts/quota-guard.sh" PostToolUse
+sp_landed && cancel_tick=yes || cancel_tick="no ($(sp_reading))"
+[ "$cancel_render" = yes ] && [ "$cancel_tick" = yes ] \
+  && ok "...and a refresh outlives the render or the tick that started it being killed" \
+  || bad "detached refresh" "render: $cancel_render · tick: $cancel_tick"
+sleep 1
+
+# ── The only registered account is a spare too ──────────────────────────────
+# An unregistered login beside one registered account: that account IS the spare (#41),
+# so its reading has to keep moving like any other — on a tick and on a render.
+solo_fixture() {
+  spare_fixture 600
+  rm -f "$ADIR/main.json" "$ADIR/.active"
+  printf '{"oauthAccount":{"accountUuid":"uuid-nobody","emailAddress":"nobody@example.com","profileFetchedAt":%s}}\n' \
+    "$(( $(date +%s) * 1000 ))" > "$FAKE/.claude.json"
+}
+solo_fixture
+sp_hook PostToolUse
+sp_landed && solo_hook=yes || solo_hook="no ($(sp_reading))"
+sleep 1
+solo_fixture
+sp_render >/dev/null
+sp_landed && solo_render=yes || solo_render="no ($(sp_reading))"
+[ "$solo_hook" = yes ] && [ "$solo_render" = yes ] \
+  && ok "the only registered account is measured too, by a tick and by a render" \
+  || bad "single spare" "tick: $solo_hook · render: $solo_render"
+sleep 1
+
+# ── ...unless the burst has already been there ──────────────────────────────
+# best_target() drops the launcher's visited set as well as the active account, and
+# returns before writing anything when that leaves no candidate. A render that asks for
+# a job anyway gets one that measures nothing, leaves the reading stale, and is asked
+# for again by the very next render.
+solo_fixture
+# Comma-separated, the form the launcher exports (export_visited, bin/ccd-handoff).
+CCD_BURST_VISITED=earlier-hop,backup sp_render >/dev/null
+sleep 2
+visited_started=$(cat "$SPLOG" 2>/dev/null)
+solo_fixture
+sp_render >/dev/null
+sp_landed && unvisited=yes || unvisited="no ($(sp_reading))"
+[ -z "$visited_started" ] && [ "$unvisited" = yes ] \
+  && ok "...and not while the burst has already visited the only spare there is" \
+  || bad "visited spare" "visited: ${visited_started:-nothing started} · not visited: $unvisited"
+rm -f "$FAKE/.claude.json"
+sleep 1
+
+# ── However many triggers, one refresh at a time ────────────────────────────
+# Three sessions' prompts, tool uses and renders landing together, which the new
+# triggers make routine, against a spare with a keepalive due and an expired token: every
+# job would spend a refresh token. Whatever the lock, the endpoint sees any overlap.
+spare_fixture 600 due
+sp_pids=""
+for _ in 1 2 3; do
+  sp_hook UserPromptSubmit & sp_pids="$sp_pids $!"
+  sp_hook PostToolUse & sp_pids="$sp_pids $!"
+  sp_render >/dev/null & sp_pids="$sp_pids $!"
+done
+wait $sp_pids
+# A refresh queued behind the first arrives within one more hold of the endpoint.
+sp_landed && landed=1 || landed=0
+sleep 4
+peak=$(grep '^start' "$SPHITS" 2>/dev/null | cut -d' ' -f3 | sort -n | tail -n 1)
+kinds=$(grep '^start' "$SPHITS" 2>/dev/null | cut -d' ' -f2 | sort -u | tr '\n' ' ')
+# Both halves have to have run, or "one at a time" is satisfied by doing almost nothing.
+if [ "$landed" -eq 0 ]; then
+  bad "single-flight" "no refresh landed at all: $(sp_reading)"
+elif [ "$kinds" != "token usage " ]; then
+  bad "single-flight" "the job did not both refresh and measure: ${kinds:-nothing ran}"
+elif [ "${peak:-0}" != "1" ]; then
+  bad "single-flight" "peak refreshes in flight at the endpoint: $peak"
+else
+  ok "prompts, tool uses and renders at once never run two refreshes together"
+fi
+
+kill "$EP_PID" 2>/dev/null; wait "$EP_PID" 2>/dev/null
+rm -rf "$SPROOT" "$ADIR" "$SPQ" "$SPLOG" "$SPHITS" "$SPD/accounts-keepalive"
+mkdir -p "$ADIR"
+unset -f sp_env sp_hook sp_render sp_cancelled solo_fixture spare_fixture sp_reading sp_landed cas_state
 
 head_ "28. no claude-dashboard installed"
 # ccd reads Claude quota to do three things: warn before exhaustion, notice a
