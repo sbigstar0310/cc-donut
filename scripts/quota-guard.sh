@@ -39,6 +39,11 @@ SWAP_PICK_BUDGET="${CCD_SWAP_PICK_BUDGET:-60}"
 # tick decides just as well. Only the backstop, where the turn has already died
 # and nothing else is coming, gets the long budget above.
 SWAP_TICK_BUDGET="${CCD_SWAP_TICK_BUDGET:-3}"
+# Where a backstop that could not move the session leaves its one line. The next
+# prompt claims it, says it once, and removes it — the same shape the keepalive's
+# verdict uses, and for the same reason: the path that learns the fact has no
+# screen to say it on.
+SWAP_NOTE="$CCD_DIR/swap-note"
 
 # Hook payloads arrive on stdin as one JSON object. Read it with pure bash: the
 # obvious `timeout 0.5 cat` is not portable — macOS has no timeout(1), and under
@@ -598,28 +603,65 @@ has_accounts() {
 # to be relaunched — that was always the expensive half of the hop, and the
 # measurements in #57 say no part of it was ever needed.
 #
-# Deciding where to go and installing it is ONE transaction, held by ccd-account
-# under the same lock the background keepalive takes: a pick and an install in two
-# processes can have a token rotation between them, and two sessions acting on one
-# reading can move the store twice. `--from` carries the account this session
-# measured, so a decision about an account we are no longer on does nothing.
+# Move this session to a spare. Three attempts, then stop: a store that moved or
+# a lock somebody else held is worth a moment's patience and nothing more.
 #
-# $1 is the key naming the reading's windows; the rest are flags for the pick.
-# Prints `<account>TAB<credential fingerprint>`. The exit code says which kind of
-# no it was: 1 is nowhere free to go, and only that may ever justify paying.
+# There are two outcomes and they are not a fork in the road. Either this prints
+# `<account>TAB<installed credential>TAB<the credential it replaced>`, or it
+# prints nothing and leaves the reason in $SWAP_REASON. Nothing about that reason
+# is evidence of exhaustion — whether the paid hop is allowed is asked separately,
+# of the measurements themselves (subscriptions_exhausted).
+SWAP_REASON=""
 swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=budget
-  local wkey="$1" from="$2" budget="$3" ab
+  local wkey="$1" from="$2" budget="$3" ab out i end left
   shift 3
-  # No account tool at all: if there is also no store, nothing free can exist and
-  # the paid hop is the honest answer (1). If accounts ARE registered, this is a
-  # tool that cannot answer — an operational failure (4), and paying on it would
-  # bill the user for a spare that is sitting right there.
+  SWAP_REASON=""
   if ! ab=$(ccd_account_bin); then
-    has_accounts && return 4
+    SWAP_REASON="ccd-account is missing from this install"
     return 1
   fi
-  "$ab" --no-color swap --from "$from" --window "$wkey" \
-        --deadline "$budget" "$@" 2>/dev/null
+  # ONE budget, attempts included. Three tries that each get the whole of it is
+  # three times the wait the caller agreed to, and on a prompt tick the caller is
+  # a person watching a cursor.
+  end=$(( $(date +%s) + budget ))
+  for i in 1 2 3; do
+    left=$(( end - $(date +%s) ))
+    [ "$left" -gt 0 ] || break
+    if out=$("$ab" --no-color swap --from "$from" --window "$wkey" \
+                   --deadline "$left" "$@" 2>&1) && [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    SWAP_REASON=$(printf '%s' "$out" | tr '\n' ' ' | head -c 120)
+    sleep 0.2
+  done
+  return 1
+}
+
+# The only question that may authorise spending money. It is answered by
+# measuring, never by what some other path failed to do: every registered account
+# other than this one has to have a fresh, successful reading, and every one of
+# them has to be out of room.
+subscriptions_exhausted() {
+  local ab
+  has_accounts || return 0
+  ab=$(ccd_account_bin) || return 1
+  "$ab" --no-color exhausted --deadline "$SWAP_PICK_BUDGET" >/dev/null 2>&1
+}
+
+# Leave one line where the next prompt will find it. A backstop that could not
+# move the session must not wake it — the account is still spent, and the woken
+# turn would walk into the same wall — but the user is owed the reason, once.
+swap_note() {  # $1=message
+  CCD_NOTE="$1" CCD_NOTE_FILE="$SWAP_NOTE" python3 - <<'PY' 2>/dev/null || true
+import json, os
+p = os.environ["CCD_NOTE_FILE"]
+tmp = p + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"message": os.environ["CCD_NOTE"]}, f, ensure_ascii=False)
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)
+PY
 }
 
 # Which account is a reading about? The reading says so when ccd took it; a
@@ -639,21 +681,23 @@ reading_account() {  # $1=what the reading itself said
 # writing its own refreshed blob back over ours — leaves that store holding the
 # credential we meant to leave, and waking into it only hits the same wall again.
 #
-# What is checked is whose credential is live, not which string it is. A plan is
-# not an account — two accounts on one plan agree about every plan field there is
-# — but neither is a token: twelve seconds is long enough for another session to
-# refresh the account we just installed, and calling that a failed swap leaves a
-# parked turn asleep for no reason. So: the pointer must name the target, there
-# must be a credential, and it must not be the one we just replaced. A rotation
-# passes; a restoration of the outgoing blob does not.
-swap_landed() {  # $1=account  $2=the credential installed  $3=the one it replaced
+# What is checked is whose credential is live. A plan is not an account — two
+# accounts on one plan agree about every plan field there is — and neither is
+# "something changed": a third account's token, or the outgoing account's next
+# rotation, both differ from what we replaced and neither is the target's.
+#
+# So the live credential must BE the target's: either the exact one this swap
+# installed, or the one the store now holds for that same account, which is what
+# a rotation ccd recorded looks like. Twelve seconds is long enough for one, and
+# calling that a failed swap leaves a parked turn asleep for nothing.
+swap_landed() {  # $1=account  $2=the credential the swap installed
   local ab
   [ -n "$2" ] || return 1
   ab=$(ccd_account_bin) || return 1
   # Pickup is 1-11s. Waking before it lands wastes the turn it was meant to save.
   [ "${SWAP_SETTLE:-0}" -gt 0 ] 2>/dev/null && sleep "$SWAP_SETTLE"
   "$ab" --no-color current --json 2>/dev/null \
-    | CCD_WANT="$1" CCD_CRED="$2" CCD_OLD="$3" python3 -c '
+    | CCD_WANT="$1" CCD_CRED="$2" python3 -c '
 import json, os, sys
 try:
     d = json.load(sys.stdin)
@@ -662,8 +706,9 @@ except Exception:
 if d.get("account") != os.environ["CCD_WANT"]:
     raise SystemExit(1)
 cred = (d.get("live") or {}).get("cred")
-old = os.environ.get("CCD_OLD") or ""
-raise SystemExit(0 if cred and cred != old else 1)
+stored = d.get("stored_cred") or ""
+want = os.environ.get("CCD_CRED") or ""
+raise SystemExit(0 if cred and (cred == want or cred == stored) else 1)
 ' 2>/dev/null
 }
 
@@ -683,8 +728,8 @@ if [ "$EVENT" = "StopFailure" ]; then
            # Prefer another subscription over paying. Only when every registered
            # account is spent (or none are registered) do we fall to OpenRouter.
            #
-           # The turn has already died, so unlike the path before the wall this one
-           # has to bring the session back. Claude Code never resumes a parked
+           # The turn has already died, so unlike the path before the wall this
+           # one has to bring the session back. Claude Code never resumes a parked
            # session by itself — every recovery in the transcripts was a human
            # typing — so we swap, confirm the credential landed, and exit 2. This
            # branch's JSON output is ignored, but the asyncRewake entry in
@@ -692,40 +737,36 @@ if [ "$EVENT" = "StopFailure" ]; then
            # "Stop hook blocking error" wording the user would otherwise read.
            # stderr is what carries the account's name into that wake.
            from=$(reading_account "$racct")
-           swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_PICK_BUDGET"); swap_rc=$?
-           IFS=$'\t' read -r account cred oldcred <<EOF
+           if swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_PICK_BUDGET"); then
+             IFS=$'\t' read -r account cred _rest <<EOF
 $swapped
 EOF
-           if [ "$swap_rc" -eq 0 ] && [ -n "$account" ]; then
-             # The swap happened: credentials, the pointer and the guard record
-             # have all moved. Whether it is safe to WAKE is a second question —
-             # but either way this session is now somebody else's, and paying for
-             # it on top would bill the user for a hop that has already been made.
-             if swap_landed "$account" "$cred" "$oldcred"; then
+             if swap_landed "$account" "$cred"; then
+               rm -f "$SWAP_NOTE" 2>/dev/null || true
                printf '%s\n' "[ccd] Your claude.ai usage limit was reached and ccd switched this session to $account, which has quota. Continue the task you were working on when the limit was reached; do not repeat work that is already complete." >&2
                exit 2
              fi
-             # Cannot prove the credential is live. Stand down rather than wake
-             # into a wall or spend money: the next tick re-reads everything and
-             # the user is exactly where the limit left them.
+             # The credential moved but cannot be proved live. Waking into that is
+             # a second 429; say so where the next prompt will read it.
+             swap_note "[ccd] The Claude quota ran out and ccd switched this session to $account, but could not confirm that account's credential went live. Nothing was billed. Carry on — \`ccd account list\` shows which account is active."
              exit 0
            fi
-           # Nowhere free to go — and ONLY that. A swap that could not act (the
-           # store moved under it, the lock stayed busy) is not evidence that every
-           # subscription is spent, and buying OpenRouter on it is the one mistake
-           # here that costs money.
-           [ "$swap_rc" -eq 1 ] || exit 0
-           # Paying is not ours to decide, and ending a session needs the launcher
-           # that will bring it back.
-           # Arm first, then signal: the launcher must find the file when the
-           # session exits. If the write fails, do NOT signal — ending a session
-           # whose handoff was never recorded leaves nothing to bring it back.
-           if paid_optin && handoff_ready; then
+           # No swap. Whether this session may move onto a paid backbone is a
+           # different question, and the answer has to be measured: every
+           # registered subscription freshly read and out of room. A failure to
+           # act is never that proof.
+           if paid_optin && handoff_ready && subscriptions_exhausted; then
+             # Arm first, then signal: the launcher must find the file when the
+             # session exits. If the write fails, do NOT signal — ending a session
+             # whose handoff was never recorded leaves nothing to bring it back.
              if write_handoff true to_fallback "$SESSION_ID" "$HOOK_CWD"; then
+               rm -f "$SWAP_NOTE" 2>/dev/null || true
                request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
              else
                rm -f "$HANDOFF" 2>/dev/null || true
              fi
+           elif has_accounts; then
+             swap_note "[ccd] The Claude quota ran out and ccd could not move this session to another subscription (${SWAP_REASON:-reason unknown}). Nothing was billed and nothing was ended. \`ccd account list\` shows what each spare looks like."
            fi
          fi ;;
     esac
@@ -888,7 +929,7 @@ if [ -n "${CCD_ACTIVE:-}" ]; then
     # The same transaction the subscription path takes: deciding and installing
     # here too must not straddle a token rotation, or the relaunch lands on a
     # credential the server has already retired.
-    esc=$(swap_to_spare none "$(reading_account "")" "$SWAP_PICK_BUDGET" --no-probe) \
+    esc=$(swap_to_spare none "$(reading_account "")" "$SWAP_TICK_BUDGET" --no-probe) \
       && esc=${esc%%	*} || esc=""
     if [ -n "$esc" ]; then
       if write_handoff true to_subscription "$SESSION_ID" "$HOOK_CWD"; then
@@ -1032,6 +1073,7 @@ if has_accounts; then
           && from=$(reading_account "$racct") \
           && swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe) \
           && moved=${swapped%%	*} && [ -n "$moved" ]; then
+         rm -f "$SWAP_NOTE" 2>/dev/null || true
          MOVED="$moved" EVENT="$EVENT" python3 -c '
 import json, os
 name = os.environ["MOVED"]
@@ -1051,6 +1093,36 @@ print(json.dumps({
          exit 0
        fi ;;
   esac
+fi
+
+# Deliver the backstop's note. A turn died, ccd could not move it, and the path
+# that learned why had no screen to say it on. Claiming by rename is the whole
+# "once" mechanism: exactly one of several concurrent prompts wins the file, and
+# the reason is gone as soon as it has been said.
+if [ "$EVENT" = "UserPromptSubmit" ] && [ -f "$SWAP_NOTE" ]; then
+  OUT=$(CCD_NOTE_FILE="$SWAP_NOTE" EVENT="$EVENT" python3 - <<'PY' 2>/dev/null
+import json, os
+p = os.environ["CCD_NOTE_FILE"]
+claim = f"{p}.said.{os.getpid()}"
+try:
+    os.rename(p, claim)                 # atomic: only one prompt can win it
+    msg = json.load(open(claim))["message"]
+except Exception:
+    raise SystemExit(0)
+finally:
+    try:
+        os.unlink(claim)
+    except OSError:
+        pass
+print(json.dumps({"hookSpecificOutput": {"hookEventName": os.environ["EVENT"],
+                                         "additionalContext": msg}},
+                 ensure_ascii=False))
+PY
+)
+  if [ -n "$OUT" ]; then
+    printf '%s\n' "$OUT"
+    exit 0
+  fi
 fi
 
 # Deliver keepalive's verdict. It runs backgrounded with its output discarded, so

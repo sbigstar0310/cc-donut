@@ -5529,12 +5529,16 @@ head_ "30. the swap is one transaction, under one lock"
 # the copy it read — a dead spare, handed to a session that has just run out.
 
 # ── The token that is installed is the token the store holds NOW ────────────
+# Held against the STORE lock, which is what every writer of a credential takes.
+# The swap takes no other lock: the single-flight one is for background passes,
+# and waiting on it was how a prompt tick ended up waiting on somebody else's
+# HTTP request.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
 sw_fixture 58 96
 # The background job's own single-flight lock, held while it rotates the spare —
 # exactly what `ccd-account keepalive` does behind REFRESH_LOCK.
-python3 - "$ADIR/.refresh.lock" "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY' &
+python3 - "$ADIR/.lock" "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY' &
 import fcntl, hashlib, json, os, sys, time
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -5803,16 +5807,17 @@ sw_prompt UserPromptSubmit sess-f7 >/dev/null
   || bad "solo spare" "went nowhere: $(cat "$ADIR/.active" 2>/dev/null)"
 
 # ── A rotation during the settle is not a failed swap ───────────────────────
-# Twelve seconds is long enough for another session to refresh the account we
-# just installed. Byte equality calls that a failure and leaves the parked turn
-# asleep; what has to be true is that the credential is the target's, not that it
-# is the same string.
+# Twelve seconds is long enough for ccd to refresh the account it just installed.
+# A rotation writes both halves — the live blob and the account's own file — so
+# the credential is still provably the target's, and byte equality would be the
+# only thing calling that a failure.
 sw_fixture 58 96
-( sleep 0.7; python3 - "$CREDS" <<'PY'
+( sleep 0.7; python3 - "$CREDS" "$ADIR/spare.json" <<'PY'
 import json, sys
-d = json.load(open(sys.argv[1]))
-d["claudeAiOauth"]["accessToken"] = "AT-spare-refreshed"
-json.dump(d, open(sys.argv[1], "w"))
+for path in sys.argv[1:3]:
+    d = json.load(open(path))
+    d["claudeAiOauth"]["accessToken"] = "AT-spare-refreshed"
+    json.dump(d, open(path, "w"))
 PY
 ) &
 ROT=$!
@@ -5859,6 +5864,251 @@ kill -9 "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
 [ "$waited" -le 5 ] \
   && ok "...and a prompt tick gives up on a busy background pass rather than blocking" \
   || bad "prompt wait" "the tick held the prompt for ${waited}s"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
+
+# ── Paying is proved, never inferred ────────────────────────────────────────
+# Every way a swap can fail that is not "there is measurably nowhere free to go"
+# used to end at the same fork, and one branch of that fork spends the user's
+# money. The paid arm asks its own question now, and only a fresh successful
+# measurement of every registered account can answer it yes.
+export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
+export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
+paid_optin_on
+# Its own key, so "nothing was armed" cannot pass for want of one.
+mkdir -p "$SWD/providers"
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$SWD/providers/keys.env"
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+# A spare nobody could measure: the row is an error, which is not evidence about
+# anything. The swap finds nowhere to go, and that is still not proof.
+sw_fixture 58 96
+stage_usage 5 5 500
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys, time
+q = json.load(open(sys.argv[1]))
+q["spare"] = {"status": "error", "checked_at": int(time.time())}
+json.dump(q, open(sys.argv[1], "w"))
+PY
+rc=$(sw_stopfail sess-p1)
+[ ! -f "$SWD/handoff-00000000000000000000000000000002.json" ] \
+  && ok "a spare that could not be measured never authorises the paid hop" \
+  || bad "paid proof" "armed $(hf_get direction) on an unmeasured spare"
+[ "$rc" != "2" ] \
+  && ok "...and nothing is woken into the wall it just hit" \
+  || bad "paid proof" "woke a session whose account is still spent"
+
+# The other side of the same rule: measured, fresh, and out of room IS proof.
+sw_fixture 58 96 99 99
+rc=$(sw_stopfail sess-p2)
+[ "$(hf_get direction)" = "to_fallback" ] \
+  && ok "...while every spare measured and spent does authorise it" \
+  || bad "paid proof" "refused a paid hop with proof in hand: $(hf_get direction)"
+hf_reset
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+paid_optin_off
+
+# ── Three attempts, then stop ───────────────────────────────────────────────
+# An operational failure is worth retrying briefly — a store that moved, a lock
+# someone else held — and worth nothing after that.
+mkdir -p "$FAKE/countroot/bin"
+cat > "$FAKE/countroot/bin/ccd-account" <<'CEOF'
+#!/bin/sh
+# Counts swap attempts and refuses each one the way an operational failure does;
+# everything else is the real tool.
+for a in "$@"; do
+  [ "$a" = swap ] && { echo x >> "$HOME/.swap-tries"; echo "could not act" >&2; exit 4; }
+done
+exec "$CCD_REAL_ACCOUNT" "$@"
+CEOF
+chmod +x "$FAKE/countroot/bin/ccd-account"
+export CCD_REAL_ACCOUNT="$ACCT"
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+rm -f "$FAKE/.swap-tries"
+SW_ROOT="$FAKE/countroot" sw_prompt UserPromptSubmit sess-r1 >/dev/null
+tries=$(grep -c . "$FAKE/.swap-tries" 2>/dev/null || echo 0)
+[ "${tries:-0}" -eq 3 ] \
+  && ok "an operational failure is retried three times and then let go" \
+  || bad "retries" "the swap was attempted ${tries:-0} times"
+
+# ── A failure the user hears about once, without a doomed wake ──────────────
+# The spare is spent as well, so the ticks that follow have nothing to swap to
+# and the note is the only thing they can have to say.
+sw_fixture 58 96 99 99
+rm -f "$SWD/swap-note" "$FAKE/.swap-tries"
+SW_ROOT="$FAKE/countroot" sw_stopfail sess-r2 >/dev/null
+[ -f "$SWD/swap-note" ] \
+  && ok "a backstop that could not swap leaves the reason behind" \
+  || bad "breadcrumb" "the turn died with nothing to say for it"
+note=$(SW_ROOT="$FAKE/countroot" sw_prompt UserPromptSubmit sess-r3)
+case "$note" in
+  *"Nothing was billed"*) ok "...and the next prompt says it once, naming the cost that was not paid" ;;
+  *) bad "breadcrumb" "got: $(printf '%s' "$note" | tr '\n' ' ' | head -c 160)" ;;
+esac
+again=$(SW_ROOT="$FAKE/countroot" sw_prompt UserPromptSubmit sess-r4)
+case "$again" in
+  *"Nothing was billed"*) bad "breadcrumb" "said it twice" ;;
+  *) ok "...and only once" ;;
+esac
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+unset CCD_REAL_ACCOUNT
+rm -f "$SWD/providers/keys.env"
+
+# ── No network under a lock ─────────────────────────────────────────────────
+# A rotation that holds the store lock across its token exchange stalls every
+# other writer for as long as the endpoint feels like taking, and a dribbling
+# response becomes a machine-wide freeze.
+sw_fixture 58 96
+stage_usage 5 5 200 2 AT-spare-rotated
+python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
+json.dump(d, open(sys.argv[1], "w"))
+q = json.load(open(sys.argv[2]))
+q["spare"]["checked_at"] = int(time.time()) - 99999
+json.dump(q, open(sys.argv[2], "w"))
+PY
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
+PICKPID=$!
+sleep 0.8
+python3 - "$ADIR/.lock" <<'PY' \
+  && ok "the store lock is free while a token exchange is in flight" \
+  || bad "lock under network" "a rotation held the store lock across its request"
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+deadline = time.time() + 1
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        raise SystemExit(0)
+    except OSError:
+        if time.time() >= deadline:
+            raise SystemExit(1)
+        time.sleep(0.05)
+PY
+wait "$PICKPID" 2>/dev/null
+
+# ── The confirmation proves ownership, not change ───────────────────────────
+# "different from what we replaced" is satisfied by a third account's token, by
+# the outgoing account's next rotation, by anything at all that moved.
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+# A token belonging to neither account: not the one the swap installs, not the
+# one it replaces. "Different from what we replaced" says yes to this.
+python3 - "$CREDS" "$FAKE/.creds-third" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["accessToken"] = "AT-interloper"
+json.dump(d, open(sys.argv[2], "w"))
+PY
+( sleep 0.7; cp "$FAKE/.creds-third" "$CREDS" ) &
+ROT=$!
+rc=$(SW_SETTLE=2 sw_stopfail sess-c1)
+wait "$ROT" 2>/dev/null
+[ "$rc" != "2" ] \
+  && ok "a credential that is nobody's in particular does not confirm a swap" \
+  || bad "confirmation" "woke on a token belonging to neither account"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
+# ── A probe never rotates the credential Claude Code is holding ─────────────
+# The live token belongs to the running session. An account can BECOME the live
+# one while a probe is mid-exchange, and finishing that rotation consumes a
+# one-time token the session is still carrying — with the replacement landing in
+# the account file and nowhere else.
+sw_fixture 58 96
+stage_usage 5 5 200 2 AT-spare-rotated
+python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
+json.dump(d, open(sys.argv[1], "w"))
+q = json.load(open(sys.argv[2]))
+q["spare"]["checked_at"] = int(time.time()) - 99999
+json.dump(q, open(sys.argv[2], "w"))
+PY
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
+PICKPID=$!
+sleep 0.5
+"$ACCT" --no-color use spare --force >/dev/null 2>&1    # it is the live one now
+wait "$PICKPID" 2>/dev/null
+tok() { python3 -c 'import json,sys;print(((json.load(open(sys.argv[1])).get("claudeAiOauth")) or {}).get("accessToken",""))' "$1"; }
+[ "$(tok "$CREDS")" = "$(tok "$ADIR/spare.json")" ] \
+  && ok "a probe leaves the signed-in account's credential to Claude Code" \
+  || bad "live rotation" "live $(tok "$CREDS") vs stored $(tok "$ADIR/spare.json")"
+
+# ── A decision installed only where it was still true ───────────────────────
+# Measuring takes time, and a person can run `ccd account use` inside it. The
+# check that the store has not moved belongs with the install, under the lock.
+sw_fixture3 58 96
+rm -f "$SWD/accounts-quota.json"
+stage_usage 5 5 200 2
+( sleep 0.7; "$ACCT" --no-color use spare2 --force >/dev/null 2>&1 ) &
+RACE=$!
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" \
+  --deadline 30 >/dev/null 2>&1
+wait "$RACE" 2>/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
+  && ok "a swap whose ground moved while it measured installs nothing" \
+  || bad "install cas" "overwrote a swap made while it was measuring: $(cat "$ADIR/.active" 2>/dev/null)"
+
+# ── A reading is labelled with the account it measured ──────────────────────
+sw_fixture 58 96
+stage_usage 5 5 200 2
+( CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color usage --json > "$FAKE/.usage-out" 2>/dev/null ) &
+USAGEPID=$!
+sleep 0.7
+"$ACCT" --no-color use spare --force >/dev/null 2>&1
+wait "$USAGEPID" 2>/dev/null
+python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if d.get("account") == "spent" else 1)' "$FAKE/.usage-out" \
+  && ok "a reading names the account whose credential it measured" \
+  || bad "reading label" "named $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("account"))' "$FAKE/.usage-out" 2>/dev/null)"
+
+# ── Partial information holds the exclusion ─────────────────────────────────
+# One window in common and one missing is not a reset; it is half an answer.
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture3 58 96
+sw_prompt UserPromptSubmit sess-w1 >/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
+  || bad "partial window" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys
+q = json.load(open(sys.argv[1]))
+q["spent"].pop("five_hour_reset", None)     # only half the windows can be named
+json.dump(q, open(sys.argv[1], "w"))
+PY
+quota 58 96
+sw_prompt UserPromptSubmit sess-w2 >/dev/null
+[ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
+  && ok "half a window is not a reset, and the exclusion holds" \
+  || bad "partial window" "released on partial information: $(cat "$ADIR/.active" 2>/dev/null)"
+
+# ── One budget, end to end, on the prompt path ──────────────────────────────
+sw_fixture 58 96
+python3 - "$ADIR/.lock" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(8)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+PY
+HOLD=$!
+sleep 0.3
+start=$(date +%s)
+sw_prompt UserPromptSubmit sess-b1 >/dev/null
+waited=$(( $(date +%s) - start ))
+kill -9 "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
+[ "$waited" -le 4 ] \
+  && ok "a prompt tick is bounded by its own budget, whoever holds the store lock" \
+  || bad "tick budget" "the tick held the prompt for ${waited}s"
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
 

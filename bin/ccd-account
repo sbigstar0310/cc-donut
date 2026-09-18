@@ -30,6 +30,7 @@ Commands:
   ccd account refresh [--all] [--inactive-only] [<name>]
   ccd account pick [--json]
   ccd account swap [--from N] [--window K] (internal: called by the hook)
+  ccd account exhausted          (internal: the only thing that may justify paying)
   ccd account keepalive          (internal: called by the hook, at most daily)
   ccd account current [--json]   (internal: statusline / doctor)
 """
@@ -877,44 +878,59 @@ def refresh_token_dead(oauth):
 def account_refresh(name, acct):
     """Refresh one stored account in place. Returns (ok, status_string).
 
+    The exchange happens OUTSIDE the lock and the write inside it. Holding the
+    store lock across a request stalls every other writer for as long as the
+    endpoint takes, and a response that dribbles freezes the machine; what the
+    lock is actually for is making the write atomic against the copy somebody
+    else is holding.
+
     Ordering matters: the rotated refresh token is written to disk BEFORE the new
     access token is used for anything. Crashing between the two costs one wasted
     access token; the reverse order costs the whole account."""
-    with Lock(LOCK_FILE):
-        return _refresh_locked(name, acct)
-
-
-def _refresh_locked(name, acct):
-    # Re-read under the lock. The caller's copy may be minutes old — a pick reads
-    # every account before it measures any — and rotating from it would write a
-    # stale base over whatever landed in between, losing that writer's change and
-    # sometimes the rotation before it.
-    fresh = account_load(name)
-    if fresh is None:
-        fresh = acct
-    oauth = fresh.get("claudeAiOauth") or {}
+    base = account_load(name) or acct
+    oauth = base.get("claudeAiOauth") or {}
     rt = oauth.get("refreshToken")
     if not rt:
         return False, "dead"
     if refresh_token_dead(oauth):
         return False, "dead"
+    # Never the account the running session is signed in as. That credential
+    # belongs to Claude Code: rotating it here consumes a one-time token it is
+    # still holding, and the replacement would land in this file only.
+    if active_name() == name:
+        return False, "stale"
+
     new_oauth, status = token_refresh(rt)
     if not new_oauth:
         return False, ("dead" if status in (400, 401, 403) else "error")
-    merged = dict(oauth)
-    merged.update(new_oauth)
-    # Anthropic does not echo refreshTokenExpiresAt; a successful rotation issues
-    # a fresh ~8.5-day window, so advance it ourselves. Without this the account
-    # would look dead to refresh_token_dead() forever after the original expiry.
-    merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
-    fresh["claudeAiOauth"] = merged
-    fresh["refreshed_at"] = now()
-    # Two different facts, and conflating them is what let six consecutive failures
-    # pass unreported. refreshed_at says the snapshot on disk is this fresh, which
-    # bank_live_oauth() and swap_to() can write truthfully after a copy. This says
-    # the token exchange itself worked, which only happens here.
-    fresh["refresh_ok_at"] = now()
-    account_save(name, fresh)
+
+    with Lock(LOCK_FILE):
+        # Compare and set. If the stored credential moved while we were on the
+        # wire — a bank of the live blob, a swap — that copy is at least as fresh
+        # as ours and was minted from a token we have now spent. Take theirs.
+        fresh = account_load(name) or base
+        if ((fresh.get("claudeAiOauth") or {}).get("refreshToken") != rt
+                or active_name() == name):
+            if fresh is not acct:
+                acct.clear()
+                acct.update(fresh)
+            return True, "ok"
+        merged = dict(fresh.get("claudeAiOauth") or {})
+        merged.update(new_oauth)
+        # Anthropic does not echo refreshTokenExpiresAt; a successful rotation
+        # issues a fresh ~8.5-day window, so advance it ourselves. Without this
+        # the account would look dead to refresh_token_dead() forever after the
+        # original expiry.
+        merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
+        fresh["claudeAiOauth"] = merged
+        fresh["refreshed_at"] = now()
+        # Two different facts, and conflating them is what let six consecutive
+        # failures pass unreported. refreshed_at says the snapshot on disk is this
+        # fresh, which bank_live_oauth() and swap_to() can write truthfully after
+        # a copy. This says the token exchange itself worked, which only happens
+        # here.
+        fresh["refresh_ok_at"] = now()
+        account_save(name, fresh)
     # The caller measures the credential it is holding, so hand it what was
     # actually stored rather than what it walked in with.
     if fresh is not acct:
@@ -1138,7 +1154,7 @@ def swap_guard_record(name, window):
 
 
 
-def swap_to(name, force=False):
+def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     """Replace only the claudeAiOauth subtree of the live blob.
 
     Called with a session live and mid-turn: the quota hook swaps in place (#57).
@@ -1155,7 +1171,7 @@ def swap_to(name, force=False):
     have been replaced by the time it is written — every refresh mints a new
     one-time token, so installing a snapshot hands the session a token the server
     has retired, which is a dead spare at the worst possible moment."""
-    with Lock(LOCK_FILE):
+    with Lock(LOCK_FILE, timeout=lock_timeout):
         target = account_load(name)
         if not target:
             die(f"no such account: {name}")
@@ -1496,63 +1512,93 @@ def cmd_use(args):
 
 
 def cmd_swap(args):
-    """Decide where to go and install it, as one transaction. Internal: the hook.
+    """Move this session to a spare. Internal: the quota hook.
 
-    The pick and the install used to be two processes with nothing held between
-    them. In that gap the background keepalive could rotate the chosen account's
-    one-time token, and the swap would then install the copy it had already read;
-    two sessions could also act on one reading and move the store twice. So the
-    whole decision runs under the lock the background job takes, every fact it
-    depends on is read after that lock is held, and `--from` is the caller's claim
-    about which account it measured — if the store has moved on since, this is a
-    decision about a situation that no longer exists.
+    Two phases and two outcomes. Measuring is network work, so it happens with no
+    lock held; installing is a write, so it happens under the store lock with the
+    caller's claim re-checked there — a person running `ccd account use` while we
+    measured must not have their swap overwritten by ours.
 
-    Prints `<account>TAB<installed credential>TAB<the credential it replaced>`.
-    Exit codes are the caller's fork in the road, and the fork costs money: 0
-    swapped, 1 nowhere free to go — the ONLY answer that may justify paying — and
-    4 could not act. An account store that does not exist is the one operational
-    answer that is also 1: nothing free can exist there."""
-    if not account_names():
-        return 1
+    Prints `<account>TAB<installed credential>TAB<the credential it replaced>` and
+    exits 0, or prints one line saying why not and exits non-zero. Nothing about
+    that reason is evidence of anything: whether the paid hop is allowed is a
+    separate question with its own measurements (cmd_exhausted)."""
+    names = account_names()
+    if not names:
+        return _swap_no("no accounts registered")
     deadline = time.time() + max(0.0, args.deadline)
-    while True:
-        try:
-            with Lock(REFRESH_LOCK, wait=False):
-                return _swap_locked(args, deadline)
-        except LockBusy:
-            # The background pass holds it. Wait inside the same budget the pick
-            # would have spent rather than give up — but the budget is the
-            # caller's: a prompt tick passes a short one, because a frozen prompt
-            # is worse than a swap one tick later.
-            if time.time() >= deadline:
-                return 4
-            time.sleep(0.25)
-        except Exception:
-            # Anything unexpected is "could not act". Letting it escape as exit 1
-            # would tell the hook that every subscription is spent, which is the
-            # one sentence here that authorises spending money.
-            return 4
-
-
-def _swap_locked(args, deadline):
-    cur = active_name()
-    # No name for the signed-in login is a supported install, not a refusal: with
-    # one account registered, that account IS the spare (#41). There is simply
-    # nothing to compare the caller's claim against, and nothing to record.
-    if args.from_account and cur and args.from_account != cur:
-        return 4                    # the store moved while this was being decided
-    a, _ = best_target(
-        no_probe=args.no_probe, deadline=deadline,
-        exclude={n: w for n, (_when, w) in swap_guard_read().items()})
-    if a is None:
-        return 1
     try:
-        _, installed, replaced = swap_to(a["name"], force=True)
+        a, why = best_target(
+            no_probe=args.no_probe, deadline=deadline,
+            exclude={n: w for n, (_when, w) in swap_guard_read().items()})
+        if a is None:
+            return _swap_no(why)
+        # One acquisition for the whole install: the claim, the credential and the
+        # record are one change or none of them.
+        left = max(0.5, deadline - time.time())
+        with Lock(LOCK_FILE, timeout=left):
+            cur = active_name()
+            # No name for the signed-in login is a supported install, not a
+            # refusal: with one account registered, that account IS the spare
+            # (#41). There is simply nothing to compare the claim against.
+            if args.from_account and cur and args.from_account != cur:
+                return _swap_no("the store moved while this was being decided")
+            _, installed, replaced = swap_to(a["name"], force=True,
+                                             lock_timeout=left)
+            if cur:
+                swap_guard_record(cur, args.window)
     except SystemExit:
-        return 4
-    if cur:
-        swap_guard_record(cur, args.window)
+        # die(): the store lock stayed busy for the whole budget, or the account
+        # lost its credential between the measurement and the install.
+        return _swap_no("could not install the credential")
+    except Exception as e:
+        return _swap_no(f"{type(e).__name__}")
     print(f"{a['name']}\t{installed}\t{replaced}")
+    return 0
+
+
+def _swap_no(reason):
+    """One line, on stderr, for the caller's breadcrumb. Exit 4 for everything:
+    the only question worth asking after a failed swap is whether every
+    subscription is measurably spent, and no exit code can answer that."""
+    print(reason, file=sys.stderr)
+    return 4
+
+
+def cmd_exhausted(args):
+    """Is there measurably nowhere free to go? Internal: the quota hook.
+
+    The one question that may authorise spending money, so it is answered from
+    measurements and nothing else. Every registered account other than the one
+    this session is on must have a fresh, successful reading, and every one of
+    them must be out of room. A stale row, a failed probe, an unreadable account
+    — none of those are evidence of exhaustion, and each one is a no.
+
+    The account we are on is not measured here: that it is spent is what the
+    caller's own reading and the rate_limit error already established."""
+    cur = active_name()
+    others = [n for n in account_names() if n != cur]
+    if not others:
+        return 0            # nothing free can exist; the paid hop is all there is
+    deadline = time.time() + max(0.0, args.deadline)
+    global NET_DEADLINE
+    outer, NET_DEADLINE = NET_DEADLINE, deadline
+    try:
+        cache = quota_cache()
+        for name in others:
+            acct = account_load(name)
+            if not acct:
+                return 1
+            rec, cache = quota_for(name, acct, cache=cache)
+            if rec.get("status") != "ok":
+                return 1    # not a measurement, so not proof
+            if has_headroom(rec):
+                return 1    # somewhere free to go: paying would be a mistake
+        quota_cache_save(cache)
+    except Exception:
+        return 1
+    finally:
+        NET_DEADLINE = outer
     return 0
 
 
@@ -1616,7 +1662,16 @@ def _guard_holds(name, rec, exclude):
     if not recorded or recorded == "none":
         return True
     theirs = _window_key(rec)
-    return not theirs or theirs == recorded
+    if not theirs:
+        return True
+    # Same windows, or nothing to compare. Half an answer — one window named
+    # where the record names two — cannot say a reset happened, and guessing
+    # that it did is how a loop guard stops guarding.
+    mine = dict(p.split("=", 1) for p in recorded.split(";") if "=" in p)
+    yours = dict(p.split("=", 1) for p in theirs.split(";") if "=" in p)
+    if set(mine) != set(yours):
+        return True
+    return mine == yours
 
 
 def best_target(no_probe=False, exclude=None, deadline=None):
@@ -1912,6 +1967,9 @@ def cmd_usage(args):
     blob, _ = live_read()
     oauth = blob.get("claudeAiOauth") or {}
     token = oauth.get("accessToken") or ""
+    # Whose credential this is, asked BEFORE the measurement. Asked after, a swap
+    # landing mid-request would put somebody else's name on these numbers.
+    measured = active_name()
     claude = {"available": False, "error": True}
     rc = 1
     if token and not token_expired(oauth):
@@ -1936,7 +1994,7 @@ def cmd_usage(args):
         # Whose reading this is. A decision taken on it is only about that
         # account, and between taking one and acting on it another session can
         # swap — at which point the numbers describe somebody else entirely.
-        print(json.dumps({"claude": claude, "account": active_name()},
+        print(json.dumps({"claude": claude, "account": measured},
                          ensure_ascii=False))
     else:
         parts = [
@@ -1966,6 +2024,10 @@ def cmd_current(args):
         "subscription_type": (acct or {}).get("subscription_type"),
         "registered": total,
         "live": {"cred": _cred_fingerprint({"claudeAiOauth": live_oauth})},
+        # What the store holds for that same account. A confirmation needs both:
+        # the credential it installed, and the one a rotation ccd recorded since
+        # — anything else live is nobody's in particular.
+        "stored_cred": _cred_fingerprint(acct),
     }
     if args.json:
         print(json.dumps(info, ensure_ascii=False))
@@ -2029,6 +2091,12 @@ def main(argv):
     a.add_argument("--deadline", type=float, default=60.0,
                    help="seconds this decision may spend, lock wait included")
     a.set_defaults(fn=cmd_swap)
+
+    a = sub.add_parser("exhausted",
+                       help="is there measurably nowhere free to go? (internal)")
+    a.add_argument("--deadline", type=float, default=20.0,
+                   help="seconds this question may spend measuring")
+    a.set_defaults(fn=cmd_exhausted)
 
     a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
     a.add_argument("--force", action="store_true")
