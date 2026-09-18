@@ -693,30 +693,6 @@ if not spares:
     tail = ""           # nothing to hand off to; the row is just who is answering
 
 
-# ── Is a launcher supervising THIS session? ──────────────────────────────────
-# The contract the hook checks before it signals (launcher_present,
-# scripts/quota-guard.sh): 32 lowercase hex whose state path is the one that token
-# implies. Anything weaker calls a session supervised that the hook will refuse,
-# which is the silence this row exists to end — #21 sat inert for four days while
-# every surface except `ccd doctor` reported success, and doctor is the command
-# nobody runs BEFORE the thing they installed fails to happen.
-#
-# ONE message, not a remedy: whether a restart or a `ccd setup` is the fix turns on
-# facts this path cannot establish without spawning a process, and confident wrong
-# advice is worse than none.
-# ...and only where a launcher is part of the answer. The hop between
-# subscriptions happens inside the session, so an install that never opted into
-# the paid hop needs no launcher at all, and saying "not supervised" there marks a
-# correct, complete install as broken. The opt-in is the condition; #56 owns
-# whether the wording and the remedy are the right ones.
-tok = os.environ.get("CCD_HANDOFF", "")
-supervised = bool(re.fullmatch(r"[0-9a-f]{32}", tok)) and os.environ.get(
-    "CCD_HANDOFF_STATE") == os.path.join(os.environ.get("CCD_DIR", ""), f"handoff-{tok}.json")
-paid_hop = os.path.exists(os.path.join(os.environ.get("CCD_DIR", ""), "paid-handoff"))
-if spares and paid_hop and not supervised:
-    head += f" {Y}(not supervised){RS}"
-
-
 # ── The escape hatch, above the threshold ────────────────────────────────────
 # The loudest thing on the screen has to be the best qualified. Three gates, the
 # same three the arming path applies before it ends a session (quota_peak in

@@ -60,8 +60,10 @@ session:
 !ccd account use          # or: ccd account use B, from a terminal
 ```
 
-The second rung — OpenRouter — is the one that relaunches, and the one that needs
-`ccd setup --auto`.
+The second rung — OpenRouter — is never automatic. ccd will not put a
+conversation on a metered backbone for you: when no spare can be reached it stops,
+says so, and leaves `ccd -c` to you. What `ccd setup --auto` installs is the way
+BACK from such a run.
 
 **The one thing that can quietly rot:** a registered account you never use. Its
 refresh token lasts about 8.5 days. ccd refreshes idle accounts once a day to keep
@@ -196,25 +198,24 @@ nothing installed. If you would rather not type any of it:
 ccd setup --auto
 ```
 
-Keep starting sessions as `claude`. When every subscription is spent the
-conversation reopens on OpenRouter by itself, and when the window resets it
-returns to the subscription the same way. Turn it off with `ccd setup --no-auto`.
+Keep starting sessions as `claude`. A `ccd -c` run started under that launcher
+returns to your subscription by itself once a spare has room or the window resets.
+Turn it off with `ccd setup --no-auto`.
 
-This is the paid hop only. Moving to another registered subscription is automatic
-with nothing installed: it happens inside the session, so there is no launcher in
-that path at all.
+Going TO OpenRouter stays yours to type. Moving to another registered subscription
+is automatic with nothing installed: it happens inside the session, so there is no
+launcher in that path at all.
 
 It is deliberately conservative, and each rule exists so a failure leaves you no
 worse off than doing nothing:
 
 - A `rate_limit` error alone never triggers it — the quota reading has to agree,
   so transient throttling is ignored. No reading, no handoff.
-- No session is ever ended unless the launcher is running to catch it and an
-  OpenRouter key is stored. Ending a session with nowhere to go would be worse
-  than leaving it alone. (The hop between subscriptions ends nothing, so neither
-  applies to it.)
-- The turn that failed is not retried on the paid hop. Re-send that prompt after
-  the switch; the free hop wakes it for you instead.
+- No session is ever ended unless the launcher is running to catch it. Ending a
+  session with nowhere to go would be worse than leaving it alone. (The hop
+  between subscriptions ends nothing, so this does not apply to it.)
+- Nothing ccd does can put you on a metered backbone. When it cannot reach a
+  spare it stops and leaves one line saying so, naming `ccd -c` if you want it.
 - If anything is missing — plugin, key, launcher — you land in the ordinary
   manual flow above, not in a broken state.
 

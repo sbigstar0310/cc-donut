@@ -5,6 +5,13 @@
 >
 > 구현하면서 설계에서 바뀐 지점은 §13에 정리했다.
 >
+> **2026-09-18 (#57) 2차 개정.** 이 브랜치는 **유료 백본으로 자동으로 넘어가지 않는다.**
+> 갈 수 있는 예비 구독이 없으면 ccd 는 멈추고 한 줄 남긴다 (`swap-note`); OpenRouter 로
+> 가는 것은 사용자가 `ccd -c` 로 직접 친다. 그래서 `to_fallback` 방향, `paid-handoff`
+> 옵트인 파일, `handoff_ready()`/`have_key()`, `ccd account exhausted` 는 전부 없어졌다.
+> 런처에 남은 것은 **OpenRouter 에서 구독으로 돌아오는 길** 하나뿐이고, `ccd setup --auto`
+> 가 사는 것도 그것이다.
+>
 > **2026-09-17 (#57) 개정.** 계정 간 스왑은 이제 **세션 안에서** 일어난다. 세션을
 > 끝내고 relaunch 하던 `to_account` 방향과, 그걸 위해 있던 계정 사다리 / 방문 집합
 > export 는 전부 제거됐다. 런처(`ccd-handoff`)에 남은 것은 유료 OpenRouter 홉과 거기서
@@ -46,7 +53,7 @@
 3. claude 가 SessionEnd 훅 실행 후 **129** 로 종료
 4. 런처가 상태 파일을 읽고 `direction` 에 따라 반대편 백본에서 `--resume <sid>` 로 재기동
 
-`direction` 은 `to_fallback` | `to_subscription` 두 값뿐이다. 0.4.0 설계는 여기에 세 번째 값(`to_account`)을 더했지만, #57 에서 다시 두 값으로 돌아왔다 — 계정 간 이동은 세션을 끝내지 않으므로 방향이 필요 없다. 인터록, hop 카운터, transcript 존재 검사, headless 거부, 복원 실패 시 새 세션 폴백은 전부 그대로다.
+`direction` 은 `to_subscription` 하나뿐이다 (2차 개정 전에는 `to_fallback` 도 있었다). 0.4.0 설계는 여기에 세 번째 값(`to_account`)을 더했지만, #57 에서 다시 두 값으로 돌아왔다 — 계정 간 이동은 세션을 끝내지 않으므로 방향이 필요 없다. 인터록, hop 카운터, transcript 존재 검사, headless 거부, 복원 실패 시 새 세션 폴백은 전부 그대로다.
 
 ## 3. 검증된 사실
 
@@ -178,7 +185,7 @@ User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 {
   "armed": true,
   "token": "<32 hex>",
-  "direction": "to_fallback",       // to_fallback | to_subscription
+  "direction": "to_subscription",   // 남은 유일한 방향
   "session_id": "…",
   "cwd": "…",
   "armed_at": 1755300000
@@ -333,12 +340,12 @@ refresh token 8.5일 만료 때문에, 등록만 해두고 안 쓰는 계정은 
 
 | 상황 | 동작 |
 |---|---|
-| 다른 계정 전부 소진 | `to_fallback` — 기존 OpenRouter 경로. 현행과 동일 |
-| 등록된 계정 없음 | `to_fallback`. 기능 도입 전과 완전히 동일하게 동작 |
-| 후보 계정 refresh 실패 | `status=dead`, 후보에서 제외, 다음 후보로. 전부 실패하면 `to_fallback` |
+| 다른 계정 전부 소진 | 멈추고 `swap-note` 에 이유를 남긴다. 자동으로 유료 백본에 가지 않는다 |
+| 등록된 계정 없음 | 아무것도 하지 않는다 (남길 노트도 없다) |
+| 후보 계정 refresh 실패 | `status=dead`, 후보에서 제외, 다음 후보로. 전부 실패하면 멈춘다 |
 | 쿼타 조회 네트워크 오류 | `status=error`, 제외. **낙관적 스왑을 하지 않는다** — 읽히지 않는 값은 절대 "여유 있음" 이 아니다 (기존 `quota_peak` 의 원칙과 동일) |
 | 스왑 도중 크래시 | `.lock` + atomic write 로 blob 은 항상 온전. `.active` 가 어긋나면 다음 실행 시 live blob 과 대조해 복구 |
-| 유료 홉 후 relaunch 가 즉시 실패 | 기존 로직 재사용: 15초 내 비정상 종료면 새 세션으로 이어가고 `--resume <sid>` 안내 |
+| 복귀 relaunch 가 즉시 실패 | 기존 로직 재사용: 15초 내 비정상 종료면 새 세션으로 이어가고 `--resume <sid>` 안내 |
 | 다른 터미널에 세션 존재 | 안내 후 진행. 그 세션도 다음 refresh 때 새 계정으로 옮겨가며, **재시작할 필요는 없다** (§6.1) |
 | 무한 전환 루프 | §5.2. 계정 간 이동은 relaunch 를 하지 않으므로 루프 대상이 아니고, `(계정, 리셋 창)` 당 한 번으로 따로 제한된다 |
 | OpenRouter 키 없음 + 다른 계정 있음 | **전환은 가능해야 한다.** 계정 간 스왑 경로에는 키 검사가 아예 없고, `launcher_ready()` 도 키를 요구하지 않는다 (§10) |
@@ -394,7 +401,7 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 
 - `handoff_ready()` 를 `launcher_ready()` / `handoff_ready()` 로 분리. 전자는 `have_key()` 를 요구하지 않는다 — OpenRouter 에서 **돌아오는** 길에는 키가 필요 없다 (§8 마지막 행)
 - 프롬프트·툴 틱: `peak >= ARM_THRESHOLD` 이고 여유 있는 계정이 있으면 **그 자리에서** `ccd-account use <name> --force` (#57 전에는 `StopFailure` 에서 `to_account` 로 무장했다)
-- `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 갈 계정이 없을 때만 `to_fallback`
+- `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 갈 계정이 없으면 멈추고 `swap-note` 를 남긴다 (깨우지 않는다 — 같은 벽에 다시 부딪힌다)
 - keep-alive: 하루 1회 `ccd-account refresh --all --inactive-only` 를 백그라운드로
 - `SessionEnd` 안내 문구는 `to_fallback` / `to_subscription` 두 가지
 

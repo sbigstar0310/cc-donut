@@ -243,10 +243,11 @@ relaunch 도 없다 (#57).
 
 ---
 
-## Stage 7b — 유료 홉 (OpenRouter) end-to-end (선택)
+## Stage 7b — OpenRouter 에서 자동 복귀 end-to-end (선택)
 
-런처가 세션을 끝내고 → OpenRouter 로 relaunch 하고 → **같은 대화를 복원**하는 과정.
-`ccd setup --auto` 로 설치되는 런처와 OpenRouter 키가 있어야 한다.
+`ccd -c` 로 옮겨간 세션이 → 런처에 의해 종료되고 → **구독에서 같은 대화를 복원**하는
+과정. `ccd setup --auto` 로 설치되는 런처가 있어야 한다. 반대 방향(구독 → OpenRouter)은
+자동으로 일어나지 않는다 — 그건 사용자가 `ccd -c` 로 직접 친다.
 
 터미널 하나만 쓴다. 신호는 **세션이 자기 자신에게** 보내므로 다른 프로세스를 맞힐
 길이 없다 — Claude Code 가 `CLAUDE_PID` 를 자식에게 내려주기 때문이다.
@@ -264,7 +265,7 @@ Claude Code가 뜨면 **아무 대화나 한 번 주고받는다** (복원할 �
 들어오므로 따로 옮겨 적을 필요가 없다:
 
 ```
-!python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_fallback','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$CLAUDE_CODE_SESSION_ID" && ps -p $CLAUDE_PID -o pid=,comm= && kill -HUP $CLAUDE_PID
+!python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_subscription','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$CLAUDE_CODE_SESSION_ID" && ps -p $CLAUDE_PID -o pid=,comm= && kill -HUP $CLAUDE_PID
 ```
 
 `ps` 가 `<pid> claude` 한 줄만 찍고 나서 신호가 간다. 다른 창은 건드릴 수 없다.
@@ -310,7 +311,7 @@ Claude Code가 뜨면 **아무 대화나 한 번 주고받는다** (복원할 �
 SID=<터미널1의 session id>
 PID=<터미널1에서 확인한 CLAUDE_PID>
 
-python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_fallback','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$SID"
+python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_subscription','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$SID"
 
 # 보내기 전에 확인 — comm 이 정확히 'claude' 인 프로세스 하나여야 한다
 ps -p "$PID" -o pid=,tty=,comm=
@@ -331,12 +332,12 @@ ps -t "$TTY1" -o pid=,comm= | awk '$2=="claude"{print $1}'
 터미널 1에서 기대하는 동작:
 
 ```
-[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다
+[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다
 
-▶ 🍩 Claude 쿼타 소진 — 같은 대화를 OpenRouter에서 이어갑니다 (유료)
+▶ ✓ 구독으로 돌아왔습니다 — 같은 대화를 이어갑니다 (OpenRouter 과금 종료)
 ```
 
-그리고 **직전 대화가 그대로 복원된 채** 새 세션이 OpenRouter 위에서 뜬다.
+그리고 **직전 대화가 그대로 복원된 채** 새 세션이 구독 위에서 뜬다.
 
 터미널 1 이 통째로 죽으면 런처도 같이 끌려가므로 relaunch 는 **일어나지 않는다.** 그때는
 상태 파일만 남으니 지우고 다시 하면 된다.

@@ -38,15 +38,16 @@ session, so a plain `ccd setup` shadows nothing and edits no startup file. There
 is no PATH line to relay and no restart to ask for. If the user has a second
 subscription, `ccd account add` is the rest of that setup — not a flag here.
 
-`--auto` is a separate question and the only one that installs a launcher: it
-grants consent for the paid OpenRouter hop when every subscription is spent. Never
-reach for it unprompted, and never as a remedy for something else.
+`--auto` is a separate question and the only one that installs a launcher. It
+does not authorise any spending — nothing in ccd moves a session onto OpenRouter
+— it installs the way BACK from a `ccd -c` run. Never reach for it unprompted, and
+never as a remedy for something else.
 
 ## A non-zero exit is not always a dead end
 
 `ccd setup --auto` exits non-zero when it finished everything else but could not
-put that launcher on PATH, so the paid hop is installed and inert. Its last line
-says so. Relay it verbatim, including the remedy it names — but it is not a reason
+put that launcher on PATH, so the automatic return is installed and inert. Its
+last line says so. Relay it verbatim, including the remedy it names — but it is not a reason
 to abandon the rest of this skill: the statusline, hooks and `ccd` command are all
 already wired by that point, and the subscription hop is unaffected. Carry on with
 the key and `ccd doctor` steps above; stop only when setup failed before doing any

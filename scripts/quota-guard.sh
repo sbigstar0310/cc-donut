@@ -416,9 +416,9 @@ p = os.environ["CCD_HF"]
 state = {
     "armed": os.environ["CCD_ARMED"] == "true",
     "token": os.environ.get("CCD_TOKEN", ""),
-    # to_fallback | to_subscription — the paid hop and the way back from it.
-    # Which account the way back lands on is whatever the live store holds by
-    # then, so nothing here has to name one.
+    # to_subscription — the way back from OpenRouter, and the only direction
+    # left. Which account it lands on is whatever the live store holds by then,
+    # so nothing here has to name one.
     "direction": os.environ["CCD_DIR_TO"],
     "session_id": os.environ["CCD_SID"],
     "cwd": os.environ["CCD_CWD"],
@@ -532,59 +532,17 @@ request_handoff() {
   kill -HUP "$pid" 2>/dev/null || return 1
 }
 
-# Is a usable OpenRouter key configured? Deliberately strict: a key that ccd will
-# later reject is the same as no key, and signalling on one would end the session
-# with nowhere to go. Mirrors the parser `ccd setup` uses to report readiness.
-have_key() {
-  # An exported key gets the same scrutiny as the file: a whitespace-only value
-  # is not a key, and accepting one would end a session with nowhere to go.
-  case "${OPENROUTER_API_KEY:-}" in
-    '') : ;;
-    *[![:space:]]*) return 0 ;;
-    *) : ;;
-  esac
-  [ -f "$CCD_DIR/providers/keys.env" ] || return 1
-  python3 - "$CCD_DIR/providers/keys.env" 2>/dev/null <<'PY'
-import re, sys
-try:
-    s = open(sys.argv[1]).read()
-except Exception:
-    raise SystemExit(1)
-for line in s.splitlines():
-    line = line.strip()
-    if line.startswith("#"):
-        continue
-    m = re.match(r'^(?:export\s+)?OPENROUTER_API_KEY=(.*)$', line)
-    if not m:
-        continue
-    v = m.group(1).strip().strip('"').strip("'").strip()
-    if v:
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-# May quota exhaustion move this session onto the paid backbone unattended?
-# Separate from have_key on purpose: a key says OpenRouter is REACHABLE, this says
-# the user agreed it may be USED. Written by `ccd setup --auto`.
-paid_optin() { [ -f "$CCD_DIR/paid-handoff" ]; }
-
 # Everything that must hold before a session may be ended. Checked BEFORE arming,
 # not after: an armed file left behind by an unsupervised or unready session
 # would be consumed by a later launcher and resume the wrong conversation.
 #
-# Split by destination, because the readiness conditions genuinely differ. Coming
-# BACK from OpenRouter needs a launcher but no key — requiring one would strand a
-# session on the paid backbone because of a credential it is about to stop using.
+# One destination is left for it: the return from OpenRouter, which needs a
+# launcher to relaunch through and no key at all — the credential it is about to
+# stop using is the one the key buys.
 launcher_ready() {
   launcher_present || return 1
   valid_session_id "$SESSION_ID" || return 1
   claude_pid >/dev/null || return 1
-}
-
-handoff_ready() {
-  launcher_ready || return 1
-  have_key || return 1
 }
 
 # Is the multi-account feature in use at all? This hook fires on every prompt AND
@@ -609,12 +567,17 @@ has_accounts() {
 # There are two outcomes and they are not a fork in the road. Either this prints
 # `<account>TAB<installed credential>TAB<the credential it replaced>`, or it
 # prints nothing and leaves the reason in $SWAP_REASON. Nothing about that reason
-# is evidence of exhaustion — whether the paid hop is allowed is asked separately,
-# of the measurements themselves (subscriptions_exhausted).
+# is evidence of anything: there is no second road to take on it. A session that
+# cannot be moved to a spare stays where it is, and says so.
+# Both answers come back in variables. Reading the line off stdout means calling
+# this inside `$( )`, and a subshell cannot hand the reason back — every note then
+# says "reason unknown", which is the one thing a note must never say.
+SWAP_RESULT=""
 SWAP_REASON=""
 swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=budget
   local wkey="$1" from="$2" budget="$3" ab out i end left
   shift 3
+  SWAP_RESULT=""
   SWAP_REASON=""
   if ! ab=$(ccd_account_bin); then
     SWAP_REASON="ccd-account is missing from this install"
@@ -629,7 +592,7 @@ swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=bud
     [ "$left" -gt 0 ] || break
     if out=$("$ab" --no-color swap --from "$from" --window "$wkey" \
                    --deadline "$left" "$@" 2>&1) && [ -n "$out" ]; then
-      printf '%s' "$out"
+      SWAP_RESULT="$out"
       return 0
     fi
     SWAP_REASON=$(printf '%s' "$out" | tr '\n' ' ' | head -c 120)
@@ -638,26 +601,15 @@ swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=bud
   return 1
 }
 
-# The only question that may authorise spending money. It is answered by
-# measuring, never by what some other path failed to do: every registered account
-# other than this one has to have a fresh, successful reading, and every one of
-# them has to be out of room.
-subscriptions_exhausted() {
-  local ab
-  has_accounts || return 0
-  ab=$(ccd_account_bin) || return 1
-  "$ab" --no-color exhausted --deadline "$SWAP_PICK_BUDGET" >/dev/null 2>&1
-}
-
 # Leave one line where the next prompt will find it. A backstop that could not
 # move the session must not wake it — the account is still spent, and the woken
 # turn would walk into the same wall — but the user is owed the reason, once.
 swap_note() {  # $1=message
   CCD_NOTE="$1" CCD_NOTE_FILE="$SWAP_NOTE" python3 - <<'PY' 2>/dev/null || true
-import json, os
+import json, os, tempfile
 p = os.environ["CCD_NOTE_FILE"]
-tmp = p + ".tmp"
-with open(tmp, "w") as f:
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".swap-note.")
+with os.fdopen(fd, "w") as f:
     json.dump({"message": os.environ["CCD_NOTE"]}, f, ensure_ascii=False)
 os.chmod(tmp, 0o600)
 os.replace(tmp, p)
@@ -737,9 +689,9 @@ if [ "$EVENT" = "StopFailure" ]; then
            # "Stop hook blocking error" wording the user would otherwise read.
            # stderr is what carries the account's name into that wake.
            from=$(reading_account "$racct")
-           if swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_PICK_BUDGET"); then
+           if swap_to_spare "$wkey" "$from" "$SWAP_PICK_BUDGET"; then
              IFS=$'\t' read -r account cred _rest <<EOF
-$swapped
+$SWAP_RESULT
 EOF
              if swap_landed "$account" "$cred"; then
                rm -f "$SWAP_NOTE" 2>/dev/null || true
@@ -751,23 +703,13 @@ EOF
              swap_note "[ccd] The Claude quota ran out and ccd switched this session to $account, but could not confirm that account's credential went live. Nothing was billed. Carry on — \`ccd account list\` shows which account is active."
              exit 0
            fi
-           # No swap. Whether this session may move onto a paid backbone is a
-           # different question, and the answer has to be measured: every
-           # registered subscription freshly read and out of room. A failure to
-           # act is never that proof.
-           if paid_optin && handoff_ready && subscriptions_exhausted; then
-             # Arm first, then signal: the launcher must find the file when the
-             # session exits. If the write fails, do NOT signal — ending a session
-             # whose handoff was never recorded leaves nothing to bring it back.
-             if write_handoff true to_fallback "$SESSION_ID" "$HOOK_CWD"; then
-               rm -f "$SWAP_NOTE" 2>/dev/null || true
-               request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
-             else
-               rm -f "$HANDOFF" 2>/dev/null || true
-             fi
-           elif has_accounts; then
-             swap_note "[ccd] The Claude quota ran out and ccd could not move this session to another subscription (${SWAP_REASON:-reason unknown}). Nothing was billed and nothing was ended. \`ccd account list\` shows what each spare looks like."
-           fi
+           # No swap, and no second road. Moving a conversation onto a metered
+           # backbone is the user's own call, typed by the user — so ccd stops
+           # here and leaves the reason where the next prompt will say it. Only
+           # where a spare could have been the answer: with nothing registered
+           # there was never anything to move to, and a note every time the quota
+           # runs out is noise.
+           has_accounts && swap_note "[ccd] The Claude quota ran out and ccd could not move this session to another subscription (${SWAP_REASON:-reason unknown}). Nothing was billed and nothing was ended. \`ccd account list\` shows what each spare looks like, and \`ccd -c\` moves this conversation onto OpenRouter at your own cost if you want it."
          fi ;;
     esac
   fi
@@ -786,10 +728,7 @@ except Exception:
     raise SystemExit(0)
 if not s.get("armed"):
     raise SystemExit(0)
-if s.get("direction") == "to_fallback":
-    msg = "[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다"
-else:
-    msg = "[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다"
+msg = "[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다"
 print(json.dumps({"systemMessage": msg}, ensure_ascii=False))
 PY
   fi
@@ -929,8 +868,11 @@ if [ -n "${CCD_ACTIVE:-}" ]; then
     # The same transaction the subscription path takes: deciding and installing
     # here too must not straddle a token rotation, or the relaunch lands on a
     # credential the server has already retired.
-    esc=$(swap_to_spare none "$(reading_account "")" "$SWAP_TICK_BUDGET" --no-probe) \
-      && esc=${esc%%	*} || esc=""
+    if swap_to_spare none "$(reading_account "")" "$SWAP_TICK_BUDGET" --no-probe; then
+      esc=${SWAP_RESULT%%	*}
+    else
+      esc=""
+    fi
     if [ -n "$esc" ]; then
       if write_handoff true to_subscription "$SESSION_ID" "$HOOK_CWD"; then
         ESC="$esc" EVENT="$EVENT" python3 -c '
@@ -959,7 +901,7 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": os.environ["EVENT"],
   # Auto return needs the same readiness as the outbound trip: a supervising
   # launcher, a valid session id, a usable key, and a resolvable claude process.
   auto_ready=""
-  handoff_ready && auto_ready=1
+  launcher_ready && auto_ready=1
   SIGNAL_FLAG="$CCD_DIR/.handoff-signal.$$"
   rm -f "$SIGNAL_FLAG"
   OUT=$(CCD_STATE="$RUN_STATE" EVENT="$EVENT" CCD_SIGNAL_FLAG="$SIGNAL_FLAG" \
@@ -1071,8 +1013,8 @@ if has_accounts; then
     ''|*[!0-9]*) : ;;
     *) if [ "$peak" -ge "$ARM_THRESHOLD" ] \
           && from=$(reading_account "$racct") \
-          && swapped=$(swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe) \
-          && moved=${swapped%%	*} && [ -n "$moved" ]; then
+          && swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe \
+          && moved=${SWAP_RESULT%%	*} && [ -n "$moved" ]; then
          rm -f "$SWAP_NOTE" 2>/dev/null || true
          MOVED="$moved" EVENT="$EVENT" python3 -c '
 import json, os

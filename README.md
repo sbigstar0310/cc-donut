@@ -123,19 +123,19 @@ Your MCP logins (Notion, Slack) are unaffected by a swap. Tokens live in
 </details>
 
 <details>
-<summary><b>The paid hop: OpenRouter, with no commands at all</b></summary>
+<summary><b>Coming back from OpenRouter by itself</b></summary>
 
-The hop between your own subscriptions is not in here — it needs nothing
-installed. This section is only about the last resort, when every subscription is
-spent and the session has to move onto OpenRouter and back.
+ccd never moves a conversation onto OpenRouter for you. That costs money, so it is
+a command you type — `ccd -c`. What it can do is bring such a run *back*: when a
+spare has room again, or the window resets, the conversation returns to your
+subscription with nothing to type.
 
 ```sh
 ccd setup --auto
 ```
 
-That authorises the billing, installs a launcher at `~/.claude/ccd/bin/claude`,
-and asks before adding one line to your shell startup file, so your shell finds it
-first:
+That installs a launcher at `~/.claude/ccd/bin/claude` and asks before adding one
+line to your shell startup file, so your shell finds it first:
 
 ```sh
 export PATH="$HOME/.claude/ccd/bin:$PATH"
@@ -146,44 +146,31 @@ official installer owns. Say no to the prompt and ccd prints the line for you.
 `--yes` answers it in advance.
 
 Then start sessions as usual with `claude`. The launcher runs the real claude and
-watches its exit code, so when every subscription is spent the conversation
-continues on OpenRouter by itself, and comes back when the quota resets.
+watches its exit code; a `ccd -c` run started under it returns to the subscription
+on its own.
 
 Conditions and limits:
 
-- **All three conditions must hold.** The launcher must be running, a quota
-  reading must confirm the rate-limit error, and there must be a key and this
-  opt-in. Otherwise ccd does nothing, and no session is ended with nowhere to go.
-- **The in-flight turn is lost.** The switch happens after the failed turn, so
-  re-send that last prompt. (The free hop between subscriptions does not lose it:
-  it swaps in place and wakes the turn.)
+- **The return needs the launcher.** While a session is on OpenRouter its backbone
+  is an environment variable, so leaving it takes a relaunch. Without the launcher
+  the session simply stays where it is and says how to come back by hand.
 - **Non-interactive runs are not relaunched.** `claude -p ...`, or anything with
   its output redirected, has no terminal to come back to and no prompt to
   re-send. ccd tells you how to continue instead.
 
-### The free hop and the paid one are separate
+### What is automatic, and what is not
 
-A handoff has two possible destinations, and they do not cost the same or work the
-same way:
-
-- **Another registered subscription.** Free, and it happens inside the session:
-  the credential ccd writes is the one the next request reads, so nothing is
+- **Between your own subscriptions.** Automatic, free, and inside the session: the
+  credential ccd writes is the one the next request reads, so nothing is
   relaunched and nothing is lost. No launcher, no PATH line, no restart.
-- **OpenRouter, on your own API key.** Billed, only ever reached when every
-  registered subscription is spent, and the one hop that does need the launcher —
-  while a session is on OpenRouter its backbone is an environment variable, so
-  leaving it takes a relaunch.
+- **Onto OpenRouter.** Never automatic. When no spare can be reached ccd stops,
+  leaves one line saying why, and names `ccd -c` — which is yours to type, on your
+  own key and your own bill.
+- **Back from OpenRouter.** Automatic, if the launcher is installed.
 
-`ccd setup --auto` is what authorises the paid hop and installs that launcher.
-Having a key stored is not enough: without the opt-in, a session whose
-subscriptions are all spent simply ends where it is rather than moving onto a paid
-backbone unattended. `ccd doctor` reports the two separately, and
-`ccd setup --no-auto` withdraws the authorisation along with the launcher.
-
-The manual procedure still works if a handoff does not fire.
-`ccd setup --no-auto` turns the paid hop off and `ccd uninstall` removes it. A
-`~/.claude/ccd/bin/claude` that is not ours, and a PATH line we did not write,
-are always left alone.
+`ccd setup --no-auto` removes the launcher and its PATH line; `ccd uninstall`
+removes everything. A `~/.claude/ccd/bin/claude` that is not ours, and a PATH line
+we did not write, are always left alone.
 
 </details>
 
@@ -239,7 +226,7 @@ calls.
 | `ccd account use <name>` | That account specifically |
 | `ccd account rm <name>` | Remove one |
 | `ccd setup` | Install everything the subscription hop needs: statusline, hooks, `ccd` itself |
-| `ccd setup --auto` | Also allow the paid OpenRouter hop, and install the launcher that carries it |
+| `ccd setup --auto` | Also install the launcher that brings a `ccd -c` run back to your subscription |
 | `ccd setup --no-auto` | Remove that launcher and its PATH line |
 | `ccd doctor [model]` | Diagnose the whole escape route |
 | `ccd` | Status: accounts, key, slots, routing, procedure |

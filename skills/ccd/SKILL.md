@@ -145,7 +145,8 @@ prices move and new models ship), do this:
 - **If a second Claude account is registered, OpenRouter is no longer the first
   stop.** Quota exhaustion moves the conversation to the spare subscription —
   free, still real Claude, inside the running session with no restart and nothing
-  to type — and only reaches OpenRouter when every registered account is spent.
+  to type. When no spare can be reached ccd stops and says so; `ccd -c` onto
+  OpenRouter stays the user's own command, because it bills.
   `ccd account list` shows which account is active and whether a spare has room;
   the statusline shows the same as `● claude:<name> │ spare …`. After a swap the
   model list, Fable access and `/status` keep naming the previous account until

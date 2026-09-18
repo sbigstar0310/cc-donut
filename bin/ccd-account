@@ -30,7 +30,6 @@ Commands:
   ccd account refresh [--all] [--inactive-only] [<name>]
   ccd account pick [--json]
   ccd account swap [--from N] [--window K] (internal: called by the hook)
-  ccd account exhausted          (internal: the only thing that may justify paying)
   ccd account keepalive          (internal: called by the hook, at most daily)
   ccd account current [--json]   (internal: statusline / doctor)
 """
@@ -93,6 +92,10 @@ REFRESH_SKEW = 300
 # the suite for ten seconds per account while quietly calling Anthropic.
 HTTP_TIMEOUT = int(os.environ.get("CCD_HTTP_TIMEOUT", "10"))
 LOCK_TIMEOUT = 5
+# What a write that CANNOT be dropped may wait. A completed token exchange has
+# already spent the credential it was minted from; there is no "try again later"
+# for it, only "write it or lose the account".
+PERSIST_TIMEOUT = 30
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -894,9 +897,10 @@ def account_refresh(name, acct):
         return False, "dead"
     if refresh_token_dead(oauth):
         return False, "dead"
-    # Never the account the running session is signed in as. That credential
-    # belongs to Claude Code: rotating it here consumes a one-time token it is
-    # still holding, and the replacement would land in this file only.
+    # Not the account the running session is signed in as, if we can see that
+    # before starting: rotating it consumes a one-time token Claude Code is still
+    # holding. This is a pre-check, not a guarantee — the account can go live
+    # while the exchange is in flight, and by then the token is already spent.
     if active_name() == name:
         return False, "stale"
 
@@ -904,17 +908,13 @@ def account_refresh(name, acct):
     if not new_oauth:
         return False, ("dead" if status in (400, 401, 403) else "error")
 
-    with Lock(LOCK_FILE):
-        # Compare and set. If the stored credential moved while we were on the
-        # wire — a bank of the live blob, a swap — that copy is at least as fresh
-        # as ours and was minted from a token we have now spent. Take theirs.
+    # From here the old refresh token is GONE — the server retired it the moment
+    # it answered. Whatever moved underneath, this result is now the only copy of
+    # a credential for this account, and dropping it strands the account for good.
+    # So the write is not conditional, and it waits as long as it has to: the lock
+    # is only ever held for file writes, so "as long as it has to" is short.
+    with Lock(LOCK_FILE, timeout=PERSIST_TIMEOUT):
         fresh = account_load(name) or base
-        if ((fresh.get("claudeAiOauth") or {}).get("refreshToken") != rt
-                or active_name() == name):
-            if fresh is not acct:
-                acct.clear()
-                acct.update(fresh)
-            return True, "ok"
         merged = dict(fresh.get("claudeAiOauth") or {})
         merged.update(new_oauth)
         # Anthropic does not echo refreshTokenExpiresAt; a successful rotation
@@ -931,6 +931,15 @@ def account_refresh(name, acct):
         # here.
         fresh["refresh_ok_at"] = now()
         account_save(name, fresh)
+        # The account went live while we were on the wire. The session holding it
+        # is carrying the refresh token this exchange just consumed, so hand it
+        # the replacement rather than leave it with a credential that cannot be
+        # renewed.
+        if active_name() == name:
+            blob, sources = live_read()
+            if blob:
+                blob["claudeAiOauth"] = merged
+                live_write(blob, sources)
     # The caller measures the credential it is holding, so hand it what was
     # actually stored rather than what it walked in with.
     if fresh is not acct:
@@ -1521,23 +1530,29 @@ def cmd_swap(args):
 
     Prints `<account>TAB<installed credential>TAB<the credential it replaced>` and
     exits 0, or prints one line saying why not and exits non-zero. Nothing about
-    that reason is evidence of anything: whether the paid hop is allowed is a
-    separate question with its own measurements (cmd_exhausted)."""
+    that reason is evidence of anything, and nothing acts on it: a session that
+    cannot be moved to a spare stays where it is."""
     names = account_names()
     if not names:
         return _swap_no("no accounts registered")
     deadline = time.time() + max(0.0, args.deadline)
     try:
-        a, why = best_target(
+        a, rec = best_target(
             no_probe=args.no_probe, deadline=deadline,
             exclude={n: w for n, (_when, w) in swap_guard_read().items()})
         if a is None:
-            return _swap_no(why)
+            return _swap_no(rec)
         # One acquisition for the whole install: the claim, the credential and the
         # record are one change or none of them.
         left = max(0.5, deadline - time.time())
         with Lock(LOCK_FILE, timeout=left):
             cur = active_name()
+            # Re-read the departures here, not from the snapshot the measurement
+            # used: another swap can record one while we measure, and the account
+            # it just left is the one account we must not install.
+            if _guard_holds(a["name"], rec,
+                            {n: w for n, (_w, w) in swap_guard_read().items()}):
+                return _swap_no("another swap had just left that account")
             # No name for the signed-in login is a supported install, not a
             # refusal: with one account registered, that account IS the spare
             # (#41). There is simply nothing to compare the claim against.
@@ -1563,43 +1578,6 @@ def _swap_no(reason):
     subscription is measurably spent, and no exit code can answer that."""
     print(reason, file=sys.stderr)
     return 4
-
-
-def cmd_exhausted(args):
-    """Is there measurably nowhere free to go? Internal: the quota hook.
-
-    The one question that may authorise spending money, so it is answered from
-    measurements and nothing else. Every registered account other than the one
-    this session is on must have a fresh, successful reading, and every one of
-    them must be out of room. A stale row, a failed probe, an unreadable account
-    — none of those are evidence of exhaustion, and each one is a no.
-
-    The account we are on is not measured here: that it is spent is what the
-    caller's own reading and the rate_limit error already established."""
-    cur = active_name()
-    others = [n for n in account_names() if n != cur]
-    if not others:
-        return 0            # nothing free can exist; the paid hop is all there is
-    deadline = time.time() + max(0.0, args.deadline)
-    global NET_DEADLINE
-    outer, NET_DEADLINE = NET_DEADLINE, deadline
-    try:
-        cache = quota_cache()
-        for name in others:
-            acct = account_load(name)
-            if not acct:
-                return 1
-            rec, cache = quota_for(name, acct, cache=cache)
-            if rec.get("status") != "ok":
-                return 1    # not a measurement, so not proof
-            if has_headroom(rec):
-                return 1    # somewhere free to go: paying would be a mistake
-        quota_cache_save(cache)
-    except Exception:
-        return 1
-    finally:
-        NET_DEADLINE = outer
-    return 0
 
 
 def cmd_refresh(args):
@@ -2091,12 +2069,6 @@ def main(argv):
     a.add_argument("--deadline", type=float, default=60.0,
                    help="seconds this decision may spend, lock wait included")
     a.set_defaults(fn=cmd_swap)
-
-    a = sub.add_parser("exhausted",
-                       help="is there measurably nowhere free to go? (internal)")
-    a.add_argument("--deadline", type=float, default=20.0,
-                   help="seconds this question may spend measuring")
-    a.set_defaults(fn=cmd_exhausted)
 
     a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
     a.add_argument("--force", action="store_true")
