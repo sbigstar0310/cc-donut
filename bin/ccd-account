@@ -92,10 +92,6 @@ REFRESH_SKEW = 300
 # the suite for ten seconds per account while quietly calling Anthropic.
 HTTP_TIMEOUT = int(os.environ.get("CCD_HTTP_TIMEOUT", "10"))
 LOCK_TIMEOUT = 5
-# What a write that CANNOT be dropped may wait. A completed token exchange has
-# already spent the credential it was minted from; there is no "try again later"
-# for it, only "write it or lose the account".
-PERSIST_TIMEOUT = 30
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -222,12 +218,16 @@ class Lock:
 
     _depth = {}
 
-    def __init__(self, path, timeout=LOCK_TIMEOUT, wait=True):
+    def __init__(self, path, timeout=LOCK_TIMEOUT, wait=True, fatal=True):
         self.path = path
         self.timeout = timeout
         # wait=False raises LockBusy instead of dying: a background pass that
         # finds another one running has nothing to do and nobody to tell.
         self.wait = wait
+        # fatal=False waits like any other caller and then raises LockBusy rather
+        # than ending the process — for work that is worth a moment's patience and
+        # is not worth anybody's session (a token exchange that has not started).
+        self.fatal = fatal
         self.fd = None
         self.nested = False
 
@@ -254,7 +254,7 @@ class Lock:
                 if not self.wait or time.time() >= deadline:
                     os.close(self.fd)
                     self.fd = None
-                    if not self.wait:
+                    if not self.wait or not self.fatal:
                         raise LockBusy()
                     die("another ccd account operation is in progress — try again")
                 time.sleep(0.1)
@@ -373,26 +373,30 @@ def live_read():
 def live_write(blob, sources):
     """Write the blob everywhere Claude Code might read it.
 
-    On macOS a stale ~/.claude/.credentials.json is a real hazard: Claude Code
-    falls back to it when the keychain read fails, so updating only the keychain
-    can silently resurrect the previous account — the worst possible outcome of a
-    swap, since the UI would claim one account while the API served another."""
-    ok = False
+    Returns (ok, failed): ok only when EVERY backend that had to take the write
+    took it, and failed naming the ones that did not.
+
+    Half a write is not a write. On macOS a stale ~/.claude/.credentials.json is
+    a real hazard: Claude Code falls back to it when the keychain read fails, so
+    one backend holding the new credential and the other the old is a store that
+    disagrees with itself — and the next bank copies the stale half back over the
+    new one, destroying a credential nobody can mint again. Reporting that as
+    success is what let it happen quietly."""
     targets = set(sources)
     if use_keychain():
         targets.add("keychain")
     else:
         targets.discard("keychain")
         targets.add("file")
-    if "keychain" in targets:
-        ok = _keychain_write(blob) or ok
+    failed = []
+    if "keychain" in targets and not _keychain_write(blob):
+        failed.append("keychain")
     if "file" in targets:
         try:
             write_json(credentials_file(), blob, 0o600)
-            ok = True
         except Exception:
-            pass
-    return ok
+            failed.append("file")
+    return (bool(targets) and not failed), failed
 
 
 # ── Account store ────────────────────────────────────────────────────────────
@@ -881,65 +885,54 @@ def refresh_token_dead(oauth):
 def account_refresh(name, acct):
     """Refresh one stored account in place. Returns (ok, status_string).
 
-    The exchange happens OUTSIDE the lock and the write inside it. Holding the
-    store lock across a request stalls every other writer for as long as the
-    endpoint takes, and a response that dribbles freezes the machine; what the
-    lock is actually for is making the write atomic against the copy somebody
-    else is holding.
+    The exchange and the write it produces happen INSIDE the store lock, as one
+    step — the shape keepalive_pass already uses. A probe is a read and can wait
+    outside any lock; an exchange is a write that consumes a one-time credential,
+    and one that straddles the lock can land on a record somebody re-registered,
+    or complete with nowhere left to put it. Holding the lock means neither can
+    happen: a lock we cannot take means the exchange never started, and nothing
+    that was never spent can be lost.
 
-    Ordering matters: the rotated refresh token is written to disk BEFORE the new
-    access token is used for anything. Crashing between the two costs one wasted
-    access token; the reverse order costs the whole account."""
-    base = account_load(name) or acct
-    oauth = base.get("claudeAiOauth") or {}
-    rt = oauth.get("refreshToken")
-    if not rt:
-        return False, "dead"
-    if refresh_token_dead(oauth):
-        return False, "dead"
-    # Not the account the running session is signed in as, if we can see that
-    # before starting: rotating it consumes a one-time token Claude Code is still
-    # holding. This is a pre-check, not a guarantee — the account can go live
-    # while the exchange is in flight, and by then the token is already spent.
+    Ordering inside matters too: the rotated refresh token is written to disk
+    BEFORE the new access token is used for anything. Crashing between the two
+    costs one wasted access token; the reverse order costs the whole account."""
+    # Cheap "don't start": the live credential belongs to Claude Code, and
+    # rotating it consumes a one-time token that session is still holding. Under
+    # the lock this cannot change underneath us — swap_to takes the same lock.
     if active_name() == name:
         return False, "stale"
-
-    new_oauth, status = token_refresh(rt)
-    if not new_oauth:
-        return False, ("dead" if status in (400, 401, 403) else "error")
-
-    # From here the old refresh token is GONE — the server retired it the moment
-    # it answered. Whatever moved underneath, this result is now the only copy of
-    # a credential for this account, and dropping it strands the account for good.
-    # So the write is not conditional, and it waits as long as it has to: the lock
-    # is only ever held for file writes, so "as long as it has to" is short.
-    with Lock(LOCK_FILE, timeout=PERSIST_TIMEOUT):
-        fresh = account_load(name) or base
-        merged = dict(fresh.get("claudeAiOauth") or {})
-        merged.update(new_oauth)
-        # Anthropic does not echo refreshTokenExpiresAt; a successful rotation
-        # issues a fresh ~8.5-day window, so advance it ourselves. Without this
-        # the account would look dead to refresh_token_dead() forever after the
-        # original expiry.
-        merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
-        fresh["claudeAiOauth"] = merged
-        fresh["refreshed_at"] = now()
-        # Two different facts, and conflating them is what let six consecutive
-        # failures pass unreported. refreshed_at says the snapshot on disk is this
-        # fresh, which bank_live_oauth() and swap_to() can write truthfully after
-        # a copy. This says the token exchange itself worked, which only happens
-        # here.
-        fresh["refresh_ok_at"] = now()
-        account_save(name, fresh)
-        # The account went live while we were on the wire. The session holding it
-        # is carrying the refresh token this exchange just consumed, so hand it
-        # the replacement rather than leave it with a credential that cannot be
-        # renewed.
-        if active_name() == name:
-            blob, sources = live_read()
-            if blob:
-                blob["claudeAiOauth"] = merged
-                live_write(blob, sources)
+    try:
+        with Lock(LOCK_FILE, fatal=False):
+            fresh = account_load(name) or acct
+            oauth = fresh.get("claudeAiOauth") or {}
+            rt = oauth.get("refreshToken")
+            if not rt:
+                return False, "dead"
+            if refresh_token_dead(oauth):
+                return False, "dead"
+            new_oauth, status = token_refresh(rt)
+            if not new_oauth:
+                return False, ("dead" if status in (400, 401, 403) else "error")
+            merged = dict(oauth)
+            merged.update(new_oauth)
+            # Anthropic does not echo refreshTokenExpiresAt; a successful rotation
+            # issues a fresh ~8.5-day window, so advance it ourselves. Without this
+            # the account would look dead to refresh_token_dead() forever after the
+            # original expiry.
+            merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
+            fresh["claudeAiOauth"] = merged
+            fresh["refreshed_at"] = now()
+            # Two different facts, and conflating them is what let six consecutive
+            # failures pass unreported. refreshed_at says the snapshot on disk is
+            # this fresh, which bank_live_oauth() and swap_to() can write
+            # truthfully after a copy. This says the token exchange itself worked,
+            # which only happens here.
+            fresh["refresh_ok_at"] = now()
+            account_save(name, fresh)
+    except LockBusy:
+        # Somebody else owns the store and kept it. Nothing was spent, so there is
+        # nothing to salvage and nothing to report but "not now".
+        return False, "busy"
     # The caller measures the credential it is holding, so hand it what was
     # actually stored rather than what it walked in with.
     if fresh is not acct:
@@ -1220,16 +1213,26 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
         # that is the whole reason live_write exists, and a stale
         # ~/.credentials.json beside a good keychain resurrects the old account.
         if cur == name:
-            if not live_write(blob, sources):
+            written, failed = live_write(blob, sources)
+            if not written:
                 # Not fatal: nothing was supposed to change and the credential in
                 # use is still good. But a silent failure here is how a stale
                 # fallback file survives to resurrect the previous account.
-                warn("could not reconcile the credential stores")
+                warn("could not reconcile the credential stores ("
+                     + ", ".join(failed) + ")")
         else:
             new_blob = dict(blob)
             new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
-            if not live_write(new_blob, sources):
-                die("failed to write the credential store")
+            written, failed = live_write(new_blob, sources)
+            if not written:
+                # Put back what every backend that DID take the write is now
+                # holding. Left split, the stores disagree about who is signed in
+                # and the next bank copies one half over the other; restoring is
+                # the only ending that leaves the account intact.
+                if failed and len(failed) < len(set(sources) | {"file"}):
+                    live_write(blob, sources)
+                die("failed to write the credential store ("
+                    + ", ".join(failed) + ")")
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
@@ -1605,7 +1608,8 @@ def cmd_refresh(args):
             print(f"{C_GRN}✓{C_RESET} {name}")
         else:
             rc = 1
-            hint = "needs re-login" if why == "dead" else "unreachable"
+            hint = {"dead": "needs re-login",
+                    "busy": "the store was busy — try again"}.get(why, "unreachable")
             print(f"{C_RED}✗{C_RESET} {name} — {hint}")
     # A clean sweep of every spare is a repair, and the backoff keepalive computes
     # from the failure count no longer describes anything. Only here: writing this

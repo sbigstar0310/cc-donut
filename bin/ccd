@@ -1419,17 +1419,24 @@ PY
   printf '→ In a running session: /reload-plugins unloads the hooks — no restart needed\n'
 }
 
-# Exec the REAL claude, never the auto-handoff shim at ~/.local/bin/claude.
+# Start the session under the launcher when one is installed, and under the real
+# claude otherwise.
 #
-# A bare `exec claude` would find that shim first and start a SECOND handoff
-# launcher underneath this one. The inner launcher inherits the OpenRouter
-# environment we just exported, so when it later relaunches "back to the
-# subscription" it hands the user a session that is still on OpenRouter — and
-# the outer loop's hop cap no longer governs the round trip. One launcher
-# supervises one session; ccd is always the supervised process, never a new
-# supervisor. Skipping the shim also keeps `ccd off` honest.
+# The launcher's only job now is the way BACK: a ccd run it supervises returns to
+# the subscription by itself once a spare has room or the window resets. A run
+# that never starts under it can never come back — `--auto` would install
+# something that watches nothing — so this is the entrance to that path.
+#
+# ONE launcher, though. CCD_HANDOFF means one is already supervising this process
+# tree, and a second would mint its own token, inherit the OpenRouter environment
+# we just exported, and hand the user a session still on OpenRouter when it
+# relaunched "back to the subscription". So when we are already supervised, go
+# straight to the real claude — which is also what keeps `ccd off` honest.
 exec_claude() {
-  local d c self="${CCD_SHIM_PATH:-}"
+  local d c self="${CCD_SHIM_PATH:-}" shim="$CCD_SHIM_DIR/claude"
+  if [ -z "${CCD_HANDOFF:-}" ] && is_ccd_shim "$shim"; then
+    exec "$shim" "$@"
+  fi
   local IFS=:
   for d in $PATH; do
     [ -n "$d" ] || continue

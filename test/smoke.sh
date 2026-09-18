@@ -2220,8 +2220,10 @@ EOF
 chmod +x "$FAKE/realbin/claude"
 out=$(PATH="$NESTPATH" OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
 case "$out" in
-  *"TOKEN:<none>"*) ok "ccd execs the real claude without minting a launcher" ;;
-  *"TOKEN:"*) bad "nested launcher" "ccd bounced through the shim: $(printf '%s' "$out" | grep TOKEN | head -1)" ;;
+  # One launcher, minted here: that token is what the return path needs, and a
+  # run that starts without one can never come back.
+  *TOKEN:[0-9a-f][0-9a-f]*) ok "ccd starts under the launcher that can bring it back" ;;
+  *"TOKEN:<none>"*) bad "no entrance" "ccd started a session no launcher can return" ;;
   *) bad "ccd exec" "never reached the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 case "$out" in
@@ -5800,40 +5802,59 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 unset CCD_REAL_ACCOUNT
 rm -f "$SWD/providers/keys.env"
 
-# ── No network under a lock ─────────────────────────────────────────────────
-# A rotation that holds the store lock across its token exchange stalls every
-# other writer for as long as the endpoint feels like taking, and a dribbling
-# response becomes a machine-wide freeze.
+# ── The exchange holds the lock; a probe does not ───────────────────────────
+# A probe is a read: it measures somebody's quota and can wait outside any lock.
+# An exchange is a write — it consumes a one-time credential — so it holds the
+# store lock across the request and the write it produces, as one step. Anything
+# else can land on a record that was re-registered while it was in flight.
 sw_fixture 58 96
 stage_usage 5 5 200 2 AT-spare-rotated
 python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1]))
-d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
+d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)   # needs a rotation
 json.dump(d, open(sys.argv[1], "w"))
 q = json.load(open(sys.argv[2]))
-q["spare"]["checked_at"] = int(time.time()) - 99999
+q["spare"]["checked_at"] = int(time.time()) - 99999                # and a measurement
 json.dump(q, open(sys.argv[2], "w"))
+PY
+lock_free() {  # is the store lock takeable right now?
+  python3 - "$ADIR/.lock" <<'PY'
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("free")
+except OSError:
+    print("held")
+PY
+}
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
+PICKPID=$!
+sleep 0.8
+[ "$(lock_free)" = "held" ] \
+  && ok "a token exchange holds the store lock for as long as it takes" \
+  || bad "exchange outside the lock" "the store was writable mid-exchange"
+wait "$PICKPID" 2>/dev/null
+
+# ...and the read-only half takes nothing: a spare whose token is fine is simply
+# measured, and every other writer carries on while that request is open.
+sw_fixture 58 96
+stage_usage 5 5 200 2
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys, time
+q = json.load(open(sys.argv[1]))
+q["spare"]["checked_at"] = int(time.time()) - 99999
+json.dump(q, open(sys.argv[1], "w"))
 PY
 CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
 PICKPID=$!
 sleep 0.8
-python3 - "$ADIR/.lock" <<'PY' \
-  && ok "the store lock is free while a token exchange is in flight" \
-  || bad "lock under network" "a rotation held the store lock across its request"
-import fcntl, os, sys, time
-fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
-deadline = time.time() + 1
-while True:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        raise SystemExit(0)
-    except OSError:
-        if time.time() >= deadline:
-            raise SystemExit(1)
-        time.sleep(0.05)
-PY
+[ "$(lock_free)" = "free" ] \
+  && ok "...while a measurement that rotates nothing blocks nobody" \
+  || bad "probe under the lock" "a read-only probe held the store lock"
 wait "$PICKPID" 2>/dev/null
+unset -f lock_free
 
 # ── The confirmation proves ownership, not change ───────────────────────────
 # "different from what we replaced" is satisfied by a third account's token, by
@@ -6048,6 +6069,169 @@ rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$SWD/accounts-
 hf_reset
 unset CCD_USAGE_URL CCD_TOKEN_URL
 unset -f sw_hook sw_fixture sw_fixture3 sw_prompt sw_stopfail
+
+head_ "32. the exchange belongs under the lock"
+# A probe is a read: it measures somebody's quota and can wait outside any lock.
+# A token exchange is a WRITE — it consumes a one-time credential — and it has to
+# happen inside the store lock with the write it produces, as one step. Outside
+# it, the store can be re-registered, re-swapped or replaced while the exchange
+# is in flight, and the result then lands on whatever is sitting in that file.
+TXD="$FAKE/.claude/ccd"
+export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
+export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
+tx_fixture() {  # one registered account, its stored token expired and due a refresh
+  rm -rf "$ADIR" "$TXD/accounts-quota.json" "$FAKE/.claude.json"
+  mkdir -p "$ADIR"
+  write_creds tx_b; "$ACCT" --no-color add --name tx_b --label B-original >/dev/null 2>&1
+  write_creds tx_c; "$ACCT" --no-color add --name tx_c --label C-other >/dev/null 2>&1
+  python3 - "$ADIR/tx_b.json" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
+json.dump(d, open(sys.argv[1], "w"))
+PY
+  printf '{"fails":0}' > "$TXD/accounts-keepalive"
+}
+tx_tok() { python3 -c 'import json,sys;print(((json.load(open(sys.argv[1])).get("claudeAiOauth")) or {}).get("accessToken",""))' "$1"; }
+tx_uuid() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("account_uuid") or "")' "$1"; }
+
+# ── A completed exchange never lands on another account's record ────────────
+# `account add --name B --force` points that name at a different account. If the
+# exchange is outside the lock, the merge writes B's brand-new refresh token into
+# the record that now belongs to C — and the live write lands on top of it.
+tx_fixture
+stage_usage 5 5 200 2 AT-tx-rotated       # a two-second exchange
+( sleep 0.6; write_creds tx_c_again
+  "$ACCT" --no-color add --name tx_b --force --label C-registered >/dev/null 2>&1 ) &
+RACE=$!
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh tx_b >/dev/null 2>&1
+wait "$RACE" 2>/dev/null
+python3 - "$ADIR/tx_b.json" <<'PY' \
+  && ok "a record never ends up holding a credential minted for another account" \
+  || bad "cross-contaminated record" "the exchange landed on a re-registered name"
+import json, sys
+d = json.load(open(sys.argv[1]))
+tok = (d.get("claudeAiOauth") or {}).get("accessToken") or ""
+# Either the refresh won the name and the record is still its own, or the
+# re-registration won and the record is wholly the new account's. What must not
+# exist is a record wearing one account's identity and another's credential.
+assert not (tok == "AT-tx-rotated" and d.get("label") == "C-registered"), \
+    f"label={d.get('label')!r} token={tok}"
+PY
+
+# ── An exchange that could not take the lock never happened ─────────────────
+# Nothing to lose is the whole point: a completed exchange has spent a token that
+# cannot be minted again, so the exchange must not START unless its result can be
+# written the moment it lands. A store held past the wait is the case — the lock
+# is worth a few seconds' patience and nothing beyond that.
+tx_fixture
+stage_usage 5 5 200 0 AT-tx-rotated
+python3 - "$ADIR/.lock" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(6)                       # longer than any caller will wait for it
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+PY
+HOLD=$!
+sleep 0.3
+: > "$CCD_FAKE_USAGE_LOG"
+"$ACCT" --no-color refresh tx_b >/dev/null 2>&1
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+wait "$HOLD" 2>/dev/null
+[ "${calls:-0}" -eq 0 ] \
+  && ok "a store that cannot be locked means no token is spent at all" \
+  || bad "spent under a held lock" "${calls:-0} exchanges ran with the store locked"
+[ "$(tx_tok "$ADIR/tx_b.json")" = "AT-tx_b" ] \
+  && ok "...and the stored credential is exactly the one nobody touched" \
+  || bad "lost exchange" "store holds $(tx_tok "$ADIR/tx_b.json")"
+
+# ── A half-written credential is not a written one ──────────────────────────
+# Two backends, one refusal: the file takes the new blob and the keychain keeps
+# the old. Reporting that as success is how a later bank copies the stale one
+# back over the new — the successor destroyed by the very next swap.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
+  && ok "a write only one backend took is reported as the failure it is" \
+  || bad "partial write" "live_write called a split-brain store a success"
+import importlib.machinery, importlib.util, os, sys
+os.environ["HOME"] = sys.argv[2]
+os.environ.pop("CCD_CREDENTIALS_BACKEND", None)
+loader = importlib.machinery.SourceFileLoader("ccdacct", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+m.use_keychain = lambda: True
+m._keychain_write = lambda blob: False          # the keychain refuses
+ok, failed = m.live_write({"claudeAiOauth": {"accessToken": "AT-new"}}, ["keychain", "file"])
+assert ok is False, "a refused backend was reported as a successful write"
+assert "keychain" in failed, f"the refusing backend is not named: {failed!r}"
+
+m._keychain_write = lambda blob: True
+ok, failed = m.live_write({"claudeAiOauth": {"accessToken": "AT-new"}}, ["keychain", "file"])
+assert ok is True and not failed, f"a complete write was reported as partial: {failed!r}"
+PY
+
+# ...and the caller has to act on it rather than carry on.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
+  && ok "...and a swap that cannot write both stores fails instead of claiming a move" \
+  || bad "partial write" "the swap reported a credential it had not installed"
+import importlib.machinery, importlib.util, os, sys
+os.environ["HOME"] = sys.argv[2]
+os.environ.pop("CCD_CREDENTIALS_BACKEND", None)
+loader = importlib.machinery.SourceFileLoader("ccdacct2", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+m.use_keychain = lambda: True
+m._keychain_write = lambda blob: False
+m.live_read = lambda: ({"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}},
+                       ["keychain", "file"])
+m.active_name = lambda: "someone_else"
+m.account_load = lambda n: ({"name": n, "claudeAiOauth":
+                             {"accessToken": "AT-target", "refreshToken": "RT-target"}}
+                            if n == "target" else None)
+m.account_save = lambda n, o: None
+try:
+    m.swap_to("target", force=True)
+except SystemExit:
+    pass
+else:
+    raise AssertionError("swap_to returned success on a half-written credential store")
+PY
+
+# ── The return has an entrance ──────────────────────────────────────────────
+# `--auto` installs a launcher whose only job is bringing a ccd run back to the
+# subscription. A ccd run that does not START under it can never come back, so
+# ccd itself has to go through it when one is installed.
+rm -rf "$FAKE/.claude/ccd/bin"
+"$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+fake_real '#!/bin/sh
+printf "REAL supervised=%s\n" "${CCD_HANDOFF:+yes}"'
+out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" off 2>&1)
+case "$out" in
+  *"supervised=yes"*) ok "a ccd run starts under the launcher that can bring it back" ;;
+  *) bad "no entrance" "the launcher installed by --auto never sees the session: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+# ...but never two of them: a session already supervised must not gain a second
+# launcher underneath the first.
+# A second launcher would mint a token of its own, so the one that arrives is the
+# proof: the same token means nothing was nested underneath it.
+fake_real '#!/bin/sh
+printf "REAL token=%s\n" "${CCD_HANDOFF:-none}"'
+out=$(PATH="$SHIMPATH" HOME="$FAKE" CCD_HANDOFF=00000000000000000000000000000001 \
+      "$ROOT/bin/ccd" off 2>&1)
+case "$out" in
+  *"token=00000000000000000000000000000001"*)
+    ok "...and a session that already has one does not get a second" ;;
+  *) bad "nested launcher" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+
+rm -rf "$ADIR" "$TXD/accounts-keepalive"
+unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
+unset -f tx_fixture tx_tok tx_uuid
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
