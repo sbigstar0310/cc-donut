@@ -540,6 +540,9 @@ request_handoff() {
 # launcher to relaunch through and no key at all — the credential it is about to
 # stop using is the one the key buys.
 launcher_ready() {
+  # A run the launcher cannot relaunch must not be ended for one: signalling a
+  # batch job kills the work and nothing brings it back.
+  [ -z "${CCD_HANDOFF_HEADLESS:-}" ] || return 1
   launcher_present || return 1
   valid_session_id "$SESSION_ID" || return 1
   claude_pid >/dev/null || return 1

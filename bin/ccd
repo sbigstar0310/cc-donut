@@ -1433,8 +1433,19 @@ PY
 # relaunched "back to the subscription". So when we are already supervised, go
 # straight to the real claude — which is also what keeps `ccd off` honest.
 exec_claude() {
-  local d c self="${CCD_SHIM_PATH:-}" shim="$CCD_SHIM_DIR/claude"
-  if [ -z "${CCD_HANDOFF:-}" ] && is_ccd_shim "$shim"; then
+  local d c a self="${CCD_SHIM_PATH:-}" shim="$CCD_SHIM_DIR/claude" interactive=1
+  # A run with no terminal is a batch job: nobody is waiting for it to come back,
+  # and supervising it only gives it a way to die — the hook can arm a return,
+  # the SIGHUP lands mid-batch, and the launcher then discovers it is headless and
+  # refuses to relaunch. Same predicate the launcher uses on itself.
+  { [ -t 0 ] && [ -t 1 ]; } || interactive=0
+  for a in ${1+"$@"}; do
+    case "$a" in -p|--print) interactive=0 ;; esac
+  done
+  # `is_ccd_shim` answers "ours", not "runnable". Exec'ing an unexecutable
+  # leftover would break every launch on a machine with a good claude on PATH.
+  if [ "$interactive" -eq 1 ] && [ -z "${CCD_HANDOFF:-}" ] \
+     && is_ccd_shim "$shim" && [ -x "$shim" ]; then
     exec "$shim" "$@"
   fi
   local IFS=:

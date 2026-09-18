@@ -157,6 +157,13 @@ headless=0
 for a in ${1+"$@"}; do
   case "$a" in -p|--print) headless=1 ;; esac
 done
+# Tell the hook, not just ourselves. Discovering this AFTER the session has been
+# signalled means the work was killed for a relaunch that then does not happen.
+if [ "$headless" -eq 1 ]; then
+  export CCD_HANDOFF_HEADLESS=1
+else
+  unset CCD_HANDOFF_HEADLESS
+fi
 while :; do
   session_start=$(date +%s 2>/dev/null || echo 0)
   "$REAL" ${args+"${args[@]}"}
@@ -192,7 +199,7 @@ while :; do
   [ "$(hf token)" = "$CCD_HANDOFF" ] || exit "$rc"
   sid=$(hf session_id)
   if [ "$headless" -eq 1 ]; then
-    printf 'ccd: quota exhausted during a non-interactive run — not relaunching.\n     Continue in a terminal with: ccd --resume %s\n' "$sid" >&2
+    printf 'ccd: a subscription freed up during a non-interactive run — not relaunching.\n     Continue on it in a terminal with: claude --resume %s\n' "$sid" >&2
     exit "$rc"
   fi
   dir=$(hf direction)

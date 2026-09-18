@@ -2218,12 +2218,13 @@ echo "TOKEN:${CCD_HANDOFF:-<none>}"
 env | grep -E '^(CCD_ACTIVE|ANTHROPIC_BASE_URL)=' | sed 's/=.*/=set/' | sort
 EOF
 chmod +x "$FAKE/realbin/claude"
+# A print-mode run has no terminal to come back to. Supervising it only gives it
+# a way to be killed: the hook can arm a return, the SIGHUP lands mid-batch, and
+# the launcher then discovers it is headless and refuses to relaunch.
 out=$(PATH="$NESTPATH" OPENROUTER_API_KEY=sk-or-v1-smoketest "$ROOT/bin/ccd" -p hi 2>/dev/null)
 case "$out" in
-  # One launcher, minted here: that token is what the return path needs, and a
-  # run that starts without one can never come back.
-  *TOKEN:[0-9a-f][0-9a-f]*) ok "ccd starts under the launcher that can bring it back" ;;
-  *"TOKEN:<none>"*) bad "no entrance" "ccd started a session no launcher can return" ;;
+  *"TOKEN:<none>"*) ok "a print-mode run is never put under a launcher" ;;
+  *TOKEN:*) bad "supervised batch" "a batch job got a launcher that can end it: $(printf '%s' "$out" | grep TOKEN | head -1)" ;;
   *) bad "ccd exec" "never reached the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 case "$out" in
@@ -2274,7 +2275,7 @@ exit 129'
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$NESTPATH" shim_run "$SHIM" -p hi 2>&1)
 case "$out" in
-  *"non-interactive run"*"ccd --resume sess-n"*) ok "a headless run is not relaunched, and says how to continue" ;;
+  *"non-interactive run"*"claude --resume sess-n"*) ok "a headless run is not relaunched, and says how to continue on the subscription" ;;
   *) bad "headless handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 
@@ -5659,10 +5660,11 @@ sw_prompt UserPromptSubmit sess-f7 >/dev/null
   || bad "solo spare" "went nowhere: $(cat "$ADIR/.active" 2>/dev/null)"
 
 # ── A rotation during the settle is not a failed swap ───────────────────────
-# Twelve seconds is long enough for ccd to refresh the account it just installed.
-# A rotation writes both halves — the live blob and the account's own file — so
-# the credential is still provably the target's, and byte equality would be the
-# only thing calling that a failure.
+# Twelve seconds is long enough for Claude Code to renew the credential ccd just
+# installed. ccd never rotates a live account itself, but the next ccd-account
+# command banks what Claude Code rotated into that account's own file — so both
+# halves end up holding it, the credential is still provably the target's, and
+# byte equality would be the only thing calling that a failure.
 sw_fixture 58 96
 ( sleep 0.7; python3 - "$CREDS" "$ADIR/spare.json" <<'PY'
 import json, sys
@@ -5980,10 +5982,11 @@ unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
 export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
 export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
 
-# ── A completed exchange is never thrown away ───────────────────────────────
-# The old refresh token is spent the moment the server answers. Discarding the
-# answer because the world moved underneath does not put it back: it loses the
-# only copy of a token nobody can mint again.
+# ── A swap queues behind an exchange, and installs what it produced ─────────
+# The old refresh token is spent the moment the server answers, so the exchange
+# holds the store lock across it. A `use` arriving mid-exchange therefore waits,
+# and what it then installs is the credential the exchange wrote — not the one it
+# read before.
 sw_fixture 58 96
 stage_usage 5 5 200 2 AT-spare-rotated
 python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
@@ -5998,15 +6001,15 @@ PY
 CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
 PICKPID=$!
 sleep 0.5
-"$ACCT" --no-color use spare --force >/dev/null 2>&1    # it goes live mid-exchange
+"$ACCT" --no-color use spare --force >/dev/null 2>&1    # queues behind the exchange
 wait "$PICKPID" 2>/dev/null
 tok() { python3 -c 'import json,sys;print(((json.load(open(sys.argv[1])).get("claudeAiOauth")) or {}).get("accessToken",""))' "$1"; }
 [ "$(tok "$ADIR/spare.json")" = "AT-spare-rotated" ] \
-  && ok "a refresh that succeeded is written down, whatever moved while it ran" \
+  && ok "a refresh that succeeded is written down, whatever was waiting behind it" \
   || bad "lost refresh" "the exchange was discarded: store holds $(tok "$ADIR/spare.json")"
 [ "$(tok "$CREDS")" = "$(tok "$ADIR/spare.json")" ] \
-  && ok "...and the session holding that account is handed the replacement" \
-  || bad "lost refresh" "live $(tok "$CREDS") vs stored $(tok "$ADIR/spare.json")"
+  && ok "...and the swap that waited installs that credential, not the one it read" \
+  || bad "stale install" "live $(tok "$CREDS") vs stored $(tok "$ADIR/spare.json")"
 
 # ── The departure record is read where the install happens ──────────────────
 # Measuring takes time; another swap can record a departure inside it, and a
@@ -6164,13 +6167,17 @@ loader.exec_module(m)
 
 m.use_keychain = lambda: True
 m._keychain_write = lambda blob: False          # the keychain refuses
-ok, failed = m.live_write({"claudeAiOauth": {"accessToken": "AT-new"}}, ["keychain", "file"])
+ok, failed, written = m.live_write({"claudeAiOauth": {"accessToken": "AT-new"}},
+                                   ["keychain", "file"])
 assert ok is False, "a refused backend was reported as a successful write"
 assert "keychain" in failed, f"the refusing backend is not named: {failed!r}"
+assert written == ["file"], f"the backend that took it is not named: {written!r}"
 
 m._keychain_write = lambda blob: True
-ok, failed = m.live_write({"claudeAiOauth": {"accessToken": "AT-new"}}, ["keychain", "file"])
+ok, failed, written = m.live_write({"claudeAiOauth": {"accessToken": "AT-new"}},
+                                   ["keychain", "file"])
 assert ok is True and not failed, f"a complete write was reported as partial: {failed!r}"
+assert set(written) == {"keychain", "file"}, f"written: {written!r}"
 PY
 
 # ...and the caller has to act on it rather than carry on.
@@ -6202,6 +6209,173 @@ else:
     raise AssertionError("swap_to returned success on a half-written credential store")
 PY
 
+# ── An account that goes live while the refresh waits is left alone ─────────
+# The pre-check says "not the live account" before the lock is taken, and cannot
+# say anything about the world after it. Claude Code publishing its profile is
+# enough to make that account live while we wait — and consuming its refresh
+# token then leaves the running session holding one that can never be renewed.
+r1_fixture() {
+  rm -rf "$ADIR" "$TXD/accounts-quota.json"; rm -f "$FAKE/.claude.json"
+  mkdir -p "$ADIR"
+  write_creds r1_b; "$ACCT" --no-color add --name r1_b >/dev/null 2>&1
+  write_creds r1_other; "$ACCT" --no-color add --name r1_other >/dev/null 2>&1
+  "$ACCT" --no-color use r1_other --force >/dev/null 2>&1   # the pointer says r1_other
+  python3 - "$ADIR/r1_b.json" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+d["account_uuid"] = "uuid-r1"                                     # who the profile names
+d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)  # and it is due a refresh
+json.dump(d, open(sys.argv[1], "w"))
+PY
+  printf '{"fails":0}' > "$TXD/accounts-keepalive"
+}
+r1_go_live() {  # Claude Code signs in as r1_b: its credential, and its profile
+  python3 - "$ADIR/r1_b.json" "$CREDS" "$FAKE/.claude.json" <<'PY'
+import json, sys, time
+acct = json.load(open(sys.argv[1]))
+live = json.load(open(sys.argv[2]))
+live["claudeAiOauth"] = acct["claudeAiOauth"]
+json.dump(live, open(sys.argv[2], "w"))
+json.dump({"oauthAccount": {"accountUuid": "uuid-r1", "emailAddress": "r1@example.com",
+                            "profileFetchedAt": int((time.time() + 5) * 1000)}},
+          open(sys.argv[3], "w"))
+PY
+}
+r1_fixture
+stage_usage 5 5 200 0 AT-r1-rotated
+python3 - "$ADIR/.lock" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(2)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+PY
+HOLD=$!
+sleep 0.2
+: > "$CCD_FAKE_USAGE_LOG"
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b >/dev/null 2>&1 &
+REFPID=$!
+sleep 0.5
+r1_go_live                       # r1_b is the live account from here on
+
+wait "$HOLD" 2>/dev/null; wait "$REFPID" 2>/dev/null
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+[ "${calls:-0}" -eq 0 ] \
+  && ok "an account that went live while we waited is not refreshed behind its session" \
+  || bad "refreshed the live account" "${calls:-0} exchanges ran after it became live"
+[ "$(tx_tok "$ADIR/r1_b.json")" = "AT-r1_b" ] \
+  && ok "...and its stored credential is the one that session is still holding" \
+  || bad "refreshed the live account" "store holds $(tx_tok "$ADIR/r1_b.json")"
+rm -f "$FAKE/.claude.json"
+
+# ── An account removed while we waited is not brought back ──────────────────
+r1_fixture
+stage_usage 5 5 200 0 AT-r1-rotated
+python3 - "$ADIR/.lock" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(2)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+PY
+HOLD=$!
+sleep 0.2
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b >/dev/null 2>&1 &
+REFPID=$!
+sleep 0.5
+rm -f "$ADIR/r1_b.json"          # `ccd account rm` landing while we wait
+wait "$HOLD" 2>/dev/null; wait "$REFPID" 2>/dev/null
+[ ! -e "$ADIR/r1_b.json" ] \
+  && ok "a refresh does not re-register an account somebody removed" \
+  || bad "resurrected account" "the record came back from a pre-lock snapshot"
+rm -f "$FAKE/.claude.json"
+
+# ── A partial install puts back what it managed to write ────────────────────
+# The rollback has to be about what was actually WRITTEN, not about how many
+# sources happened to be readable: a keychain that cannot be read still gets
+# written, so counting readable sources skips the restore exactly when both
+# stores have been left disagreeing.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
+  && ok "a half-installed credential is rolled back to what the session still holds" \
+  || bad "no rollback" "the stores were left disagreeing about who is signed in"
+import importlib.machinery, importlib.util, json, os, sys
+os.environ["HOME"] = sys.argv[2]
+os.environ.pop("CCD_CREDENTIALS_BACKEND", None)
+loader = importlib.machinery.SourceFileLoader("ccdacct3", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
+writes = []
+m.use_keychain = lambda: True
+m._keychain_write = lambda blob: False          # the keychain refuses every write
+# A keychain that could not be READ: the source list names the file alone, while
+# the write still has to reach both.
+m.live_read = lambda: (OLD, ["file"])
+m.write_json = lambda p, obj, mode=0o600: writes.append(obj)
+m.active_name = lambda: "someone_else"
+m.account_load = lambda n: ({"name": n, "claudeAiOauth":
+                             {"accessToken": "AT-target", "refreshToken": "RT-target"}}
+                            if n == "target" else None)
+m.account_save = lambda n, o: None
+try:
+    m.swap_to("target", force=True)
+except SystemExit:
+    pass
+else:
+    raise AssertionError("swap_to reported success on a half-written store")
+assert writes, "nothing was written at all, so this proved nothing"
+last = (writes[-1].get("claudeAiOauth") or {}).get("accessToken")
+assert last == "AT-old", f"the file was left holding {last!r} while the keychain kept AT-old"
+PY
+
+# ── A batch job is never ended for a return it cannot make ─────────────────
+# The launcher is the only one that knows there is no terminal to come back to.
+# Discovering it after the session has been signalled means the work was killed
+# for a relaunch that then does not happen.
+"$FAKE/sigbin/claude" 8 2>/dev/null & BPID=$!
+sleep 0.3
+cat > "$TXD/run-state.json" <<'RSEOF'
+{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5,"last_seven_day_percent":97,"last_seven_day_reset":"D1"}
+RSEOF
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"fiveHourReset":"R1","sevenDayPercent":3,"sevenDayReset":"D2"}}\n' \
+  > "$TXD/quota-cache.json"
+rm -f "$TXD/handoff-00000000000000000000000000000002.json"
+printf '{"session_id":"sess-batch","cwd":"/tmp/w","hook_event_name":"UserPromptSubmit"}' \
+  | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
+    CCD_HANDOFF=00000000000000000000000000000002 \
+    CCD_HANDOFF_STATE="$TXD/handoff-00000000000000000000000000000002.json" \
+    CCD_HANDOFF_HEADLESS=1 CLAUDE_PID=$BPID CCD_STANDIN_PID=$BPID \
+    "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+sleep 0.4
+if kill -0 "$BPID" 2>/dev/null; then ok "a run that cannot be relaunched is never signalled"
+else bad "killed a batch job" "the hook ended a session the launcher would refuse to bring back"; fi
+[ ! -f "$TXD/handoff-00000000000000000000000000000002.json" ] \
+  && ok "...and nothing is armed for a relaunch that would be refused" \
+  || bad "armed for a batch job" "armed a return a headless run cannot take"
+kill -9 "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null
+rm -f "$TXD/run-state.json"
+
+# ── A leftover shim that cannot run is not a route ──────────────────────────
+# is_ccd_shim() answers "ours", not "runnable". Committing to an unexecutable one
+# breaks every ccd launch on a machine with a perfectly good claude on PATH.
+rm -rf "$FAKE/.claude/ccd/bin"
+mkdir -p "$FAKE/.claude/ccd/bin"
+{ printf '#!/usr/bin/env bash\n'; printf '# ccd-auto-handoff-shim v1 (managed by: ccd setup --auto)\n'; } \
+  > "$FAKE/.claude/ccd/bin/claude"
+chmod -x "$FAKE/.claude/ccd/bin/claude"
+fake_real '#!/bin/sh
+printf "REAL reached=%s\n" "$*"'
+out=$(PATH="$SHIMPATH" HOME="$FAKE" shim_run "$ROOT/bin/ccd" off 2>&1)
+case "$out" in
+  *"REAL reached="*) ok "a shim that cannot be executed is stepped over, not exec'd" ;;
+  *) bad "unrunnable shim" "ccd could not start claude at all: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+rm -rf "$FAKE/.claude/ccd/bin"
+
 # ── The return has an entrance ──────────────────────────────────────────────
 # `--auto` installs a launcher whose only job is bringing a ccd run back to the
 # subscription. A ccd run that does not START under it can never come back, so
@@ -6210,10 +6384,16 @@ rm -rf "$FAKE/.claude/ccd/bin"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 fake_real '#!/bin/sh
 printf "REAL supervised=%s\n" "${CCD_HANDOFF:+yes}"'
+out=$(PATH="$SHIMPATH" HOME="$FAKE" shim_run "$ROOT/bin/ccd" off 2>&1)
+case "$out" in
+  *"supervised=yes"*) ok "an interactive ccd run starts under the launcher that can bring it back" ;;
+  *) bad "no entrance" "the launcher installed by --auto never sees the session: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+# ...and a redirected one does not: no terminal, nothing to return to.
 out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" off 2>&1)
 case "$out" in
-  *"supervised=yes"*) ok "a ccd run starts under the launcher that can bring it back" ;;
-  *) bad "no entrance" "the launcher installed by --auto never sees the session: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+  *"supervised="*) ok "...while a run with nowhere to come back to is left alone" ;;
+  *) bad "no entrance" "never reached the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
 esac
 # ...but never two of them: a session already supervised must not gain a second
 # launcher underneath the first.
@@ -6222,7 +6402,7 @@ esac
 fake_real '#!/bin/sh
 printf "REAL token=%s\n" "${CCD_HANDOFF:-none}"'
 out=$(PATH="$SHIMPATH" HOME="$FAKE" CCD_HANDOFF=00000000000000000000000000000001 \
-      "$ROOT/bin/ccd" off 2>&1)
+      shim_run "$ROOT/bin/ccd" off 2>&1)
 case "$out" in
   *"token=00000000000000000000000000000001"*)
     ok "...and a session that already has one does not get a second" ;;

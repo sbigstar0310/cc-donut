@@ -373,8 +373,11 @@ def live_read():
 def live_write(blob, sources):
     """Write the blob everywhere Claude Code might read it.
 
-    Returns (ok, failed): ok only when EVERY backend that had to take the write
-    took it, and failed naming the ones that did not.
+    Returns (ok, failed, written): ok only when EVERY backend that had to take
+    the write took it, failed naming the ones that refused, and written naming
+    the ones that now hold this blob. A caller undoing a partial write needs that
+    last list — which backends were READABLE is a different question, and
+    answering it instead is how a split store went unrepaired.
 
     Half a write is not a write. On macOS a stale ~/.claude/.credentials.json is
     a real hazard: Claude Code falls back to it when the keychain read fails, so
@@ -388,15 +391,16 @@ def live_write(blob, sources):
     else:
         targets.discard("keychain")
         targets.add("file")
-    failed = []
-    if "keychain" in targets and not _keychain_write(blob):
-        failed.append("keychain")
+    failed, written = [], []
+    if "keychain" in targets:
+        (written if _keychain_write(blob) else failed).append("keychain")
     if "file" in targets:
         try:
             write_json(credentials_file(), blob, 0o600)
+            written.append("file")
         except Exception:
             failed.append("file")
-    return (bool(targets) and not failed), failed
+    return (bool(targets) and not failed), failed, written
 
 
 # ── Account store ────────────────────────────────────────────────────────────
@@ -896,14 +900,27 @@ def account_refresh(name, acct):
     Ordering inside matters too: the rotated refresh token is written to disk
     BEFORE the new access token is used for anything. Crashing between the two
     costs one wasted access token; the reverse order costs the whole account."""
-    # Cheap "don't start": the live credential belongs to Claude Code, and
-    # rotating it consumes a one-time token that session is still holding. Under
-    # the lock this cannot change underneath us — swap_to takes the same lock.
+    # Cheap "don't start": no point queueing for a lock to do nothing with it.
     if active_name() == name:
         return False, "stale"
     try:
         with Lock(LOCK_FILE, fatal=False):
-            fresh = account_load(name) or acct
+            # Everything the exchange depends on is established HERE, after the
+            # wait. The pre-check above is about the world we saw; a swap can
+            # finish, or Claude Code can publish a profile, while we queue.
+            #
+            # If this account is live now, do not refresh it. The credential
+            # belongs to Claude Code: consuming its refresh token leaves that
+            # session holding one it can never renew, and handing it the
+            # successor would mean writing the live blob out from under a
+            # process that is refreshing it too. Claude Code renews its own.
+            if active_name() == name:
+                return False, "stale"
+            fresh = account_load(name)
+            if fresh is None:
+                # Removed while we waited. The caller's snapshot is not a
+                # registration, and saving from it would bring the account back.
+                return False, "gone"
             oauth = fresh.get("claudeAiOauth") or {}
             rt = oauth.get("refreshToken")
             if not rt:
@@ -1213,8 +1230,8 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
         # that is the whole reason live_write exists, and a stale
         # ~/.credentials.json beside a good keychain resurrects the old account.
         if cur == name:
-            written, failed = live_write(blob, sources)
-            if not written:
+            reconciled, failed, _ = live_write(blob, sources)
+            if not reconciled:
                 # Not fatal: nothing was supposed to change and the credential in
                 # use is still good. But a silent failure here is how a stale
                 # fallback file survives to resurrect the previous account.
@@ -1223,16 +1240,19 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
         else:
             new_blob = dict(blob)
             new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
-            written, failed = live_write(new_blob, sources)
-            if not written:
-                # Put back what every backend that DID take the write is now
-                # holding. Left split, the stores disagree about who is signed in
-                # and the next bank copies one half over the other; restoring is
-                # the only ending that leaves the account intact.
-                if failed and len(failed) < len(set(sources) | {"file"}):
-                    live_write(blob, sources)
-                die("failed to write the credential store ("
-                    + ", ".join(failed) + ")")
+            installed, failed, written = live_write(new_blob, sources)
+            if not installed:
+                # Some backends took the new credential and some did not: the
+                # stores now disagree about who is signed in, and the next bank
+                # copies one half over the other. Put back what the session is
+                # still holding — and if THAT cannot be done, say so, because a
+                # split store is the one state nothing downstream can reason about.
+                note = ", ".join(failed)
+                if written:
+                    undone, undo_failed, _ = live_write(blob, sources)
+                    if not undone:
+                        note += "; could not restore " + ", ".join(undo_failed)
+                die("failed to write the credential store (" + note + ")")
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
@@ -1609,7 +1629,9 @@ def cmd_refresh(args):
         else:
             rc = 1
             hint = {"dead": "needs re-login",
-                    "busy": "the store was busy — try again"}.get(why, "unreachable")
+                    "busy": "the store was busy — try again",
+                    "gone": "no longer registered",
+                    "stale": "signed in here — Claude Code renews it"}.get(why, "unreachable")
             print(f"{C_RED}✗{C_RESET} {name} — {hint}")
     # A clean sweep of every spare is a repair, and the backoff keepalive computes
     # from the failure count no longer describes anything. Only here: writing this
