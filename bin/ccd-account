@@ -28,7 +28,6 @@ Commands:
   ccd account rm <name>
   ccd account use [<name>] [--json]
   ccd account refresh [--all] [--inactive-only] [<name>]
-  ccd account reconcile [<name>]
   ccd account pick [--json]
   ccd account swap [--from N] [--window K] (internal: called by the hook)
   ccd account keepalive          (internal: called by the hook, at most daily)
@@ -119,11 +118,18 @@ KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
 # account it just left as spent. Bounded by time: an entry is a statement about
 # the last half hour, not a permanent verdict, and nothing is evicted while it
 # still describes now (see swap_guard_read).
-# Written when a credential write left the backends holding different things and
-# putting them back failed too. While it exists nothing may install or bank a
-# credential: the stores disagree about who is signed in, and every copy from one
-# to the other files one account's credential under another's name.
+# Written BEFORE a credential write that could leave the backends holding
+# different things, and removed once they provably agree again. While it exists
+# nothing may install or bank a credential: the stores disagree about who is
+# signed in, and every copy from one to the other files one account's credential
+# under another's name.
 STORE_SPLIT = os.path.join(CCD_DIR, "store-split")
+# ccd does not repair the store. Claude Code writes every backend itself on a
+# /login, which is more authoritative than anything ccd could reconstruct from a
+# snapshot it happens to hold — so the only thing ccd owes the user is a true
+# report and a stop that lifts by itself the moment the stores agree again.
+SPLIT_WAY_OUT = ("Sign in again with /login — Claude Code writes every credential "
+                 "store itself, and ccd picks that up on its next command.")
 SWAP_GUARD = os.path.join(CCD_DIR, "swapped-windows")
 SWAP_GUARD_TTL = int(os.environ.get("CCD_SWAP_GUARD_TTL", "1800"))
 # Breadcrumb for the hook. keepalive runs backgrounded with its output discarded,
@@ -376,16 +382,75 @@ def live_read():
     return (blob if blob is not None else {}), sources
 
 
+def live_creds():
+    """Return ({backend: refresh token}, [backends that would not answer]).
+
+    live_read() answers a different question — what to write back — and folds the
+    backends into one preferred blob, which drops the other one's credential out
+    of view. Anything deciding whether a stored token is safe to SPEND has to see
+    all of them: a running session may be carrying the one that was dropped. And a
+    backend that will not answer is unknown, never absent — an empty answer is
+    what let an exchange proceed with nothing read at all."""
+    held, blind = {}, []
+    if use_keychain():
+        k = _keychain_read()
+        if k is None:
+            blind.append("keychain")
+        else:
+            held["keychain"] = (k.get("claudeAiOauth") or {}).get("refreshToken") or ""
+    path = credentials_file()
+    filed = read_json(path)
+    if filed is not None:
+        held["file"] = (filed.get("claudeAiOauth") or {}).get("refreshToken") or ""
+    elif os.path.exists(path):
+        blind.append("file")
+    return held, blind
+
+
 def store_split():
-    """What the last unrepairable write left behind, or None."""
+    """The stop a credential write left behind, as recorded. A cheap read: it
+    says a stop may be standing, not that it still applies."""
     return read_json(STORE_SPLIT)
 
 
-def mark_store_split(detail):
+def store_split_now():
+    """The stop, re-tested against the stores. Call it holding the store lock.
+
+    This is the whole way out, and it is not a repair: /login makes Claude Code
+    write every backend itself, and once every store the record names can be seen
+    to hold the same credential there is nothing left to stop. A store it cannot
+    see is not agreement — that is the same rule live_creds() states.
+
+    The lock is what makes the test honest. A writer that has recorded its intent
+    but not yet touched a backend leaves the stores agreeing, and lifting the stop
+    there would throw away exactly the protection the record exists to give."""
+    rec = read_json(STORE_SPLIT)
+    if rec is None:
+        return None
+    held, blind = live_creds()
+    named = rec.get("stores") or sorted(held)
+    if not blind and named and all(n in held for n in named) \
+            and len(set(held.values())) <= 1:
+        clear_store_split()
+        return None
+    return rec
+
+
+def mark_store_split(detail, stores):
+    """Record, BEFORE a backend is touched, that this write could leave them
+    disagreeing. Returns False when it could not be written.
+
+    Write-ahead, not best-effort. A state directory that cannot hold the record is
+    a protection that cannot be recorded, and an unrecorded protection is none at
+    all: the next command would bank one account's credential under another's name
+    with nothing left to stop it. So a caller that cannot record its intent does
+    not write the credential either."""
     try:
-        write_json(STORE_SPLIT, {"detail": detail, "at": now()})
+        write_json(STORE_SPLIT,
+                   {"detail": detail, "stores": sorted(stores), "at": now()})
+        return True
     except Exception:
-        pass            # the die() below is the report either way
+        return False
 
 
 def clear_store_split():
@@ -393,6 +458,19 @@ def clear_store_split():
         os.unlink(STORE_SPLIT)
     except OSError:
         pass
+
+
+def write_targets(sources):
+    """Every backend a write has to land in: wherever the blob was read from,
+    plus the keychain on a platform that keeps one. The write-ahead record names
+    these, so it has to be the same answer live_write() acts on."""
+    targets = set(sources)
+    if use_keychain():
+        targets.add("keychain")
+    else:
+        targets.discard("keychain")
+        targets.add("file")
+    return sorted(targets)
 
 
 def live_write(blob, sources):
@@ -410,12 +488,7 @@ def live_write(blob, sources):
     disagrees with itself — and the next bank copies the stale half back over the
     new one, destroying a credential nobody can mint again. Reporting that as
     success is what let it happen quietly."""
-    targets = set(sources)
-    if use_keychain():
-        targets.add("keychain")
-    else:
-        targets.discard("keychain")
-        targets.add("file")
+    targets = write_targets(sources)
     failed, written = [], []
     if "keychain" in targets:
         (written if _keychain_write(blob) else failed).append("keychain")
@@ -721,12 +794,16 @@ def bank_live_oauth():
 
     Rationale, and the residual cases this cannot cover, live in
     docs/multi-account.md §12.0.1 through §12.0.5."""
-    if store_split():
-        return                 # the stores disagree; copying between them spreads it
-    if _bank_target() is None:
+    if not store_split() and _bank_target() is None:
         return                 # cheap pre-check: keeps the lock uncontended
     try:
         with Lock(LOCK_FILE, wait=False):
+            # Under the lock, because a stop can land while we queue for it and
+            # copying between stores that disagree is how the split spreads. It is
+            # also where a healed store lifts its own stop, which is what makes
+            # /login the only thing the user has to do.
+            if store_split_now():
+                return
             target = _bank_target()
             if target is None:
                 return         # the blob moved while we waited
@@ -956,8 +1033,15 @@ def account_refresh(name, acct):
             # live between here and the request — Claude Code publishes its
             # profile without touching any lock — but the only way OUR token
             # becomes the live one is a swap, and swaps take the lock we hold.
-            if rt and rt == ((live_read()[0].get("claudeAiOauth") or {})
-                             .get("refreshToken")):
+            #
+            # Every readable backend, not the preferred one: with the keychain on
+            # A and the file on B, comparing one blob drops B out of view and the
+            # exchange spends the token a session is carrying. And a backend that
+            # will not answer is unknown, which refuses — it may hold that token.
+            held, blind = live_creds()
+            if blind or not held:
+                return False, "unsure"
+            if rt in held.values():
                 return False, "stale"
             new_oauth, status = token_refresh(rt)
             if not new_oauth:
@@ -1223,11 +1307,11 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     one-time token, so installing a snapshot hands the session a token the server
     has retired, which is a dead spare at the worst possible moment."""
     with Lock(LOCK_FILE, timeout=lock_timeout):
-        split = store_split()
+        split = store_split_now()
         if split:
             die("the credential stores disagree with each other ("
                 + str(split.get("detail") or "unknown") + ")."
-                "\n     Put them back in step with: ccd account reconcile")
+                "\n     " + SPLIT_WAY_OUT)
         target = account_load(name)
         if not target:
             die(f"no such account: {name}")
@@ -1267,37 +1351,58 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
         # that is the whole reason live_write exists, and a stale
         # ~/.credentials.json beside a good keychain resurrects the old account.
         if cur == name:
-            reconciled, failed, _ = live_write(blob, sources)
-            if not reconciled:
+            # No write-ahead record here: every backend is being handed what one
+            # of them already holds, so a partial failure cannot make them
+            # disagree about anything they agreed on before.
+            evened, failed, _ = live_write(blob, sources)
+            if not evened:
                 # Not fatal: nothing was supposed to change and the credential in
                 # use is still good. But a silent failure here is how a stale
                 # fallback file survives to resurrect the previous account.
-                warn("could not reconcile the credential stores ("
+                warn("could not put the credential stores back in step ("
                      + ", ".join(failed) + ")")
         else:
             new_blob = dict(blob)
             new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
+            targets = write_targets(sources)
+            # Write-ahead. Between the first backend taking the new credential and
+            # the last, the stores disagree; dying in there with nothing recorded
+            # is how the next command files one account's credential under the
+            # other's name. So the intent goes down first, and a state directory
+            # that cannot hold it means no credential is written at all.
+            if not mark_store_split(
+                    f"a swap to {name} was interrupted before every store agreed",
+                    targets):
+                die("cannot record what this swap is about to change ("
+                    + STORE_SPLIT + ") — refusing to touch the credential stores "
+                    "without it")
             installed, failed, written = live_write(new_blob, sources)
             if not installed:
                 # Some backends took the new credential and some did not: the
                 # stores now disagree about who is signed in, and the next bank
                 # copies one half over the other. Put back what the session is
-                # still holding — and if THAT cannot be done, say so, because a
-                # split store is the one state nothing downstream can reason about.
+                # still holding.
                 note = ", ".join(failed)
+                stuck = list(written)
                 if written:
-                    undone, undo_failed, _ = live_write(blob, sources)
-                    if not undone:
-                        # Neither the new credential nor the old one is everywhere.
-                        # Nothing may copy between these stores until a human — or
-                        # one reconcile — decides what they should both hold.
-                        note += "; could not restore " + ", ".join(undo_failed)
-                        mark_store_split(
-                            f"{', '.join(written)} hold the new credential, "
-                            f"{', '.join(failed)} kept the old one")
+                    _, undo_failed, _ = live_write(blob, sources)
+                    # What the ROLLBACK achieved, not what the install attempted: a
+                    # backend that refused the new credential refuses the redundant
+                    # restore too, and it never moved. Recording that as a split
+                    # stops a machine that is perfectly consistent.
+                    stuck = [b for b in written if b in undo_failed]
+                    if stuck:
+                        note += "; could not restore " + ", ".join(stuck)
+                if not stuck:
+                    clear_store_split()
+                    die("failed to write the credential store (" + note + ")")
+                mark_store_split(
+                    f"{', '.join(stuck)} took {name}'s credential, "
+                    f"{', '.join(b for b in targets if b not in stuck)} kept "
+                    f"the one before it", targets)
                 die("failed to write the credential store (" + note + ")"
-                    + ("\n     Put them back in step with: ccd account reconcile"
-                       if store_split() else ""))
+                    + "\n     " + SPLIT_WAY_OUT)
+            clear_store_split()
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
@@ -1648,37 +1753,6 @@ def _swap_no(reason):
     return 4
 
 
-def cmd_reconcile(args):
-    """Put every credential backend back in step, and clear the split record.
-
-    The way out of a store that disagrees with itself. One account is chosen —
-    the one named, or the one the pointer says is active — and its stored
-    credential is written to every backend. That is the only repair ccd can make
-    honestly: it knows what it registered, not which half of a split store the
-    user would rather keep."""
-    name = args.name or active_name()
-    if not name:
-        die("nothing to reconcile to — name an account: ccd account reconcile <name>")
-    with Lock(LOCK_FILE):
-        acct = account_load(name)
-        if not acct:
-            die(f"no such account: {name}")
-        oauth = acct.get("claudeAiOauth")
-        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
-            die(f"account '{name}' has no usable credentials to reconcile to")
-        blob, sources = live_read()
-        new_blob = dict(blob or {})
-        new_blob["claudeAiOauth"] = oauth
-        ok, failed, _ = live_write(new_blob, sources)
-        if not ok:
-            die("the credential stores still disagree (" + ", ".join(failed) + ")"
-                "\n     Fix that backend, then run: ccd account reconcile " + name)
-        active_set(name)
-        clear_store_split()
-    print(f"{C_GRN}✓{C_RESET} every credential store now holds {C_BOLD}{name}{C_RESET}")
-    return 0
-
-
 def cmd_refresh(args):
     cur = active_name()
     if args.name:
@@ -1707,7 +1781,9 @@ def cmd_refresh(args):
             hint = {"dead": "needs re-login",
                     "busy": "the store was busy — try again",
                     "gone": "no longer registered",
-                    "stale": "signed in here — Claude Code renews it"}.get(why, "unreachable")
+                    "stale": "signed in here — Claude Code renews it",
+                    "unsure": "cannot see the live credential — not spending it"
+                    }.get(why, "unreachable")
             print(f"{C_RED}✗{C_RESET} {name} — {hint}")
     # A clean sweep of every spare is a repair, and the backoff keepalive computes
     # from the failure count no longer describes anything. Only here: writing this
@@ -2147,11 +2223,6 @@ def main(argv):
     a.add_argument("--json", action="store_true")
     a.add_argument("--force", action="store_true")
     a.set_defaults(fn=cmd_use)
-
-    a = sub.add_parser("reconcile",
-                       help="put every credential store back in step after a split write")
-    a.add_argument("name", nargs="?")
-    a.set_defaults(fn=cmd_reconcile)
 
     a = sub.add_parser("refresh", help="refresh stored tokens")
     a.add_argument("name", nargs="?")

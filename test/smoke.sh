@@ -6408,28 +6408,39 @@ calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
   && ok "...and the stored copy still matches what that session has" \
   || bad "spent the live token" "store holds $(tx_tok "$ADIR/r1_b.json")"
 
-# ── A store that disagrees with itself stops everything until it is repaired ─
+# ── A store that disagrees with itself stops everything, and ccd never repairs it ─
 # One backend took the new credential and the other kept the old, and putting it
 # back failed too. The next swap's outgoing backup would read the half the
 # keychain answers with and file it under the registration the pointer names —
-# one account's credential saved as another's. Nothing may move until that is
-# reconciled, and the way out has to be one step.
-PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
-  && ok "a rollback that fails too is recorded as a store that cannot be trusted" \
-  || bad "unrecorded split" "the swap left the stores disagreeing and said nothing"
-import importlib.machinery, importlib.util, json, os, sys
+# one account's credential saved as another's. Nothing may move until the stores
+# agree again, and the only thing that can put them back in step is /login:
+# Claude Code writes every backend itself, which is more authoritative than
+# anything ccd could reconstruct from what it happens to have on file.
+split_home() { # $1=case name -> a HOME of this case's own
+  rm -rf "$FAKE/split-$1"; mkdir -p "$FAKE/split-$1/.claude"; printf '%s' "$FAKE/split-$1"
+}
+SPLIT_PRE='
+import importlib.machinery, importlib.util, json, os, sys, time
 os.environ["HOME"] = sys.argv[2]
 os.environ.pop("CCD_CREDENTIALS_BACKEND", None)
 loader = importlib.machinery.SourceFileLoader("ccdsplit", sys.argv[1])
 spec = importlib.util.spec_from_loader(loader.name, loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
+m.ensure_dirs()
+m._keychain_read = lambda: None          # never the developer key, on any path
+OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
+TARGET = {"name": "target", "claudeAiOauth":
+          {"accessToken": "AT-target", "refreshToken": "RT-target"}}
+def only_target(n):
+    return dict(TARGET) if n == "target" else None
+'
 
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 try:
     os.unlink(m.STORE_SPLIT)
-except (OSError, AttributeError):
+except OSError:
     pass
-OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
 # The keychain takes the install and then refuses the rollback; the file refuses
 # throughout. That is the state with no good half left to copy from.
 calls = {"n": 0}
@@ -6446,9 +6457,7 @@ def selective(p, obj, mode=0o600):
     return real_write(p, obj, mode)
 m.write_json = selective
 m.active_name = lambda: "someone_else"
-m.account_load = lambda n: ({"name": n, "claudeAiOauth":
-                             {"accessToken": "AT-target", "refreshToken": "RT-target"}}
-                            if n == "target" else None)
+m.account_load = only_target
 m.account_save = lambda n, o: None
 err = None
 try:
@@ -6456,42 +6465,204 @@ try:
 except SystemExit as e:
     err = str(e)
 assert err is not None, "swap_to reported success on a store it could not repair"
-assert os.path.exists(m.STORE_SPLIT), "nothing recorded that the store is split"
-# The record has to say what each half is holding: it is what doctor prints and
-# what tells a human which way to reconcile.
-note = (json.load(open(m.STORE_SPLIT)).get("detail") or "")
+rec = json.load(open(m.STORE_SPLIT))
+# The record has to say what each half is holding — it is what doctor prints —
+# and which stores the stop is about, which is what lets it be re-tested later.
+note = rec.get("detail") or ""
 assert "keychain" in note and "file" in note, f"the record says too little: {note!r}"
-PY
-rm -f "$FAKE/.claude/ccd/store-split"
+assert rec.get("stores") == ["file", "keychain"], f"the stop names no stores: {rec!r}"
+' "$ROOT/bin/ccd-account" "$(split_home rollback)" \
+  && ok "a rollback that fails too is recorded as a store that cannot be trusted" \
+  || bad "unrecorded split" "the swap left the stores disagreeing and said nothing"
 
-# ...and while that record stands, nothing else may touch the credential stores.
+# A rollback that PUT EVERYTHING BACK is not a split, however loudly the install
+# failed. The backend that refused the new credential refuses the redundant
+# restore too, and it never moved: recording that as a split stops a machine that
+# is perfectly consistent.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+m._keychain_write = lambda blob: False   # refuses the install AND the restore
+m.live_read = lambda: (OLD, ["keychain", "file"])
+m.active_name = lambda: "someone_else"
+m.account_load = only_target
+m.account_save = lambda n, o: None
+try:
+    m.swap_to("target", force=True)
+except SystemExit:
+    pass
+assert not os.path.exists(m.STORE_SPLIT), \
+    "a store that ends up consistent was stopped anyway: " + open(m.STORE_SPLIT).read()
+live = json.load(open(m.credentials_file()))
+assert live["claudeAiOauth"]["accessToken"] == "AT-old", \
+    "the rollback did not put the file back: " + json.dumps(live["claudeAiOauth"])
+' "$ROOT/bin/ccd-account" "$(split_home consistent)" \
+  && ok "a rollback that put every backend back is not recorded as a split" \
+  || bad "false split" "a consistent store was stopped over a refused redundant write"
+
+# Write-ahead, not best-effort. If the intent cannot be recorded, the credential
+# is not written at all: an unwritable state directory would otherwise disable
+# the protection silently, and the next command banks one account's credential
+# under another's name with nothing left to stop it.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+touched = []
+m.use_keychain = lambda: True
+m._keychain_write = lambda blob: (touched.append("keychain"), True)[1]
+m.live_read = lambda: (OLD, ["keychain", "file"])
+real_write = m.write_json
+def selective(p, obj, mode=0o600):
+    if os.path.basename(str(p)) == "store-split":
+        raise OSError("read-only state directory")
+    touched.append(os.path.basename(str(p)))
+    return real_write(p, obj, mode)
+m.write_json = selective
+m.active_name = lambda: "someone_else"
+m.account_load = only_target
+m.account_save = lambda n, o: None
+err = None
+try:
+    m.swap_to("target", force=True)
+except SystemExit as e:
+    err = str(e)
+assert err is not None, "the swap went ahead with no way to record what it was doing"
+assert touched == [], f"a credential backend was written anyway: {touched!r}"
+' "$ROOT/bin/ccd-account" "$(split_home noroom)" \
+  && ok "a state directory that cannot hold the record means no credential is written" \
+  || bad "unrecorded write" "the swap wrote credentials it could not record"
+
+# The stop is re-tested, never repaired. /login makes Claude Code write every
+# backend itself, and the moment they agree again there is nothing left to stop.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+held = {"keychain": "RT-old"}
+m.use_keychain = lambda: True
+m._keychain_read = lambda: {"claudeAiOauth": {"refreshToken": held["keychain"]}}
+m.write_json(m.credentials_file(),
+             {"claudeAiOauth": {"accessToken": "AT-new", "refreshToken": "RT-new"}})
+m.write_json(m.STORE_SPLIT, {"detail": "keychain kept the old credential",
+                             "stores": ["file", "keychain"]})
+assert m.store_split_now() is not None, "the stop lifted while the stores disagreed"
+held["keychain"] = "RT-new"          # /login wrote both backends
+assert m.store_split_now() is None, "the stop stood after the stores were put back in step"
+assert not os.path.exists(m.STORE_SPLIT), "the record outlived the disagreement"
+' "$ROOT/bin/ccd-account" "$(split_home login)" \
+  && ok "the stop lifts by itself once every store it names agrees again" \
+  || bad "no way out" "/login put the stores back in step and ccd stayed stopped"
+
+# Banking re-checks the record under the lock. The pre-check describes the world
+# we saw; the record can land while we queue, and copying between stores that
+# disagree is exactly how one account's credential gets filed under another's.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+saved = []
+m.use_keychain = lambda: False
+m.account_save = lambda n, o: saved.append(n)
+m.account_load = lambda n: {"name": n}
+m._bank_target = lambda: ("acct", {"accessToken": "AT-live", "refreshToken": "RT-live"})
+RealLock = m.Lock
+class MarkingLock(RealLock):
+    def __enter__(self):
+        got = RealLock.__enter__(self)
+        m.write_json(m.STORE_SPLIT, {"detail": "another ccd stopped mid-write",
+                                     "stores": ["file", "keychain"]})
+        return got
+m.Lock = MarkingLock
+m.bank_live_oauth()
+assert saved == [], f"banked across a store that started disagreeing while it waited: {saved!r}"
+' "$ROOT/bin/ccd-account" "$(split_home banklock)" \
+  && ok "banking re-reads the stop under the lock, not only before it" \
+  || bad "banked on a split" "the record landed while banking waited and it copied anyway"
+
+# The gate that decides whether a stored token is safe to spend has to look at
+# EVERY backend. Preferring one drops the other's credential from the comparison,
+# and a running session may well be carrying the one that was dropped.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+spent = []
+m.use_keychain = lambda: True
+m._keychain_read = lambda: {"claudeAiOauth": {"refreshToken": "RT-a"}}
+m.write_json(m.credentials_file(),
+             {"claudeAiOauth": {"accessToken": "AT-b", "refreshToken": "RT-b"}})
+m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
+m.active_name = lambda: None
+far = int((time.time() + 8 * 86400) * 1000)
+m.account_load = lambda n: {"name": "b", "claudeAiOauth":
+                            {"accessToken": "AT-b", "refreshToken": "RT-b",
+                             "refreshTokenExpiresAt": far}}
+okd, st = m.account_refresh("b", {})
+assert spent == [], f"spent a token the other backend is holding: {spent!r}"
+assert okd is False and st == "stale", f"got {okd!r}/{st!r}"
+' "$ROOT/bin/ccd-account" "$(split_home bothbackends)" \
+  && ok "a token any readable backend is holding is never spent" \
+  || bad "spent a live token" "the gate looked at one backend and missed the other"
+
+# And a backend it cannot read is unknown, not absent. An empty answer is what
+# let the exchange proceed when nothing could be read at all.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+spent = []
+m.use_keychain = lambda: True
+m._keychain_read = lambda: None          # the keychain will not answer
+m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
+m.active_name = lambda: None
+far = int((time.time() + 8 * 86400) * 1000)
+m.account_load = lambda n: {"name": "b", "claudeAiOauth":
+                            {"accessToken": "AT-b", "refreshToken": "RT-b",
+                             "refreshTokenExpiresAt": far}}
+okd, st = m.account_refresh("b", {})
+assert spent == [], f"spent a token with no idea what the session is holding: {spent!r}"
+assert okd is False, f"got {okd!r}/{st!r}"
+' "$ROOT/bin/ccd-account" "$(split_home blind)" \
+  && ok "a credential store that cannot be read refuses the exchange, it does not permit it" \
+  || bad "spent a token blind" "an unreadable backend was treated as an empty one"
+
+# ...and while the stop stands, nothing else may touch the credential stores. The
+# record names both backends; this suite can only see the file one, so it cannot
+# be re-tested here — which is exactly the shape of "ccd cannot see that they
+# agree", and the stop has to hold.
 mkdir -p "$ADIR"
-printf '{"detail":"keychain kept AT-old, file holds AT-new"}' > "$TXD/store-split"
-write_creds split_a; "$ACCT" --no-color add --name split_a >/dev/null 2>&1
+printf '{"detail":"keychain kept AT-old, file holds AT-new","stores":["file","keychain"]}' \
+  > "$TXD/store-split"
 write_creds split_b; "$ACCT" --no-color add --name split_b >/dev/null 2>&1
-write_creds split_a                     # the session is on split_a
+write_creds split_a; "$ACCT" --no-color add --name split_a >/dev/null 2>&1
 out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
 { [ "$rc" -ne 0 ] && ! grep -q 'AT-split_b' "$CREDS"; } \
   && ok "a swap refuses to run on a store that is known to disagree with itself" \
   || bad "swapped on a split store" "rc=$rc, credential $(tx_tok "$CREDS")"
 case "$out" in
-  *reconcile*) ok "...and names the one command that gets the user out" ;;
+  *"/login"*) ok "...and sends the user to /login, the one thing that can fix it" ;;
   *) bad "no way out" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+case "$out" in
+  *reconcile*) bad "still offering a repair" "ccd offered to rebuild the store itself" ;;
+  *) ok "...and never offers to rebuild the store itself" ;;
 esac
 out=$(HOME="$FAKE" CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
 case "$out" in
-  *"disagree"*) ok "...and doctor says it, where somebody would go looking" ;;
-  *) bad "doctor blind" "doctor never mentions the split store" ;;
+  *"disagree"*"/login"*) ok "...and doctor says it, where somebody would go looking" ;;
+  *) bad "doctor blind" "doctor never sends the user to /login over the split store" ;;
 esac
-out=$("$ACCT" --no-color reconcile split_a 2>&1); rc=$?
-{ [ "$rc" -eq 0 ] && [ ! -e "$TXD/store-split" ]; } \
-  && ok "...and one reconcile puts every backend back in step and clears it" \
-  || bad "no recovery" "rc=$rc, marker $([ -e "$TXD/store-split" ] && echo kept || echo gone): $(printf '%s' "$out" | head -c 100)"
+"$ACCT" --no-color reconcile split_a >/dev/null 2>&1 \
+  && bad "repair command survives" "ccd account reconcile still runs" \
+  || ok "...and there is no ccd command that claims to repair a credential store"
+rm -f "$TXD/store-split"
+
+# Write-ahead, on the real filesystem and not a stubbed one: the record's own path
+# is made unwritable (a directory sits where the file goes) while everything else
+# stays writable. A protection that cannot be recorded is none at all, so the
+# credential must not move either.
+write_creds split_a
+mkdir -p "$TXD/store-split"
+out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && [ "$(tx_tok "$CREDS")" = "AT-split_a" ]; } \
+  && ok "a record ccd cannot write means the credential is not written either" \
+  || bad "wrote what it could not record" "rc=$rc, credential $(tx_tok "$CREDS")"
+case "$out" in
+  *"refusing to touch the credential stores"*) ok "...and says so instead of swapping quietly" ;;
+  *) bad "silent unrecorded write" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+rm -rf "$TXD/store-split"
+
 "$ACCT" --no-color use split_b --force >/dev/null 2>&1 \
   && grep -q 'AT-split_b' "$CREDS" \
   && ok "...after which a swap works again" \
-  || bad "still blocked" "the store stayed unusable after a clean reconcile"
-rm -f "$TXD/store-split"
+  || bad "still blocked" "the store stayed unusable once the stop was gone"
+rm -rf "$FAKE"/split-*
 
 # ── The launcher is the one that knows a run is headless ────────────────────
 # A test that sets the flag itself proves only that the hook reads it. What has

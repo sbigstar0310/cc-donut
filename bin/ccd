@@ -561,14 +561,24 @@ doctor() {
 
   # A store that disagrees with itself stops every swap and every bank, so it is
   # the first thing to say: everything below it is describing a machine that
-  # cannot move a credential until this is cleared.
+  # cannot move a credential until the stores agree again. ccd reports it and
+  # stops there — rebuilding one from a snapshot it happens to hold is exactly
+  # the guess that filed one account's credential under another's name.
+  # Ask ccd-account first. Every one of its commands re-tests the stop against the
+  # stores and lifts it the moment they agree, so this is what keeps doctor from
+  # reporting a disagreement that /login has already put right.
+  if [ -x "$SELF_DIR/ccd-account" ]; then
+    "$SELF_DIR/ccd-account" --no-color current --json >/dev/null 2>&1 || true
+  fi
   if [ -f "$CCD_DIR/store-split" ]; then
     printf '\n%sCredential stores%s\n' "$b" "$r"
     printf '  %s✗ they disagree with each other%s — %s\n' "$red" "$r" \
       "$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("detail") or "unknown"))' \
          "$CCD_DIR/store-split" 2>/dev/null)"
-    printf '      %sNothing will swap or bank until this is cleared. One step out:%s\n' "$d" "$r"
-    printf '      %sccd account reconcile [<name>]%s\n' "$b" "$r"
+    printf '      %sNothing will swap or bank while they disagree, and ccd will not%s\n' "$d" "$r"
+    printf '      %srebuild them: Claude Code writes every credential store itself.%s\n' "$d" "$r"
+    printf '      %sSign in again with %s/login%s%s — ccd picks that up on its next command.%s\n' \
+      "$d" "$b" "$r" "$d" "$r"
   fi
 
   # Spare subscriptions. A dead spare is worth reporting loudly: it looks fine in
