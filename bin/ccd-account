@@ -68,6 +68,8 @@ TOKEN_URLS = (
 if os.environ.get("CCD_TOKEN_URL"):
     TOKEN_URLS = (os.environ["CCD_TOKEN_URL"],)
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+# `security` exit code for "no such item". The one failure that is an answer.
+KEYCHAIN_MISSING = 44
 USER_AGENT = "ccd"
 
 # An account is a candidate only if EVERY window it reports is below this.
@@ -124,12 +126,10 @@ KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
 # signed in, and every copy from one to the other files one account's credential
 # under another's name.
 STORE_SPLIT = os.path.join(CCD_DIR, "store-split")
-# ccd does not repair the store. Claude Code writes every backend itself on a
-# /login, which is more authoritative than anything ccd could reconstruct from a
-# snapshot it happens to hold — so the only thing ccd owes the user is a true
-# report and a stop that lifts by itself the moment the stores agree again.
-SPLIT_WAY_OUT = ("Sign in again with /login — Claude Code writes every credential "
-                 "store itself, and ccd picks that up on its next command.")
+# ccd does not repair the store: a credential Claude Code writes is worth more
+# than anything ccd could reconstruct from a snapshot it happens to hold. All ccd
+# owes the user is a true report and a stop that lifts by itself — see
+# split_way_out(), which is careful not to promise more than a sign-in does.
 SWAP_GUARD = os.path.join(CCD_DIR, "swapped-windows")
 SWAP_GUARD_TTL = int(os.environ.get("CCD_SWAP_GUARD_TTL", "1800"))
 # Breadcrumb for the hook. keepalive runs backgrounded with its output discarded,
@@ -297,7 +297,13 @@ class Lock:
 # contract, not a design choice. It is confined to these two functions.
 
 
-def _keychain_read():
+def _keychain_probe():
+    """Return (blob, state) where state is "ok", "absent" or "blind".
+
+    `security` exits 44 for an item that is simply not in the keychain, and that
+    is a fact about the store: that backend is holding nothing, so it cannot be
+    half of a disagreement. Every other failure leaves the question open, and an
+    open question is never agreement."""
     try:
         p = subprocess.run(
             ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
@@ -306,14 +312,20 @@ def _keychain_read():
             timeout=10,
         )
     except Exception:
-        return None
+        return None, "blind"
+    if p.returncode == KEYCHAIN_MISSING:
+        return None, "absent"
     if p.returncode != 0:
-        return None
+        return None, "blind"
     try:
         d = json.loads(p.stdout.strip())
-        return d if isinstance(d, dict) else None
     except Exception:
-        return None
+        return None, "blind"
+    return (d, "ok") if isinstance(d, dict) else (None, "blind")
+
+
+def _keychain_read():
+    return _keychain_probe()[0]
 
 
 def _keychain_write(blob):
@@ -382,29 +394,59 @@ def live_read():
     return (blob if blob is not None else {}), sources
 
 
+def cred_identity(oauth):
+    """What makes two backends the same credential, or None when they cannot say.
+
+    The ACCESS token. It is what Claude Code actually sends, ccd refuses to
+    register or install a credential without one, and a rotation mints a new
+    access token and refresh token together — so equal access tokens mean the same
+    credential, not merely the same account. The refresh token is the other
+    candidate and is deliberately not used here: it is optional in everything ccd
+    accepts, so two unrelated logins that both lack one would compare equal. That
+    is absence of evidence read as agreement, and it is how a divided store talked
+    itself into looking healthy."""
+    at = (oauth or {}).get("accessToken")
+    return at if isinstance(at, str) and at else None
+
+
 def live_creds():
-    """Return ({backend: refresh token}, [backends that would not answer]).
+    """Return ({backend: its claudeAiOauth}, [backends holding no login],
+    [backends that would not answer]).
 
     live_read() answers a different question — what to write back — and folds the
     backends into one preferred blob, which drops the other one's credential out
-    of view. Anything deciding whether a stored token is safe to SPEND has to see
-    all of them: a running session may be carrying the one that was dropped. And a
-    backend that will not answer is unknown, never absent — an empty answer is
-    what let an exchange proceed with nothing read at all."""
-    held, blind = {}, []
+    of view. Deciding whether a stored token is safe to SPEND, or whether two
+    stores agree, has to see all of them.
+
+    Three answers, not two, because "holding nothing" and "will not say" are
+    opposites. A backend that is not there, or that holds no Claude login at all,
+    cannot be half of a disagreement — counting it as one is how a stop outlived
+    the sign-in that ended it. A backend that will not answer may be holding the
+    very credential in question, so it is never agreement.
+
+    A keychain this platform does not use appears in none of the three: ccd has no
+    way to look, which is not the same as having looked and found nothing."""
+    held, gone, blind = {}, [], []
     if use_keychain():
-        k = _keychain_read()
-        if k is None:
+        blob, state = _keychain_probe()
+        oauth = (blob or {}).get("claudeAiOauth") if state == "ok" else None
+        if state == "blind":
             blind.append("keychain")
+        elif isinstance(oauth, dict) and cred_identity(oauth):
+            held["keychain"] = oauth
         else:
-            held["keychain"] = (k.get("claudeAiOauth") or {}).get("refreshToken") or ""
+            gone.append("keychain")
     path = credentials_file()
     filed = read_json(path)
-    if filed is not None:
-        held["file"] = (filed.get("claudeAiOauth") or {}).get("refreshToken") or ""
-    elif os.path.exists(path):
-        blind.append("file")
-    return held, blind
+    if filed is None:
+        (blind if os.path.exists(path) else gone).append("file")
+    else:
+        oauth = filed.get("claudeAiOauth")
+        if isinstance(oauth, dict) and cred_identity(oauth):
+            held["file"] = oauth
+        else:
+            gone.append("file")
+    return held, gone, blind
 
 
 def store_split():
@@ -416,10 +458,18 @@ def store_split():
 def store_split_now():
     """The stop, re-tested against the stores. Call it holding the store lock.
 
-    This is the whole way out, and it is not a repair: /login makes Claude Code
-    write every backend itself, and once every store the record names can be seen
-    to hold the same credential there is nothing left to stop. A store it cannot
-    see is not agreement — that is the same rule live_creds() states.
+    This is the whole way out, and it is not a repair: signing in again replaces
+    the credential Claude Code uses, and the stop ends when ccd can SEE that every
+    store the record named agrees. Three ways it does not end, each one a bug this
+    was written to stop repeating:
+
+      - a backend that will not answer. It may be holding the other credential.
+      - a named backend ccd can neither read nor rule out.
+      - two identities, or none at all. Equality between two absences is not
+        agreement (cred_identity), and an empty store is not an agreeing store.
+
+    A named backend that is demonstrably holding nothing DOES satisfy the record:
+    it is not a stale half, it is not a half.
 
     The lock is what makes the test honest. A writer that has recorded its intent
     but not yet touched a backend leaves the stores agreeing, and lifting the stop
@@ -427,13 +477,17 @@ def store_split_now():
     rec = read_json(STORE_SPLIT)
     if rec is None:
         return None
-    held, blind = live_creds()
-    named = rec.get("stores") or sorted(held)
-    if not blind and named and all(n in held for n in named) \
-            and len(set(held.values())) <= 1:
-        clear_store_split()
-        return None
-    return rec
+    held, gone, blind = live_creds()
+    if blind:
+        return rec
+    named = rec.get("stores") or sorted(held) + sorted(gone)
+    if any(n not in held and n not in gone for n in named):
+        return rec
+    ids = {cred_identity(o) for o in held.values()}
+    if len(ids) != 1:
+        return rec
+    clear_store_split()
+    return None
 
 
 def mark_store_split(detail, stores):
@@ -451,6 +505,26 @@ def mark_store_split(detail, stores):
         return True
     except Exception:
         return False
+
+
+def split_way_out():
+    """What actually ends a stop, with nothing promised that is not true.
+
+    Signing in again replaces the credential Claude Code USES — on macOS that is
+    the keychain. The file beside it is a fallback Claude Code reads when a
+    keychain write fails, and a sign-in does not rewrite it, so when that stale
+    file is the other half no number of sign-ins will lift the stop. Deleting it
+    will, because a backend holding nothing is not a half. Saying only the first
+    sentence is how a user gets sent in a circle."""
+    return ("Sign in again with /login: that replaces the credential Claude Code "
+            "uses, and ccd lifts this by itself once it can see the stores agree."
+            "\n     If it still stands, the other half is a stale "
+            + _tilde(credentials_file()) + " that /login does not rewrite — delete it.")
+
+
+def _tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
 
 
 def clear_store_split():
@@ -1038,10 +1112,10 @@ def account_refresh(name, acct):
             # A and the file on B, comparing one blob drops B out of view and the
             # exchange spends the token a session is carrying. And a backend that
             # will not answer is unknown, which refuses — it may hold that token.
-            held, blind = live_creds()
+            held, _gone, blind = live_creds()
             if blind or not held:
                 return False, "unsure"
-            if rt in held.values():
+            if any(rt == o.get("refreshToken") for o in held.values()):
                 return False, "stale"
             new_oauth, status = token_refresh(rt)
             if not new_oauth:
@@ -1311,7 +1385,7 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
         if split:
             die("the credential stores disagree with each other ("
                 + str(split.get("detail") or "unknown") + ")."
-                "\n     " + SPLIT_WAY_OUT)
+                "\n     " + split_way_out())
         target = account_load(name)
         if not target:
             die(f"no such account: {name}")
@@ -1401,7 +1475,7 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
                     f"{', '.join(b for b in targets if b not in stuck)} kept "
                     f"the one before it", targets)
                 die("failed to write the credential store (" + note + ")"
-                    + "\n     " + SPLIT_WAY_OUT)
+                    + "\n     " + split_way_out())
             clear_store_split()
             active_set(name)
             # The credential is only half of an account. The other half is what

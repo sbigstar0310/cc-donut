@@ -576,9 +576,13 @@ doctor() {
       "$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("detail") or "unknown"))' \
          "$CCD_DIR/store-split" 2>/dev/null)"
     printf '      %sNothing will swap or bank while they disagree, and ccd will not%s\n' "$d" "$r"
-    printf '      %srebuild them: Claude Code writes every credential store itself.%s\n' "$d" "$r"
-    printf '      %sSign in again with %s/login%s%s — ccd picks that up on its next command.%s\n' \
+    printf '      %srebuild them. Sign in again with %s/login%s%s: that replaces the%s\n' \
       "$d" "$b" "$r" "$d" "$r"
+    printf '      %scredential Claude Code uses, and ccd lifts this by itself once it%s\n' "$d" "$r"
+    printf '      %scan see the stores agree.%s\n' "$d" "$r"
+    printf '      %sIf it still stands, the other half is a stale%s\n' "$d" "$r"
+    printf '      %s%s%s%s that a sign-in does not rewrite — delete it.%s\n' \
+      "$b" "$(tilde "$HOME/.claude/.credentials.json")" "$r" "$d" "$r"
   fi
 
   # Spare subscriptions. A dead spare is worth reporting loudly: it looks fine in

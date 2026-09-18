@@ -6428,7 +6428,9 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
 m.ensure_dirs()
+REAL_PROBE = m._keychain_probe           # kept for the one case that tests it
 m._keychain_read = lambda: None          # never the developer key, on any path
+m._keychain_probe = lambda: (None, "absent")
 OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
 TARGET = {"name": "target", "claudeAiOauth":
           {"accessToken": "AT-target", "refreshToken": "RT-target"}}
@@ -6532,15 +6534,15 @@ assert touched == [], f"a credential backend was written anyway: {touched!r}"
 # The stop is re-tested, never repaired. /login makes Claude Code write every
 # backend itself, and the moment they agree again there is nothing left to stop.
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
-held = {"keychain": "RT-old"}
+held = {"kc": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
 m.use_keychain = lambda: True
-m._keychain_read = lambda: {"claudeAiOauth": {"refreshToken": held["keychain"]}}
+m._keychain_probe = lambda: ({"claudeAiOauth": held["kc"]}, "ok")
 m.write_json(m.credentials_file(),
              {"claudeAiOauth": {"accessToken": "AT-new", "refreshToken": "RT-new"}})
 m.write_json(m.STORE_SPLIT, {"detail": "keychain kept the old credential",
                              "stores": ["file", "keychain"]})
 assert m.store_split_now() is not None, "the stop lifted while the stores disagreed"
-held["keychain"] = "RT-new"          # /login wrote both backends
+held["kc"] = {"accessToken": "AT-new", "refreshToken": "RT-new"}   # signed in again
 assert m.store_split_now() is None, "the stop stood after the stores were put back in step"
 assert not os.path.exists(m.STORE_SPLIT), "the record outlived the disagreement"
 ' "$ROOT/bin/ccd-account" "$(split_home login)" \
@@ -6576,7 +6578,8 @@ assert saved == [], f"banked across a store that started disagreeing while it wa
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 spent = []
 m.use_keychain = lambda: True
-m._keychain_read = lambda: {"claudeAiOauth": {"refreshToken": "RT-a"}}
+m._keychain_probe = lambda: ({"claudeAiOauth": {"accessToken": "AT-a",
+                                                "refreshToken": "RT-a"}}, "ok")
 m.write_json(m.credentials_file(),
              {"claudeAiOauth": {"accessToken": "AT-b", "refreshToken": "RT-b"}})
 m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
@@ -6597,7 +6600,7 @@ assert okd is False and st == "stale", f"got {okd!r}/{st!r}"
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 spent = []
 m.use_keychain = lambda: True
-m._keychain_read = lambda: None          # the keychain will not answer
+m._keychain_probe = lambda: (None, "blind")   # the keychain will not answer
 m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
 m.active_name = lambda: None
 far = int((time.time() + 8 * 86400) * 1000)
@@ -6610,6 +6613,129 @@ assert okd is False, f"got {okd!r}/{st!r}"
 ' "$ROOT/bin/ccd-account" "$(split_home blind)" \
   && ok "a credential store that cannot be read refuses the exchange, it does not permit it" \
   || bad "spent a token blind" "an unreadable backend was treated as an empty one"
+
+# Absence of evidence is not agreement. A credential only has to carry an access
+# token for ccd to register and install it, so two backends can hold DIFFERENT
+# logins that both lack a refresh token — and a stop lifted on that pair hands the
+# next swap a live blob belonging to the other account.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+kc = {"blob": {"claudeAiOauth": {"accessToken": "AT-b"}}}          # B, no refresh token
+m._keychain_probe = lambda: (kc["blob"], "ok")
+m._keychain_read = lambda: kc["blob"]
+m.write_json(m.credentials_file(), {"claudeAiOauth": {"accessToken": "AT-a"}})
+m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a",
+                             "stores": ["file", "keychain"]})
+assert m.store_split_now() is not None, \
+    "two different logins compared equal because neither had a refresh token"
+# ...and a store where nothing can be identified at all is not an agreeing store.
+kc["blob"] = {"claudeAiOauth": {}}
+m.write_json(m.credentials_file(), {"claudeAiOauth": {}})
+assert m.store_split_now() is not None, "a store with no identity anywhere lifted the stop"
+' "$ROOT/bin/ccd-account" "$(split_home noident)" \
+  && ok "two credentials that cannot be told apart are not the same credential" \
+  || bad "absence read as agreement" "the stop lifted on a store that is still divided"
+
+# "Not in the keychain" is an answer; every other failure is not. Nothing else in
+# this suite exercises that branch, because every other case stubs the probe.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+import types
+class Ran:
+    def __init__(self, rc, out=""):
+        self.returncode, self.stdout, self.stderr = rc, out, ""
+def answering(rc, out=""):
+    m.subprocess = types.SimpleNamespace(run=lambda *a, **k: Ran(rc, out))
+answering(44)
+assert REAL_PROBE() == (None, "absent"), "no such item was read as a refusal to answer"
+answering(1)
+assert REAL_PROBE() == (None, "blind"), "a failed keychain read was read as an absence"
+answering(0, json.dumps({"claudeAiOauth": {"accessToken": "AT-k"}}))
+blob, state = REAL_PROBE()
+assert state == "ok" and blob["claudeAiOauth"]["accessToken"] == "AT-k", (state, blob)
+' "$ROOT/bin/ccd-account" "$(split_home probe)" \
+  && ok "the keychain saying nothing is there is not the same as saying nothing" \
+  || bad "probe conflates" "absent and unreadable came back the same"
+
+# Codex's scenario end to end: the install takes the keychain and the rollback
+# cannot put it back, so keychain=B, file=A, pointer=A — every credential carrying
+# an access token and nothing else. The retry must find the stop, and must not
+# bank the keychain half into A on its way past.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+store = {"a": {"name": "a", "claudeAiOauth": {"accessToken": "AT-a"}},
+         "b": {"name": "b", "claudeAiOauth": {"accessToken": "AT-b"}}}
+m.account_load = lambda n: json.loads(json.dumps(store[n])) if n in store else None
+m.account_save = lambda n, o: store.__setitem__(n, json.loads(json.dumps(o)))
+m.active_name = lambda: "a"
+m.active_set = lambda n, stamp=True: None
+m.drop_account_scoped_config = lambda: None
+back = {"keychain": {"claudeAiOauth": {"accessToken": "AT-a"}},
+        "file": {"claudeAiOauth": {"accessToken": "AT-a"}}}
+m.use_keychain = lambda: True
+kcalls = {"n": 0}
+def kwrite(blob):
+    kcalls["n"] += 1
+    if kcalls["n"] == 1:
+        back["keychain"] = json.loads(json.dumps(blob))
+        return True
+    return False                      # refuses the rollback
+m._keychain_write = kwrite
+m._keychain_probe = lambda: (back["keychain"], "ok")
+m._keychain_read = lambda: back["keychain"]
+m.live_read = lambda: (json.loads(json.dumps(back["keychain"])), ["keychain", "file"])
+m.write_json(m.credentials_file(), {"claudeAiOauth": {"accessToken": "AT-a"}})
+real_write = m.write_json
+def selective(p, obj, mode=0o600):
+    if str(p).endswith(".credentials.json"):
+        raise OSError("read-only")     # the file backend keeps A throughout
+    return real_write(p, obj, mode)
+m.write_json = selective
+first = None
+try:
+    m.swap_to("b", force=True)
+except SystemExit as e:
+    first = str(e)
+assert first is not None, "the divided write reported success"
+assert os.path.exists(m.STORE_SPLIT), "nothing recorded the divided store"
+try:
+    m.swap_to("b", force=True)         # the retry
+except SystemExit as e:
+    second = str(e)
+else:
+    raise AssertionError("the retry ran on a store that is still divided")
+assert store["a"]["claudeAiOauth"]["accessToken"] == "AT-a", \
+    "a retry filed b credential under a: " + json.dumps(store["a"]["claudeAiOauth"])
+' "$ROOT/bin/ccd-account" "$(split_home retry)" \
+  && ok "a retry over a divided store neither swaps nor rewrites the outgoing account" \
+  || bad "retry corrupts the store" "the second swap moved something it should not have"
+
+# A backend that is no longer there is not holding a stale credential. Signing in
+# again on macOS writes the keychain and leaves no file, and a stop that outlived
+# that would never lift for anybody.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+m._keychain_probe = lambda: ({"claudeAiOauth": {"accessToken": "AT-new",
+                                                "refreshToken": "RT-new"}}, "ok")
+m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a",
+                             "stores": ["file", "keychain"]})
+assert not os.path.exists(m.credentials_file()), "fixture left a file behind"
+assert m.store_split_now() is None, "a store with one healthy backend and no other stayed stopped"
+' "$ROOT/bin/ccd-account" "$(split_home gone)" \
+  && ok "a named backend that no longer exists satisfies the record" \
+  || bad "no exit" "signing in again left the stop standing for ever"
+
+# ...and neither does a file that is not part of the Claude login at all. It holds
+# no claudeAiOauth, so it cannot be the other half of anything.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+m._keychain_probe = lambda: ({"claudeAiOauth": {"accessToken": "AT-new",
+                                                "refreshToken": "RT-new"}}, "ok")
+m.write_json(m.credentials_file(), {"mcpOAuth": {"notion|abc": {"accessToken": "MCP"}}})
+m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a",
+                             "stores": ["file", "keychain"]})
+assert m.store_split_now() is None, "a file holding no Claude login was counted as a half"
+' "$ROOT/bin/ccd-account" "$(split_home unrelated)" \
+  && ok "a backend holding no Claude login is not one of the halves" \
+  || bad "no exit" "an unrelated credentials file blocked the way out for ever"
 
 # ...and while the stop stands, nothing else may touch the credential stores. The
 # record names both backends; this suite can only see the file one, so it cannot
@@ -6625,8 +6751,15 @@ out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
   && ok "a swap refuses to run on a store that is known to disagree with itself" \
   || bad "swapped on a split store" "rc=$rc, credential $(tx_tok "$CREDS")"
 case "$out" in
-  *"/login"*) ok "...and sends the user to /login, the one thing that can fix it" ;;
+  *"/login"*) ok "...and sends the user to /login, which replaces the credential in use" ;;
   *) bad "no way out" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+case "$out" in
+  *"writes every credential store"*)
+    bad "overclaims" "ccd promises Claude Code writes both stores; it writes one and falls back" ;;
+  *".credentials.json"*)
+    ok "...and names the stale fallback file for the case /login cannot clear" ;;
+  *) bad "no second exit" "nothing says what to do when signing in does not lift it" ;;
 esac
 case "$out" in
   *reconcile*) bad "still offering a repair" "ccd offered to rebuild the store itself" ;;
