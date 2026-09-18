@@ -559,6 +559,18 @@ doctor() {
   # for it: OpenRouter costs money, so it is typed.
   printf '  %s· onto OpenRouter: never automatic%s — `ccd -c` is the way there\n' "$d" "$r"
 
+  # A store that disagrees with itself stops every swap and every bank, so it is
+  # the first thing to say: everything below it is describing a machine that
+  # cannot move a credential until this is cleared.
+  if [ -f "$CCD_DIR/store-split" ]; then
+    printf '\n%sCredential stores%s\n' "$b" "$r"
+    printf '  %s✗ they disagree with each other%s — %s\n' "$red" "$r" \
+      "$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("detail") or "unknown"))' \
+         "$CCD_DIR/store-split" 2>/dev/null)"
+    printf '      %sNothing will swap or bank until this is cleared. One step out:%s\n' "$d" "$r"
+    printf '      %sccd account reconcile [<name>]%s\n' "$b" "$r"
+  fi
+
   # Spare subscriptions. A dead spare is worth reporting loudly: it looks fine in
   # every other view, and its failure only surfaces at the moment of the handoff.
   printf '\n%sSpare Claude accounts%s\n' "$b" "$r"
@@ -1448,6 +1460,13 @@ exec_claude() {
      && is_ccd_shim "$shim" && [ -x "$shim" ]; then
     exec "$shim" "$@"
   fi
+  # Going straight to claude means NO launcher is watching this session — so it
+  # must not claim one. `ccd -p` run inside a supervised session inherits its
+  # parent's contract, and a hook reading it would arm and signal this process on
+  # a launcher that is watching a different one: the batch dies for a relaunch
+  # nobody makes. Supervision is granted by the launcher that starts you, never
+  # by the environment you happened to be born in.
+  unset CCD_HANDOFF CCD_HANDOFF_STATE CCD_HANDOFF_HEADLESS
   local IFS=:
   for d in $PATH; do
     [ -n "$d" ] || continue

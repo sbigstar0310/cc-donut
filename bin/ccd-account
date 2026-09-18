@@ -28,6 +28,7 @@ Commands:
   ccd account rm <name>
   ccd account use [<name>] [--json]
   ccd account refresh [--all] [--inactive-only] [<name>]
+  ccd account reconcile [<name>]
   ccd account pick [--json]
   ccd account swap [--from N] [--window K] (internal: called by the hook)
   ccd account keepalive          (internal: called by the hook, at most daily)
@@ -118,6 +119,11 @@ KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
 # account it just left as spent. Bounded by time: an entry is a statement about
 # the last half hour, not a permanent verdict, and nothing is evicted while it
 # still describes now (see swap_guard_read).
+# Written when a credential write left the backends holding different things and
+# putting them back failed too. While it exists nothing may install or bank a
+# credential: the stores disagree about who is signed in, and every copy from one
+# to the other files one account's credential under another's name.
+STORE_SPLIT = os.path.join(CCD_DIR, "store-split")
 SWAP_GUARD = os.path.join(CCD_DIR, "swapped-windows")
 SWAP_GUARD_TTL = int(os.environ.get("CCD_SWAP_GUARD_TTL", "1800"))
 # Breadcrumb for the hook. keepalive runs backgrounded with its output discarded,
@@ -368,6 +374,25 @@ def live_read():
         if blob is None:
             blob = filed
     return (blob if blob is not None else {}), sources
+
+
+def store_split():
+    """What the last unrepairable write left behind, or None."""
+    return read_json(STORE_SPLIT)
+
+
+def mark_store_split(detail):
+    try:
+        write_json(STORE_SPLIT, {"detail": detail, "at": now()})
+    except Exception:
+        pass            # the die() below is the report either way
+
+
+def clear_store_split():
+    try:
+        os.unlink(STORE_SPLIT)
+    except OSError:
+        pass
 
 
 def live_write(blob, sources):
@@ -696,6 +721,8 @@ def bank_live_oauth():
 
     Rationale, and the residual cases this cannot cover, live in
     docs/multi-account.md §12.0.1 through §12.0.5."""
+    if store_split():
+        return                 # the stores disagree; copying between them spreads it
     if _bank_target() is None:
         return                 # cheap pre-check: keeps the lock uncontended
     try:
@@ -909,13 +936,6 @@ def account_refresh(name, acct):
             # wait. The pre-check above is about the world we saw; a swap can
             # finish, or Claude Code can publish a profile, while we queue.
             #
-            # If this account is live now, do not refresh it. The credential
-            # belongs to Claude Code: consuming its refresh token leaves that
-            # session holding one it can never renew, and handing it the
-            # successor would mean writing the live blob out from under a
-            # process that is refreshing it too. Claude Code renews its own.
-            if active_name() == name:
-                return False, "stale"
             fresh = account_load(name)
             if fresh is None:
                 # Removed while we waited. The caller's snapshot is not a
@@ -927,6 +947,18 @@ def account_refresh(name, acct):
                 return False, "dead"
             if refresh_token_dead(oauth):
                 return False, "dead"
+            # The thing an exchange can hurt is a CREDENTIAL, not a name: what
+            # makes it harmful is spending the refresh token a live session is
+            # carrying, and it is harmful whatever that account happens to be
+            # called or whom the pointer names. So compare the token itself.
+            #
+            # This is also the check that cannot be overtaken. A name can become
+            # live between here and the request — Claude Code publishes its
+            # profile without touching any lock — but the only way OUR token
+            # becomes the live one is a swap, and swaps take the lock we hold.
+            if rt and rt == ((live_read()[0].get("claudeAiOauth") or {})
+                             .get("refreshToken")):
+                return False, "stale"
             new_oauth, status = token_refresh(rt)
             if not new_oauth:
                 return False, ("dead" if status in (400, 401, 403) else "error")
@@ -1191,6 +1223,11 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     one-time token, so installing a snapshot hands the session a token the server
     has retired, which is a dead spare at the worst possible moment."""
     with Lock(LOCK_FILE, timeout=lock_timeout):
+        split = store_split()
+        if split:
+            die("the credential stores disagree with each other ("
+                + str(split.get("detail") or "unknown") + ")."
+                "\n     Put them back in step with: ccd account reconcile")
         target = account_load(name)
         if not target:
             die(f"no such account: {name}")
@@ -1251,8 +1288,16 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
                 if written:
                     undone, undo_failed, _ = live_write(blob, sources)
                     if not undone:
+                        # Neither the new credential nor the old one is everywhere.
+                        # Nothing may copy between these stores until a human — or
+                        # one reconcile — decides what they should both hold.
                         note += "; could not restore " + ", ".join(undo_failed)
-                die("failed to write the credential store (" + note + ")")
+                        mark_store_split(
+                            f"{', '.join(written)} hold the new credential, "
+                            f"{', '.join(failed)} kept the old one")
+                die("failed to write the credential store (" + note + ")"
+                    + ("\n     Put them back in step with: ccd account reconcile"
+                       if store_split() else ""))
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
@@ -1601,6 +1646,37 @@ def _swap_no(reason):
     subscription is measurably spent, and no exit code can answer that."""
     print(reason, file=sys.stderr)
     return 4
+
+
+def cmd_reconcile(args):
+    """Put every credential backend back in step, and clear the split record.
+
+    The way out of a store that disagrees with itself. One account is chosen —
+    the one named, or the one the pointer says is active — and its stored
+    credential is written to every backend. That is the only repair ccd can make
+    honestly: it knows what it registered, not which half of a split store the
+    user would rather keep."""
+    name = args.name or active_name()
+    if not name:
+        die("nothing to reconcile to — name an account: ccd account reconcile <name>")
+    with Lock(LOCK_FILE):
+        acct = account_load(name)
+        if not acct:
+            die(f"no such account: {name}")
+        oauth = acct.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            die(f"account '{name}' has no usable credentials to reconcile to")
+        blob, sources = live_read()
+        new_blob = dict(blob or {})
+        new_blob["claudeAiOauth"] = oauth
+        ok, failed, _ = live_write(new_blob, sources)
+        if not ok:
+            die("the credential stores still disagree (" + ", ".join(failed) + ")"
+                "\n     Fix that backend, then run: ccd account reconcile " + name)
+        active_set(name)
+        clear_store_split()
+    print(f"{C_GRN}✓{C_RESET} every credential store now holds {C_BOLD}{name}{C_RESET}")
+    return 0
 
 
 def cmd_refresh(args):
@@ -2071,6 +2147,11 @@ def main(argv):
     a.add_argument("--json", action="store_true")
     a.add_argument("--force", action="store_true")
     a.set_defaults(fn=cmd_use)
+
+    a = sub.add_parser("reconcile",
+                       help="put every credential store back in step after a split write")
+    a.add_argument("name", nargs="?")
+    a.set_defaults(fn=cmd_reconcile)
 
     a = sub.add_parser("refresh", help="refresh stored tokens")
     a.add_argument("name", nargs="?")

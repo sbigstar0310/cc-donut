@@ -6154,6 +6154,7 @@ wait "$HOLD" 2>/dev/null
 # Two backends, one refusal: the file takes the new blob and the keychain keeps
 # the old. Reporting that as success is how a later bank copies the stale one
 # back over the new — the successor destroyed by the very next swap.
+rm -f "$FAKE/.claude/ccd/store-split"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
   && ok "a write only one backend took is reported as the failure it is" \
   || bad "partial write" "live_write called a split-brain store a success"
@@ -6181,6 +6182,7 @@ assert set(written) == {"keychain", "file"}, f"written: {written!r}"
 PY
 
 # ...and the caller has to act on it rather than carry on.
+rm -f "$FAKE/.claude/ccd/store-split"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
   && ok "...and a swap that cannot write both stores fails instead of claiming a move" \
   || bad "partial write" "the swap reported a credential it had not installed"
@@ -6254,20 +6256,30 @@ PY
 HOLD=$!
 sleep 0.2
 : > "$CCD_FAKE_USAGE_LOG"
-CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b >/dev/null 2>&1 &
+start=$(date +%s)
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b > "$FAKE/.r1-out" 2>&1 &
 REFPID=$!
 sleep 0.5
 r1_go_live                       # r1_b is the live account from here on
-
-wait "$HOLD" 2>/dev/null; wait "$REFPID" 2>/dev/null
+wait "$HOLD" 2>/dev/null
+wait "$REFPID" 2>/dev/null; rc=$?
+waited=$(( $(date +%s) - start ))
 calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
-[ "${calls:-0}" -eq 0 ] \
+# The interleaving itself, asserted rather than assumed: a refresh that did not
+# queue behind the lock never met the publication and would prove nothing.
+[ "$waited" -ge 1 ] \
+  && ok "the refresh queued behind the lock, so it met the account going live" \
+  || bad "no interleaving" "the refresh finished in ${waited}s without waiting"
+{ [ "${calls:-0}" -eq 0 ] && [ "$rc" -ne 0 ]; } \
   && ok "an account that went live while we waited is not refreshed behind its session" \
-  || bad "refreshed the live account" "${calls:-0} exchanges ran after it became live"
+  || bad "refreshed the live account" "${calls:-0} exchanges, rc=$rc"
+grep -q "signed in here" "$FAKE/.r1-out" \
+  && ok "...and says why, rather than reporting an unreachable account" \
+  || bad "wrong refusal" "got: $(tr '\n' ' ' < "$FAKE/.r1-out" | head -c 100)"
 [ "$(tx_tok "$ADIR/r1_b.json")" = "AT-r1_b" ] \
-  && ok "...and its stored credential is the one that session is still holding" \
+  && ok "...with its stored credential still the one that session is holding" \
   || bad "refreshed the live account" "store holds $(tx_tok "$ADIR/r1_b.json")"
-rm -f "$FAKE/.claude.json"
+rm -f "$FAKE/.claude.json" "$FAKE/.r1-out"
 
 # ── An account removed while we waited is not brought back ──────────────────
 r1_fixture
@@ -6282,21 +6294,33 @@ os.close(fd)
 PY
 HOLD=$!
 sleep 0.2
-CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b >/dev/null 2>&1 &
+: > "$CCD_FAKE_USAGE_LOG"
+start=$(date +%s)
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b > "$FAKE/.r5-out" 2>&1 &
 REFPID=$!
 sleep 0.5
 rm -f "$ADIR/r1_b.json"          # `ccd account rm` landing while we wait
-wait "$HOLD" 2>/dev/null; wait "$REFPID" 2>/dev/null
-[ ! -e "$ADIR/r1_b.json" ] \
+wait "$HOLD" 2>/dev/null
+wait "$REFPID" 2>/dev/null; rc=$?
+waited=$(( $(date +%s) - start ))
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+[ "$waited" -ge 1 ] \
+  && ok "the refresh queued behind the lock, so it met the removal" \
+  || bad "no interleaving" "the refresh finished in ${waited}s without waiting"
+{ [ ! -e "$ADIR/r1_b.json" ] && [ "${calls:-0}" -eq 0 ] && [ "$rc" -ne 0 ]; } \
   && ok "a refresh does not re-register an account somebody removed" \
-  || bad "resurrected account" "the record came back from a pre-lock snapshot"
-rm -f "$FAKE/.claude.json"
+  || bad "resurrected account" "exists=$([ -e "$ADIR/r1_b.json" ] && echo yes || echo no) calls=${calls:-0} rc=$rc"
+grep -q "no longer registered" "$FAKE/.r5-out" \
+  && ok "...and says so, rather than reporting it unreachable" \
+  || bad "wrong refusal" "got: $(tr '\n' ' ' < "$FAKE/.r5-out" | head -c 100)"
+rm -f "$FAKE/.claude.json" "$FAKE/.r5-out"
 
 # ── A partial install puts back what it managed to write ────────────────────
 # The rollback has to be about what was actually WRITTEN, not about how many
 # sources happened to be readable: a keychain that cannot be read still gets
 # written, so counting readable sources skips the restore exactly when both
 # stores have been left disagreeing.
+rm -f "$FAKE/.claude/ccd/store-split"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
   && ok "a half-installed credential is rolled back to what the session still holds" \
   || bad "no rollback" "the stores were left disagreeing about who is signed in"
@@ -6315,7 +6339,7 @@ m._keychain_write = lambda blob: False          # the keychain refuses every wri
 # A keychain that could not be READ: the source list names the file alone, while
 # the write still has to reach both.
 m.live_read = lambda: (OLD, ["file"])
-m.write_json = lambda p, obj, mode=0o600: writes.append(obj)
+m.write_json = lambda p, obj, mode=0o600: writes.append((str(p), obj))
 m.active_name = lambda: "someone_else"
 m.account_load = lambda n: ({"name": n, "claudeAiOauth":
                              {"accessToken": "AT-target", "refreshToken": "RT-target"}}
@@ -6327,8 +6351,9 @@ except SystemExit:
     pass
 else:
     raise AssertionError("swap_to reported success on a half-written store")
-assert writes, "nothing was written at all, so this proved nothing"
-last = (writes[-1].get("claudeAiOauth") or {}).get("accessToken")
+creds = [obj for path, obj in writes if path.endswith(".credentials.json")]
+assert creds, "the credential file was never written, so this proved nothing"
+last = (creds[-1].get("claudeAiOauth") or {}).get("accessToken")
 assert last == "AT-old", f"the file was left holding {last!r} while the keychain kept AT-old"
 PY
 
@@ -6359,6 +6384,133 @@ else bad "killed a batch job" "the hook ended a session the launcher would refus
 kill -9 "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null
 rm -f "$TXD/run-state.json"
 
+# ── The token decides, not the name ─────────────────────────────────────────
+# What an exchange can hurt is the CREDENTIAL a session is holding, and a name is
+# only a guess at that. Here the pointer names another account entirely, while the
+# live blob is carrying r1_b's refresh token — spend it and the running session is
+# left with one it can never renew.
+r1_fixture
+stage_usage 5 5 200 0 AT-r1-rotated
+python3 - "$ADIR/r1_b.json" "$CREDS" <<'PY'
+import json, sys
+acct = json.load(open(sys.argv[1]))
+live = json.load(open(sys.argv[2]))
+live["claudeAiOauth"] = dict(acct["claudeAiOauth"])   # the session holds r1_b's token
+json.dump(live, open(sys.argv[2], "w"))
+PY
+: > "$CCD_FAKE_USAGE_LOG"
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh r1_b > "$FAKE/.rtok-out" 2>&1; rc=$?
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+{ [ "${calls:-0}" -eq 0 ] && [ "$rc" -ne 0 ]; } \
+  && ok "a token the live session is holding is never spent, whatever the pointer says" \
+  || bad "spent the live token" "${calls:-0} exchanges, rc=$rc"
+[ "$(tx_tok "$ADIR/r1_b.json")" = "AT-r1_b" ] \
+  && ok "...and the stored copy still matches what that session has" \
+  || bad "spent the live token" "store holds $(tx_tok "$ADIR/r1_b.json")"
+
+# ── A store that disagrees with itself stops everything until it is repaired ─
+# One backend took the new credential and the other kept the old, and putting it
+# back failed too. The next swap's outgoing backup would read the half the
+# keychain answers with and file it under the registration the pointer names —
+# one account's credential saved as another's. Nothing may move until that is
+# reconciled, and the way out has to be one step.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE" <<'PY' \
+  && ok "a rollback that fails too is recorded as a store that cannot be trusted" \
+  || bad "unrecorded split" "the swap left the stores disagreeing and said nothing"
+import importlib.machinery, importlib.util, json, os, sys
+os.environ["HOME"] = sys.argv[2]
+os.environ.pop("CCD_CREDENTIALS_BACKEND", None)
+loader = importlib.machinery.SourceFileLoader("ccdsplit", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+try:
+    os.unlink(m.STORE_SPLIT)
+except (OSError, AttributeError):
+    pass
+OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
+# The keychain takes the install and then refuses the rollback; the file refuses
+# throughout. That is the state with no good half left to copy from.
+calls = {"n": 0}
+def keychain_write(blob):
+    calls["n"] += 1
+    return calls["n"] == 1
+m.use_keychain = lambda: True
+m._keychain_write = keychain_write
+m.live_read = lambda: (OLD, ["keychain", "file"])
+real_write = m.write_json
+def selective(p, obj, mode=0o600):
+    if str(p).endswith(".credentials.json"):
+        raise OSError("read-only")          # the file backend, and only it
+    return real_write(p, obj, mode)
+m.write_json = selective
+m.active_name = lambda: "someone_else"
+m.account_load = lambda n: ({"name": n, "claudeAiOauth":
+                             {"accessToken": "AT-target", "refreshToken": "RT-target"}}
+                            if n == "target" else None)
+m.account_save = lambda n, o: None
+err = None
+try:
+    m.swap_to("target", force=True)
+except SystemExit as e:
+    err = str(e)
+assert err is not None, "swap_to reported success on a store it could not repair"
+assert os.path.exists(m.STORE_SPLIT), "nothing recorded that the store is split"
+# The record has to say what each half is holding: it is what doctor prints and
+# what tells a human which way to reconcile.
+note = (json.load(open(m.STORE_SPLIT)).get("detail") or "")
+assert "keychain" in note and "file" in note, f"the record says too little: {note!r}"
+PY
+rm -f "$FAKE/.claude/ccd/store-split"
+
+# ...and while that record stands, nothing else may touch the credential stores.
+mkdir -p "$ADIR"
+printf '{"detail":"keychain kept AT-old, file holds AT-new"}' > "$TXD/store-split"
+write_creds split_a; "$ACCT" --no-color add --name split_a >/dev/null 2>&1
+write_creds split_b; "$ACCT" --no-color add --name split_b >/dev/null 2>&1
+write_creds split_a                     # the session is on split_a
+out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && ! grep -q 'AT-split_b' "$CREDS"; } \
+  && ok "a swap refuses to run on a store that is known to disagree with itself" \
+  || bad "swapped on a split store" "rc=$rc, credential $(tx_tok "$CREDS")"
+case "$out" in
+  *reconcile*) ok "...and names the one command that gets the user out" ;;
+  *) bad "no way out" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+out=$(HOME="$FAKE" CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
+case "$out" in
+  *"disagree"*) ok "...and doctor says it, where somebody would go looking" ;;
+  *) bad "doctor blind" "doctor never mentions the split store" ;;
+esac
+out=$("$ACCT" --no-color reconcile split_a 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && [ ! -e "$TXD/store-split" ]; } \
+  && ok "...and one reconcile puts every backend back in step and clears it" \
+  || bad "no recovery" "rc=$rc, marker $([ -e "$TXD/store-split" ] && echo kept || echo gone): $(printf '%s' "$out" | head -c 100)"
+"$ACCT" --no-color use split_b --force >/dev/null 2>&1 \
+  && grep -q 'AT-split_b' "$CREDS" \
+  && ok "...after which a swap works again" \
+  || bad "still blocked" "the store stayed unusable after a clean reconcile"
+rm -f "$TXD/store-split"
+
+# ── The launcher is the one that knows a run is headless ────────────────────
+# A test that sets the flag itself proves only that the hook reads it. What has
+# to be true is that the launcher publishes it, because it is the only party that
+# can see there is no terminal to come back to.
+mkdir -p "$FAKE/hlbin"
+printf '#!/bin/sh\nprintf "HEADLESS=[%%s]\\n" "${CCD_HANDOFF_HEADLESS:-}"\n' > "$FAKE/hlbin/claude"
+chmod +x "$FAKE/hlbin/claude"
+out=$(PATH="$FAKE/hlbin:$PATH" "$ROOT/bin/ccd-handoff" -p hi 2>&1)
+case "$out" in
+  *"HEADLESS=[1]"*) ok "the launcher tells the hook when a run cannot be relaunched" ;;
+  *) bad "no headless flag" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
+esac
+out=$(PATH="$FAKE/hlbin:$PATH" shim_run "$ROOT/bin/ccd-handoff" 2>&1)
+case "$out" in
+  *"HEADLESS=[]"*) ok "...and says nothing of the sort about an interactive one" ;;
+  *) bad "headless flag leaked" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
+esac
+
 # ── A leftover shim that cannot run is not a route ──────────────────────────
 # is_ccd_shim() answers "ours", not "runnable". Committing to an unexecutable one
 # breaks every ccd launch on a machine with a perfectly good claude on PATH.
@@ -6383,17 +6535,33 @@ rm -rf "$FAKE/.claude/ccd/bin"
 rm -rf "$FAKE/.claude/ccd/bin"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 fake_real '#!/bin/sh
-printf "REAL supervised=%s\n" "${CCD_HANDOFF:+yes}"'
+printf "REAL supervised=[%s]\n" "${CCD_HANDOFF:+yes}"'
 out=$(PATH="$SHIMPATH" HOME="$FAKE" shim_run "$ROOT/bin/ccd" off 2>&1)
 case "$out" in
-  *"supervised=yes"*) ok "an interactive ccd run starts under the launcher that can bring it back" ;;
+  *"supervised=[yes]"*) ok "an interactive ccd run starts under the launcher that can bring it back" ;;
   *) bad "no entrance" "the launcher installed by --auto never sees the session: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
 esac
 # ...and a redirected one does not: no terminal, nothing to return to.
 out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" off 2>&1)
 case "$out" in
-  *"supervised="*) ok "...while a run with nowhere to come back to is left alone" ;;
+  *"supervised=[]"*) ok "...while a run with nowhere to come back to is left alone" ;;
+  *"supervised=[yes]"*) bad "no entrance" "a redirected run was put under a launcher" ;;
   *) bad "no entrance" "never reached the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+esac
+
+# ── A batch job never inherits somebody else's supervision ──────────────────
+# `ccd -p` run from inside a supervised session inherits CCD_HANDOFF and the
+# state path that goes with it. Declining the launcher is only half the job: the
+# child still claims to be watched, so the hook arms and signals it on the
+# parent's contract — and the work dies for a relaunch nobody will make.
+out=$(PATH="$SHIMPATH" HOME="$FAKE" OPENROUTER_API_KEY=sk-or-v1-smoketest \
+      CCD_HANDOFF=00000000000000000000000000000001 \
+      CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000001.json" \
+      "$ROOT/bin/ccd" -p hi 2>&1)
+case "$out" in
+  *"supervised=[]"*) ok "a batch run started inside a supervised session claims no supervision" ;;
+  *"supervised=[yes]"*) bad "inherited supervision" "the batch child carried its parent's launcher contract" ;;
+  *) bad "inherited supervision" "never reached the real claude: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
 esac
 # ...but never two of them: a session already supervised must not gain a second
 # launcher underneath the first.
@@ -6405,7 +6573,8 @@ out=$(PATH="$SHIMPATH" HOME="$FAKE" CCD_HANDOFF=00000000000000000000000000000001
       shim_run "$ROOT/bin/ccd" off 2>&1)
 case "$out" in
   *"token=00000000000000000000000000000001"*)
-    ok "...and a session that already has one does not get a second" ;;
+    bad "inherited supervision" "the child kept a contract minted for its parent" ;;
+  *"token=none"*) ok "...and a session that inherits a contract does not keep it" ;;
   *) bad "nested launcher" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
 esac
 
