@@ -160,7 +160,8 @@ A handoff has two possible destinations and they do not cost the same:
 - **Another registered subscription.** Free. Nothing is billed, and the session
   carries on as though nothing happened. This is what the launcher is for.
 - **OpenRouter, on your own API key.** Billed, and only ever reached when every
-  registered subscription is spent.
+  registered subscription is spent and you have both stored a key and opted in
+  with `ccd setup --auto`.
 
 The launcher carries the first one on its own, and `ccd setup` installs it.
 `ccd setup --auto` authorises the second as well. Having a key stored is not enough:
@@ -179,8 +180,9 @@ are always left alone.
 <details>
 <summary><b>OpenRouter, the last resort</b></summary>
 
-Only reached when every registered subscription is spent. It is paid per token
-with your own key, so it is worth setting up before you need it:
+Only reached when every registered subscription is spent, you have stored a key,
+and you opted in with `ccd setup --auto`. It is paid per token with your own key,
+so it is worth setting up before you need it:
 
 ```sh
 ccd key           # store your OpenRouter key (hidden input, never enters chat)
