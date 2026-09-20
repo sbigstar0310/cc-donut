@@ -47,7 +47,10 @@ The ladder becomes:
 
 ```text
 account A spent  →  account B has room?  →  B      free
-                 →  B spent too?         →  🍩     OpenRouter (paid)
+                 →  B spent too?         →  key stored and --auto opted in?
+                                            yes →  🍩  OpenRouter (paid)
+                                            no  →  nowhere; the session ends,
+                                                   switch by hand (below)
 ```
 
 With automatic handoff on (`ccd setup --auto`) this needs nothing typed at all.
