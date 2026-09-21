@@ -49,8 +49,8 @@ The ladder becomes:
 account A spent  →  account B has room?  →  B      free
                  →  B spent too?         →  key stored and --auto opted in?
                                             yes →  🍩  OpenRouter (paid)
-                                            no  →  nowhere; the session ends,
-                                                   switch by hand (below)
+                                            no  →  no automatic handoff; wait for
+                                                   the quota, or type `ccd -c` (top)
 ```
 
 With automatic handoff on (`ccd setup --auto`) this needs nothing typed at all.
