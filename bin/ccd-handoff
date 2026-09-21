@@ -81,9 +81,12 @@ ccd_bin() {
 paid_optin() { [ -f "$HOME/.claude/ccd/paid-handoff" ]; }
 
 # ...and so is the proof. Same contract as the hook's subscriptions_proved_spent
-# (scripts/quota-guard.sh): the exact word on stdout AND a zero exit, from the
-# ccd-account that ships beside the ccd this relaunch would run. Anything else —
-# no plugin, a crash, silence — is not proof, and an unproved hop is not made.
+# (scripts/quota-guard.sh): the exact word on stdout AND a zero exit. NOT
+# necessarily the same binary the hook asked — the hook prefers CLAUDE_PLUGIN_ROOT,
+# this resolves the plugin cache, and the two can be different versions. That is
+# safe because every mismatch fails closed: no plugin, an older ccd-account with no
+# `exhausted`, a crash, silence — none of them is the word, and an unproved hop is
+# not made.
 proved_spent() {
   local t out
   t=$(ccd_bin); [ -n "$t" ] && [ -x "${t%/*}/ccd-account" ] || return 1
@@ -303,8 +306,15 @@ while :; do
       # an account with room. Ask again, and do not bill on an old answer.
       if ! proved_spent; then
         printf '\nccd: 받아 줄 구독이 없다는 것이 지금은 확인되지 않습니다 — 과금 없이 여기서 멈춥니다.\n' >&2
-        printf '   이어서 하려면: claude --resume %s\n' "$sid" >&2
-        printf '   계정 상태: ccd account list · 직접 넘어가려면: ccd -c\n' >&2
+        # Only offer what works: a session that never got a transcript cannot be
+        # resumed, and `--resume` on it fails with "No conversation found".
+        if [ "$resumed" -eq 1 ]; then
+          printf '   이어서 하려면: claude --resume %s\n' "$sid" >&2
+          printf '   계정 상태: ccd account list · 직접 넘어가려면: ccd -c\n' >&2
+        else
+          printf '   이어 갈 대화가 아직 없습니다 — claude 로 새로 시작하세요\n' >&2
+          printf '   계정 상태: ccd account list · 직접 넘어가려면: ccd\n' >&2
+        fi
         exit "$rc"
       fi
       if [ "$resumed" -eq 1 ]; then

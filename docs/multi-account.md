@@ -19,7 +19,21 @@
 > 하지 않음); `exhausted` 자체는 읽기만 하고, 런처는 relaunch 직전에 같은 질문을 다시 한다. 읽지 못한 디렉터리, 실패한
 > 측정, 낡은 값, 락 타임아웃, 만료된 데드라인, `store-split` 정지, 실패했거나 확인되지
 > 않은 스왑은 어느 것도 증명이 아니고, 그때는 기존의 "세 번 시도 후 멈추고 알림" 으로
-> 간다. 95% 틱에서는 절대 과금하지 않는다 — 벽에 실제로 부딪힌 `StopFailure` 에서만.
+> 간다. 틱에서는 절대 과금하지 않는다 — 벽에 실제로 부딪힌 `StopFailure` 에서만.
+>
+> **2026-09-21 (#57) 4차 개정 — "소진" 의 뜻은 하나, 100% 다.** `ARM_THRESHOLD=95` 와
+> `HEADROOM=90` 은 없어졌고 `CCD_HEADROOM` 손잡이도 없다. 세션은 지금 계정이 100% 가
+> 되면 옮기고(그 전에는 아니다), 예비 구독은 100% 미만이면 목적지이며(99% 도 목적지다),
+> 과금은 등록된 모든 계정이 100% 일 때만 한다. 90% 예비분은 "옮길 만하지 않다" 와
+> "과금할 만큼 바닥났다" 를 한 숫자로 답하고 있었고, 그래서 90% 인 예비 구독이 스왑에서도
+> 빠지고 증명에서도 "바닥" 으로 세어져, 10% 가 남았는데 과금이 일어났다. 숫자는
+> `bin/spent-at` 한 파일에 있고 훅·`ccd-account`·statusline 이 그 파일을 **읽는다** — 서로
+> source 하지 않고, 복사본도 없다.
+>
+> **같은 개정 — 측정값은 계정마다 파일 하나.** 공유 캐시 `accounts-quota.json` 은 없어졌다.
+> 전부 읽고 → 네트워크를 기다리고 → 전부 다시 쓰는 방식은 atomic replace 로도 **lost
+> update** 를 막지 못했다 (찢어진 파일만 막는다). 이제 `~/.claude/ccd/readings/<이름>.json`
+> (디렉터리 0700, 파일 0600) 이고, 측정한 쪽은 자기가 측정한 계정의 파일만 쓴다.
 >
 > **2026-09-18 (#57) 2차 개정 (3차에서 뒤집힘).** 한때 이 브랜치는 유료 백본으로 자동으로
 > 넘어가지 않았다: 다섯 번의 리뷰가 매번 운영상의 실패(락 타임아웃, 503, 읽지 못한
@@ -172,20 +186,23 @@ User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 
 `accounts/.active` 에 현재 활성 계정 이름을 평문 한 줄로 둔다. 어느 계정이 돌고 있는지는 blob 비교가 아니라 이 파일이 진실의 원천이다 (토큰이 회전해도 안정적).
 
-### 4.2 쿼타 캐시 `~/.claude/ccd/accounts-quota.json` (mode 600)
+### 4.2 측정값 `~/.claude/ccd/readings/<이름>.json` (디렉터리 700, 파일 600)
+
+계정마다 파일 하나다. 측정한 프로세스는 자기가 측정한 계정의 파일만 atomic 하게 쓰므로,
+다른 계정의 측정값을 덮어쓸 방법이 없다. 같은 계정을 두 프로세스가 동시에 측정하면 늦게
+끝난 쪽이 나중에 쓰는데, `checked_at` 은 **응답이 도착한 시각**이라 "나중 도장 = 나중에 본
+서버 상태" 이고, 더 오래된 도장은 더 새 도장을 덮어쓰지 못한다 (`reading_save`). `ccd
+account rm` 은 그 계정의 파일도 지운다. 아래는 `readings/personal.json` 하나의 내용이다.
 
 ```jsonc
 {
-  "personal": {
-    "five_hour_percent": 100, "seven_day_percent": 77,
+  "five_hour_percent": 100, "seven_day_percent": 77,
     "five_hour_reset": "2026-08-16T12:10:00Z",
     "seven_day_reset": "2026-08-18T04:00:00Z",
     "checked_at": 1755300000,
     "uuid": "…",                        // 이 판정이 설명하는 계정 (account_uuid)
     "cred": "9f2c1a4b7e0d6538",         // 측정 대상 access token 의 SHA-256 앞 16자
     "status": "ok"                      // ok | stale | dead | error
-  },
-  "work": { … }
 }
 ```
 
@@ -225,14 +242,14 @@ pick_account():
       아니면: access token 유효? → 조회
               만료됨?           → refresh 시도 → 조회
               refresh 실패      → status=dead/error, 제외
-  여유 있음 = five_hour_percent < HEADROOM(=90) AND seven_day_percent < HEADROOM
+  여유 있음 = 보고된 창 가운데 SPENT_AT(=100, bin/spent-at) 에 닿은 것이 하나도 없다
   여유 있는 후보 중 priority 오름차순, 동률이면 max(5h,7d) 오름차순으로 1개 선택
   없으면 None
 ```
 
 **7일 창을 반드시 같이 본다.** 5h가 방금 리셋됐어도 7d가 99%면 그 계정은 몇 분 안에 다시 죽는다 — 그 상태로 스왑하면 hop 카운터만 태우고 OpenRouter에 도착하며, 사용자는 이유 없는 화면 전환을 두 번 겪는다.
 
-`HEADROOM=90` 은 `ARM_THRESHOLD=95` 보다 낮게 잡는다. 95에서 탈출하는데 92짜리 계정으로 가면 곧바로 또 탈출한다.
+**예비분은 두지 않는다.** 99% 인 예비 구독도 목적지다. 곧바로 또 옮기게 될 수 있지만 그건 받아들인 비용이다 — 예비분을 두면 그 숫자가 "옮길 만한가" 와 "과금할 만큼 바닥났나" 를 동시에 답하게 되고, 둘이 같은 답을 내는 순간 여유가 남은 채로 과금이 일어난다. 그래서 "여유 있음"(`has_headroom`)과 "증명에서 바닥으로 센다"(`_still_spent`)는 같은 술어 `window_spent` 의 양면이다. 측정값은 정수로 반올림돼 저장되므로(`_window`) 99.6 은 100 이고 바닥이다.
 
 ### 5.2 루프 방지 — 횟수가 아니라 방문 집합으로
 
@@ -422,7 +439,7 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 ### `scripts/quota-guard.sh`
 
 - `handoff_ready()` 를 `launcher_ready()` / `handoff_ready()` 로 분리. 전자는 `have_key()` 를 요구하지 않는다 — OpenRouter 에서 **돌아오는** 길에는 키가 필요 없다 (§8 마지막 행)
-- 프롬프트·툴 틱: `peak >= ARM_THRESHOLD` 이고 여유 있는 계정이 있으면 **그 자리에서** `ccd-account use <name> --force` (#57 전에는 `StopFailure` 에서 `to_account` 로 무장했다)
+- 프롬프트·툴 틱: `peak >= SPENT_AT`(=100) 이고 여유 있는 계정이 있으면 **그 자리에서** `ccd-account use <name> --force` (#57 전에는 `StopFailure` 에서 `to_account` 로 무장했다)
 - `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 스왑하지 못했으면 `paid_optin && have_key && subscriptions_proved_spent` 를 묻고, 참이면서 `launcher_ready` 일 때만 `to_fallback` 을 무장하고 SIGHUP 한다 (무장 먼저, 신호 실패 시 해제). 그 밖에는 멈추고 `swap-note` 를 남긴다 (깨우지 않는다 — 같은 벽에 다시 부딪힌다). 세 조건은 맞는데 런처가 없으면 그 사실과 고치는 법을 note 에 적는다
 - keep-alive: 하루 1회 `ccd-account refresh --all --inactive-only` 를 백그라운드로
 - `SessionEnd` 안내 문구는 `to_fallback` / `to_subscription` 두 가지
@@ -467,7 +484,7 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 통합 (fake claude 바이너리 + stub HTTP) — #57 이후의 프로토콜 기준:
 - A 소진 → **세션을 끝내지 않고** B 로 스왑하고, 그 사실을 한 줄로 알리는가 (relaunch 도 `--resume` 도 없다)
 - 벽에 먼저 부딪힌 경우: `StopFailure` 가 스왑한 뒤 exit 2 로 멈춘 턴을 깨우는가
-- A·B 모두 **측정돼** 소진 + 키 + 옵트인 + 런처 → OpenRouter 로 가는가; 그중 하나라도 없거나 증명이 아니면(503, 낡은 값, 락 타임아웃, 읽지 못한 디렉터리, `store-split`, 실패·미확인 스왑, 95% 틱) 과금 없이 멈추고 이유를 남기는가
+- A·B 모두 **측정돼** 소진 + 키 + 옵트인 + 런처 → OpenRouter 로 가는가; 그중 하나라도 없거나 증명이 아니면(503, 낡은 값, 락 타임아웃, 읽지 못한 디렉터리, `store-split`, 실패·미확인 스왑, 틱) 과금 없이 멈추고 이유를 남기는가
 - 계정 0개 등록 시 현행과 바이트 단위로 동일하게 동작하는가 (**가장 중요한 회귀 테스트**)
 - 스왑 중 kill -9 후 blob 무결성
 
@@ -816,7 +833,7 @@ A 가 자기 토큰을 회전시켜 공유 블롭에 덮어쓸 수 있다. 프�
 보낸다. `dead` 는 `full` 보다 앞이다 — 재로그인은 사용자가 해야 하는 일이고, 이 행 말고는
 알려주는 곳이 없다.
 
-`90` 경계는 `ccd-account` 의 `HEADROOM` 과 같은 값을 같은 방식(`CCD_HEADROOM`)으로 읽는다.
+`ready`/`full` 경계는 `bin/spent-at` — `ccd-account` 와 훅이 읽는 바로 그 파일 — 에서 읽는다.
 statusline 이 자기 숫자를 따로 들고 있으면 handoff 가 쓰지 않을 스페어를 준비됐다고 적는다.
 
 ---

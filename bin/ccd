@@ -560,7 +560,7 @@ doctor() {
   # takes: ccd pays only on proof that no subscription can take the session.
   if [ -f "$CCD_PAID_OPTIN" ]; then
     if [ -n "${OPENROUTER_API_KEY//[[:space:]]/}" ]; then
-      printf '  %s✓%s OpenRouter hop allowed (paid) — only when no spare is registered, or every one is measured spent\n' "$grn" "$r"
+      printf '  %s✓%s OpenRouter hop allowed (paid) — only when every registered account is measured at 100%% (or none is registered)\n' "$grn" "$r"
     else
       printf '  %s✗ OpenRouter hop allowed, but no key is stored%s — it cannot happen; store one with: ccd key\n' "$red" "$r"
     fi
@@ -1167,9 +1167,11 @@ CCD_STATUSLINE_LAUNCHER
       printf '✓ quota handoff ready — nothing to install for it\n'
       printf '  %sWhen your Claude quota runs out, this session moves to whichever%s\n' "$d" "$r"
       printf '  %sother subscription has room, in place: nothing billed, no restart.%s\n' "$d" "$r"
-      printf '  %sOpenRouter (paid, your own key) is never automatic: when every%s\n' "$d" "$r"
-      printf '  %ssubscription is spent, you type `ccd -c`. `ccd setup --auto` adds%s\n' "$d" "$r"
-      printf '  %sonly the way BACK from there to a subscription.%s\n' "$d" "$r"
+      printf '  %sOpenRouter (paid, your own key) stays off: a bare setup never enables%s\n' "$d" "$r"
+      printf '  %sbilling. `ccd setup --auto` lets ccd move a session there by itself —%s\n' "$d" "$r"
+      printf '  %sonly when every registered account is at 100%% and a key is stored —%s\n' "$d" "$r"
+      printf '  %sand installs the launcher that carries it there and back. `ccd -c`%s\n' "$d" "$r"
+      printf '  %sgoes there by hand at any time.%s\n' "$d" "$r"
       ;;
     1)
       mkdir -p "$CCD_SHIM_DIR"

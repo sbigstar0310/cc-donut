@@ -155,8 +155,8 @@ claude          # 새 터미널에서. /status 로 로그인 계정 확인
 "쿼타가 죽으면 B로 갈까"(선택)와 "과금해도 된다는 것이 증명됐나"(증명)를 실제로 소진시키지 않고 확인한다. 둘은 **다른 질문**이다 — `pick` 이 아무것도 못 고른 것은 과금의 근거가 아니다. 쿼타 캐시를 직접 심으면 된다.
 
 ```sh
-Q=~/.claude/ccd/accounts-quota.json
-cp $Q $Q.bak 2>/dev/null || true
+Q=~/.claude/ccd/readings                     # 계정마다 파일 하나: $Q/<이름>.json
+rm -rf $Q.bak; cp -R $Q $Q.bak 2>/dev/null || true
 A=$(./bin/ccd-account current)
 B=$(ls ~/.claude/ccd/accounts/*.json | xargs -n1 basename | sed 's/.json//' | grep -v "^$A$" | head -1)
 
@@ -166,37 +166,40 @@ seed() { python3 - "$Q" "$A" "$B" "$@" <<'PY'
 import datetime, hashlib, json, os, sys, time
 q, names, pct = sys.argv[1], sys.argv[2:4], list(map(int, sys.argv[4:8]))
 ahead = lambda h: (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=h)).isoformat()
-rows = {}
+os.makedirs(q, mode=0o700, exist_ok=True)
 for i, n in enumerate(names):
     a = json.load(open(os.path.expanduser(f"~/.claude/ccd/accounts/{n}.json")))
     at = (a.get("claudeAiOauth") or {}).get("accessToken") or ""
     cred = hashlib.sha256(at.encode()).hexdigest()[:16] if at else ""   # = _cred_fingerprint
-    rows[n] = {"status": "ok", "checked_at": int(time.time()), "uuid": a.get("account_uuid"), "cred": cred,
+    row = {"status": "ok", "checked_at": int(time.time()), "uuid": a.get("account_uuid"), "cred": cred,
                "five_hour_percent": pct[2*i], "seven_day_percent": pct[2*i+1],
                "five_hour_reset": ahead(2), "seven_day_reset": ahead(72)}
-json.dump(rows, open(q, "w"))
+    json.dump(row, open(os.path.join(q, n + ".json"), "w"))
 PY
 }
 
-# A 소진, B 여유 → B로 가야 한다
-seed 99 99 10 20 && ./bin/ccd-account pick --json
+# "소진" 은 100% 다. A 소진, B 여유 → B로 가야 한다
+seed 100 100 10 20 && ./bin/ccd-account pick --json
 #   기대: {"account":"<B>", ..., "reason":"headroom"}
 
 # 둘 다 소진 → 선택은 "갈 곳 없음" (rc=1). 이것만으로는 과금하지 않는다.
-seed 99 99 99 99 && ./bin/ccd-account pick --json; echo "rc=$?"
+seed 100 100 100 100 && ./bin/ccd-account pick --json; echo "rc=$?"
 #   기대: {"account":null,"reason":"all_exhausted"}  rc=1
 # 과금의 근거는 따로 묻는다: 등록된 **모든** 계정(지금 쓰는 계정 포함)이 방금 측정돼 바닥.
 ./bin/ccd-account exhausted; echo "rc=$?"
 #   기대: every-subscription-measured-spent  rc=0
 # 한 계정이라도 여유가 있거나, 행이 낡았거나, 리셋 시각이 없으면 증명이 아니다.
-seed 10 20 99 99 && ./bin/ccd-account exhausted; echo "rc=$?"
+seed 10 20 100 100 && ./bin/ccd-account exhausted; echo "rc=$?"
 #   기대: (출력 없음)  rc=1   — 지금 쓰는 계정 A 에 여유가 있다
 
-# B의 5h는 비었지만 7일이 꽉참 → 가면 안 된다 (몇 분 뒤 또 죽으므로)
-seed 99 99 5 99 && ./bin/ccd-account pick --json; echo "rc=$?"
+# B의 5h는 비었지만 7일이 100% → 가면 안 된다 (창 하나라도 바닥이면 그 계정은 바닥이다)
+seed 100 100 5 100 && ./bin/ccd-account pick --json; echo "rc=$?"
 #   기대: all_exhausted, rc=1
+# B가 99% 면 아직 목적지다. 예비분은 없다.
+seed 100 100 99 99 && ./bin/ccd-account pick --json
+#   기대: {"account":"<B>", ...}
 
-mv $Q.bak $Q 2>/dev/null || rm -f $Q          # 캐시 원복
+rm -rf $Q; mv $Q.bak $Q 2>/dev/null || true    # 측정값 원복
 ```
 
 ---
@@ -251,7 +254,7 @@ relaunch 도 없다 (#57).
 > 스왑이 **떠나온** 계정은 `swapped-windows` 에 기록되고, 그 기록이 살아 있는 동안
 > (`CCD_SWAP_GUARD_TTL`, 기본 30분) 다음 목적지 후보에서 빠진다. 떠나는 것 자체는 막지
 > 않으므로 소진된 계정에 갇히지 않는다. 기록은 그때의 리셋 창을 같이 들고 있어서, 그
-> 계정의 **자기 측정값**(`accounts-quota.json` 의 `five_hour_reset`/`seven_day_reset`)이
+> 계정의 **자기 측정값**(`readings/<이름>.json` 의 `five_hour_reset`/`seven_day_reset`)이
 > 다른 창을 가리키면 새 상황으로 보고 다시 후보가 된다.
 >
 > 그래서 다시 해보려면 위 명령의 `swapped-windows` 삭제를 반드시 포함한다 — 훅이 읽는
@@ -369,8 +372,8 @@ ps -t "$TTY1" -o pid=,comm= | awk '$2=="claude"{print $1}'
 # 백업 파일 제거 (refresh token 평문)
 rm -P ~/claude-creds-backup.json
 
-# 쿼타 캐시
-rm -f ~/.claude/ccd/accounts-quota.json
+# 측정값
+rm -rf ~/.claude/ccd/readings
 ```
 
 `ccd setup --auto`는 Stage 7b 를 하지 않는 한 실행되지 않으므로 PATH와 shim은 건드려지지 않는다. 계정 간 스왑(Stage 7)에는 필요 없다. 되돌릴 때는 `ccd setup --no-auto`.
@@ -383,6 +386,6 @@ rm -f ~/.claude/ccd/accounts-quota.json
 | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `add`가 이름을 자동으로 못 지음     | `python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['oauthAccount'].keys())"` — `accountUuid`/`emailAddress`가 있는지 |
 | `/login` 후에도 `current`가 안 바뀜 | 같은 명령으로 `profileFetchedAt` 확인. 스왑 시각(`~/.claude/ccd/accounts/.active-at`)보다 커야 identity가 채택된다                                        |
-| `pick`이 계속 `all_exhausted`       | `cat ~/.claude/ccd/accounts-quota.json` — `status`가 `dead`면 재로그인 필요, `error`면 네트워크                                                           |
+| `pick`이 계속 `all_exhausted`       | `cat ~/.claude/ccd/readings/*.json` — `status`가 `dead`면 재로그인 필요, `error`면 네트워크                                                           |
 | 스왑 후 MCP 로그아웃                | surgical merge 실패. Stage 4의 python 스니펫 출력을 남길 것                                                                                               |
 | 계정이 `needs re-login`             | `claude` → `/login` 만 하면 끝. 다음 `ccd account` 명령이 라이브 토큰을 그 계정 파일로 복사한다(§12.0 배킹). `add --force` 는 필요 없다                   |

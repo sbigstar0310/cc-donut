@@ -20,11 +20,15 @@ TTL=600
 # Staleness moves in days, so this warning repeats far more slowly than the quota one.
 STALE_TTL=14400
 THRESHOLD=85
-# Arming needs the quota reading to corroborate the API error: a bare rate_limit
-# can be transient throttling, and a handoff on that would be a false alarm. The
-# same reading, at the same threshold, is what moves the session BEFORE the wall
-# (see "Swap before the wall") — one corroboration, two moments.
-ARM_THRESHOLD=95
+# A session moves when its account is SPENT, and "spent" has one meaning for the
+# whole of ccd: bin/spent-at, the same file ccd-account reads to decide whether an
+# account is somewhere to move TO and whether it counts towards the proof that may
+# authorise paying. Read, not copied, so the three cannot drift. It corroborates the
+# API error at the wall (a bare rate_limit can be transient throttling) and it is
+# what moves the session on the tick — one number, two moments. Unreadable means
+# nothing here ever fires: a hook that cannot tell "spent" does not act on a guess.
+SPENT_AT=$(cat "$(dirname "$0")/../bin/spent-at" 2>/dev/null)
+case "$SPENT_AT" in ''|*[!0-9]*) SPENT_AT=999999 ;; esac
 # Measured credential pickup after a swap is 1-11s. The backstop waits that out
 # before it wakes the session, so the woken turn does not retry on the account we
 # just left. The StopFailure hook's timeout is set well past it (hooks/hooks.json).
@@ -260,7 +264,12 @@ usage_probe() {  # $1=destination file
   return 1
 }
 
-if [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
+# A turn that died on rate_limit is the one moment the cached reading is known to
+# be behind: it can be ten minutes old and say 96 while the wall says 100. Spent
+# is 100 now, not 95, so a reading that lags no longer corroborates by accident —
+# it has to be taken again, here, before anything below reads it.
+if [ "$(file_age "$CACHE")" -gt "$TTL" ] \
+   || { [ "$EVENT" = "StopFailure" ] && [ "$HOOK_ERROR" = "rate_limit" ]; }; then
   script=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/check-usage.js 2>/dev/null | sort -V | tail -1)
   node_bin=$(find_node) || node_bin=""
   # This hook fires on both UserPromptSubmit and PostToolUse, so instances run
@@ -532,6 +541,17 @@ request_handoff() {
   kill -HUP "$pid" 2>/dev/null || return 1
 }
 
+# How long since ANY spare was last measured: the age of the newest file under
+# readings/, one per account. Nothing there reads as ancient, never as fresh.
+readings_age() {
+  local f newest=""
+  for f in "$CCD_DIR"/readings/*.json; do
+    [ -f "$f" ] || continue
+    { [ -z "$newest" ] || [ "$f" -nt "$newest" ]; } && newest="$f"
+  done
+  file_age "${newest:-/nonexistent}"
+}
+
 # Is a usable OpenRouter key configured? Deliberately strict: a key that ccd will
 # later reject is the same as no key, and signalling on one would end the session
 # with nowhere to go. Mirrors the parser `ccd setup` uses to report readiness.
@@ -759,7 +779,7 @@ if [ "$EVENT" = "StopFailure" ]; then
     read_peak
     case "$peak" in
       ''|*[!0-9]*) : ;;   # no trustworthy reading → stay disarmed
-      *) if [ "$peak" -ge "$ARM_THRESHOLD" ]; then
+      *) if [ "$peak" -ge "$SPENT_AT" ]; then
            # Prefer another subscription over paying. Only when every registered
            # account is spent (or none are registered) do we fall to OpenRouter.
            #
@@ -1095,7 +1115,7 @@ fi
 # they needed it — the failure ccd exists to prevent. Backgrounded: this must
 # never add latency to a prompt, and it is a no-op on all but one tick a day.
 if [ -z "${CCD_ACTIVE:-}" ] && has_accounts && ka=$(ccd_account_bin); then
-  # --pick re-measures the spares into accounts-quota.json, which keepalive never does
+  # --pick re-measures the spares into readings/, which keepalive never does
   # and the statusline's spare row reads (#24). On every tick once that reading is past
   # the TTL, not on prompts alone: an autonomous turn can run tool uses for an hour
   # without one (#54). A fresh reading adds nothing to the tick. keepalive and the pick
@@ -1103,7 +1123,7 @@ if [ -z "${CCD_ACTIVE:-}" ] && has_accounts && ka=$(ccd_account_bin); then
   # with the statusline's trigger (cmd_keepalive). --detach because Claude Code kills a
   # hook that outruns its timeout by process group, and a kill mid token-exchange loses
   # a token the server has already rotated.
-  if [ "$(file_age "$CCD_DIR/accounts-quota.json")" -ge "${CCD_CANDIDATE_TTL:-300}" ]; then
+  if [ "$(readings_age)" -ge "${CCD_CANDIDATE_TTL:-300}" ]; then
     "$ka" --no-color keepalive --pick --detach >/dev/null 2>&1 &
   else
     "$ka" --no-color keepalive --detach >/dev/null 2>&1 &
@@ -1124,7 +1144,7 @@ if has_accounts; then
   read_peak
   case "$peak" in
     ''|*[!0-9]*) : ;;
-    *) if [ "$peak" -ge "$ARM_THRESHOLD" ] \
+    *) if [ "$peak" -ge "$SPENT_AT" ] \
           && from=$(reading_account "$racct") \
           && { swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe \
                || { [ -e "$CCD_DIR/store-split" ] && swap_note "[ccd] The Claude quota is nearly gone and ccd cannot move this session: $SWAP_REASON"; false; }; } \

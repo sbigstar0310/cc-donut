@@ -72,10 +72,26 @@ if os.environ.get("CCD_TOKEN_URL"):
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 USER_AGENT = "ccd"
 
-# An account is a candidate only if EVERY window it reports is below this.
-# Deliberately lower than quota-guard's ARM_THRESHOLD (95): escaping a 95% account
-# onto a 92% one just means hopping again in a few minutes.
-HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
+# ONE meaning of "spent", and it is not a knob: the percentage at which a window
+# has nothing left. Three decisions turn on it and they must never disagree —
+# when a session moves (the hook), whether an account is somewhere to move TO
+# (has_headroom), and whether an account counts towards the proof that may
+# authorise paying (_still_spent). A 90% "reserve" used to answer the second and
+# the third at once: a spare at 90% was skipped by the swap AND proved spent, and
+# ccd paid with a tenth of a subscription left. So the number lives in one file,
+# bin/spent-at, read by this program, the hook and the statusline alike; none of
+# them sources another, and none of them can drift. Missing or unreadable is a
+# broken install, and says so loudly rather than guessing.
+with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "spent-at")) as _f:
+    SPENT_AT = int(_f.read())
+
+
+def window_spent(pct):
+    """Is this one window out of room? Readings are whole percentages (_window
+    rounds them), so 99.6 on the wire is 100 here and counts; 99.4 does not."""
+    return isinstance(pct, (int, float)) and not isinstance(pct, bool) and pct >= SPENT_AT
+
+
 CANDIDATE_TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
 KEEPALIVE_INTERVAL = int(os.environ.get("CCD_KEEPALIVE_INTERVAL", "86400"))
 # First retry after a failed keepalive pass, doubling per consecutive failure up
@@ -114,7 +130,12 @@ ACTIVE_AT_FILE = os.path.join(ACCOUNTS_DIR, ".active-at")
 LOCK_FILE = os.path.join(ACCOUNTS_DIR, ".lock")
 REFRESH_LOCK = os.path.join(ACCOUNTS_DIR, ".refresh.lock")    # see cmd_keepalive
 ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
-QUOTA_FILE = os.path.join(CCD_DIR, "accounts-quota.json")
+# One reading per account, one file per reading. A shared file made every writer
+# responsible for every row: load all, wait on the network, write all — and an
+# atomic replace keeps such a file from tearing, not from losing the update
+# somebody else made while you waited. With a file each, a prober can only ever
+# publish the account it measured.
+READINGS_DIR = os.path.join(CCD_DIR, "readings")
 KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
 # Where automatic swaps have come FROM lately, so one is never sent back to an
 # account it just left as spent. Bounded by time: an entry is a statement about
@@ -174,6 +195,11 @@ def now():
 
 def ensure_dirs():
     os.makedirs(ACCOUNTS_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(READINGS_DIR, mode=0o700, exist_ok=True)
+    try:        # the shared cache these replaced; a cache, so nothing is migrated
+        os.unlink(os.path.join(CCD_DIR, "accounts-quota.json"))
+    except OSError:
+        pass
     try:
         os.chmod(ACCOUNTS_DIR, 0o700)
     except OSError:
@@ -1197,18 +1223,42 @@ def _cache_row_valid(rec, acct):
     return True
 
 
-def quota_cache():
-    return read_json(QUOTA_FILE) or {}
+def reading_path(name):
+    return os.path.join(READINGS_DIR, f"{name}.json")
 
 
-def quota_cache_save(cache):
-    write_json(QUOTA_FILE, cache, 0o600)
+def reading_load(name):
+    return read_json(reading_path(name)) if valid_name(name) else None
+
+
+def reading_save(name, rec):
+    """Publish one account's reading. Nothing here can touch another account's.
+
+    Two probers of the SAME account can still finish out of order. A reading is
+    stamped when its answer arrives (quota_for), so the later stamp is the later
+    look at the server, and an older one does not replace it. The check and the
+    rename are not one step, and need not be: the two readings that could slip
+    through are a rename apart and describe the same second. A stamp from the
+    future is a wrong clock, not a newer reading, and does not block."""
+    on_file = reading_load(name)
+    theirs = (on_file or {}).get("checked_at")
+    if isinstance(theirs, (int, float)) and rec["checked_at"] < theirs <= now():
+        return
+    os.makedirs(READINGS_DIR, mode=0o700, exist_ok=True)
+    write_json(reading_path(name), rec, 0o600)
+
+
+def reading_drop(name):
+    try:
+        os.unlink(reading_path(name))
+    except OSError:
+        pass
 
 
 def probe_account(name, acct, allow_refresh=True):
     """Read one account's quota, refreshing its token first if needed.
 
-    Returns a record shaped like the accounts-quota.json entries."""
+    Returns a record shaped like the files under readings/."""
     rec = {"checked_at": now(), "status": "error"}
     oauth = acct.get("claudeAiOauth") or {}
 
@@ -1266,9 +1316,8 @@ def cache_ttl_for(status, ttl):
     return 60  # stale/error: transient, retry soon but not every tick
 
 
-def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True, cache=None):
-    cache = quota_cache() if cache is None else cache
-    rec = cache.get(name)
+def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True):
+    rec = reading_load(name)
     if isinstance(rec, dict) and isinstance(rec.get("checked_at"), (int, float)):
         # Identity before age: a row can be fresh and still be about the wrong
         # account or a replaced token. Clocks cannot answer either question —
@@ -1278,18 +1327,25 @@ def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True, cache=None):
         if _cache_row_valid(rec, acct) and (
             (now() - rec["checked_at"]) < cache_ttl_for(rec.get("status"), ttl)
         ):
-            return rec, cache
+            return rec
     rec = probe_account(name, acct, allow_refresh=allow_refresh)
     # Stamped after the probe: it may have refreshed the token, and the verdict
     # belongs to whichever credential it ended up measuring.
     rec["cred"] = _cred_fingerprint(acct)
     rec["uuid"] = acct.get("account_uuid")
-    cache[name] = rec
-    return rec, cache
+    # ...and so is the time: when the answer arrived, not when the question was
+    # asked. That is what makes "the later stamp wins" mean the later look.
+    rec["checked_at"] = now()
+    reading_save(name, rec)
+    return rec
 
 
 def has_headroom(rec):
-    """Every window the account reports must be below HEADROOM.
+    """No window the account reports may be spent (window_spent).
+
+    A destination is any account that is not spent: 99% is a destination. There
+    is no reserve below that — the reserve is what made "not worth hopping to"
+    and "spent enough to pay for" the same answer.
 
     The 7-day window is not optional: an account whose 5h just reset but whose
     weekly is at 99% dies again within minutes, burning a hop and showing the
@@ -1303,7 +1359,7 @@ def has_headroom(rec):
     vals = [v for v in vals if isinstance(v, (int, float))]
     if not vals:
         return False
-    return max(vals) < HEADROOM
+    return not any(window_spent(v) for v in vals)
 
 
 def worst(rec):
@@ -1652,17 +1708,15 @@ def cmd_list(args):
             print(f"{C_DIM}No accounts registered. Run `ccd account add`.{C_RESET}")
         return 0
 
-    cache = quota_cache()
     rows = []
     for a in accounts:
         name = a["name"]
         if name == cur:
             # Claude Code owns the live token; never refresh it from here.
-            rec, cache = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=False, cache=cache)
+            rec = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=False)
         else:
-            rec, cache = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=True, cache=cache)
+            rec = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=True)
         rows.append((a, rec))
-    quota_cache_save(cache)
 
     if args.json:
         print(
@@ -1744,9 +1798,7 @@ def cmd_rm(args):
             os.unlink(path)
         except OSError as e:
             die(f"could not remove {path}: {e}")
-        cache = quota_cache()
-        cache.pop(name, None)
-        quota_cache_save(cache)
+        reading_drop(name)
         if active_name() == name:
             try:
                 os.unlink(ACTIVE_FILE)
@@ -1857,7 +1909,12 @@ def measure_active(deadline):
     swap that found nowhere to go, so that `exhausted` can stay a pure read; the
     cache-only tick never calls it.
 
-    Never refreshed: Claude Code owns the live token. The prologue has just banked
+    Never refreshed, and that is load-bearing, not belt and braces: `cur` is who
+    was active when we looked, and another session can swap the store before the
+    probe runs. account_refresh() refuses the ACTIVE account — and by then this
+    one no longer is, so with refreshing allowed an expired token here would be
+    exchanged, from a path that must never spend one. Claude Code owns the live
+    token. The prologue has just banked
     the live credential into this account, so its access token is as current as
     ccd can know; if it is not, the probe fails, the row says so, and a failed
     row is not proof."""
@@ -1868,8 +1925,7 @@ def measure_active(deadline):
         return
     outer, NET_DEADLINE = NET_DEADLINE, deadline
     try:
-        _, cache = quota_for(cur, acct, allow_refresh=False)
-        quota_cache_save(cache)
+        quota_for(cur, acct, allow_refresh=False)
     finally:
         NET_DEADLINE = outer
 
@@ -1892,7 +1948,7 @@ def _still_spent(rec):
     minutes; a naive time is a guess about whose clock it was. Neither is proof."""
     for pct, reset in ((rec.get("five_hour_percent"), rec.get("five_hour_reset")),
                        (rec.get("seven_day_percent"), rec.get("seven_day_reset"))):
-        if not isinstance(pct, (int, float)) or isinstance(pct, bool) or pct < HEADROOM:
+        if not window_spent(pct):
             continue
         try:
             at = datetime.datetime.fromisoformat(reset.replace("Z", "+00:00"))
@@ -1942,9 +1998,8 @@ def subscriptions_proved_spent():
     accounts = {n: account_load(n) for n in names}
     if any(a is None for a in accounts.values()):
         return False
-    cache = quota_cache()
     for name, acct in accounts.items():
-        rec = cache.get(name)
+        rec = reading_load(name)
         if not _cache_row_valid(rec, acct) or rec.get("status") != "ok":
             return False
         ts = rec.get("checked_at")
@@ -2070,8 +2125,6 @@ def best_target(no_probe=False, exclude=None, deadline=None):
     if not candidates:
         return None, "no_candidate"
 
-    cache = quota_cache()
-    probed = False
     scored = []
     outer, NET_DEADLINE = NET_DEADLINE, deadline
     try:
@@ -2080,7 +2133,7 @@ def best_target(no_probe=False, exclude=None, deadline=None):
                 # Cached-only mode for latency-sensitive callers (the prompt hook).
                 # Never opens a socket: a stale answer that costs nothing beats a
                 # fresh one that freezes the user's prompt for seconds.
-                rec = cache.get(a["name"])
+                rec = reading_load(a["name"])
                 # The identity check earns its place most here: this path hands off
                 # on a cached `ok` without opening a socket, so a row left behind by
                 # a name that now points at another account would spend that
@@ -2091,15 +2144,11 @@ def best_target(no_probe=False, exclude=None, deadline=None):
                 if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
                     continue
             else:
-                rec, cache = quota_for(a["name"], a, cache=cache)
-                probed = True
+                rec = quota_for(a["name"], a)
             if has_headroom(rec) and not _guard_holds(a["name"], rec, exclude):
                 scored.append((a.get("priority", 999), worst(rec), a, rec))
     finally:
         NET_DEADLINE = outer
-    if probed:
-        quota_cache_save(cache)
-
     if not scored:
         return None, "all_exhausted"
 

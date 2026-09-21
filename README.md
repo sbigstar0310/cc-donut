@@ -159,8 +159,11 @@ continues on OpenRouter by itself, and comes back when the quota resets.
 Conditions and limits:
 
 - **It pays on proof, never on a guess.** Every registered account — the one
-  you are on included — must have a fresh, successful reading that shows it
-  spent, with a reset time still in the future (or nothing registered at all),
+  you are on included — must have a fresh, successful reading that shows it at
+  100%, with a reset time still in the future (or nothing registered at all).
+  "Spent" means 100% everywhere in ccd: a session moves when its account gets
+  there, a spare is somewhere to go until it does (99% is), and nothing is
+  paid for while any account is short of it. That comes
   on top of the rate-limit error, the key and this opt-in. A spare that
   could not be measured, a busy store, a swap that failed — none of those is
   proof, and each one ends in a note instead of a bill.

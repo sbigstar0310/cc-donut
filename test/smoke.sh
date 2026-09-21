@@ -12,6 +12,42 @@ export HOME="$FAKE"
 # send fixture writes to the developer's real configuration. Cases that test it
 # set it themselves.
 unset CLAUDE_CONFIG_DIR
+
+# One reading per account, one file each — the layout bin/ccd-account's reading_save
+# writes. Fixtures still think of "the readings" as one dict, so these carry a dict
+# to and from that layout; nothing in the product reads one.
+RQD="$HOME/.claude/ccd/readings"
+rq_put() { # stdin: {"<account>": {row}, ...} — REPLACES every reading on file
+  rm -rf "$RQD"; mkdir -p "$RQD"; chmod 700 "$RQD"
+  python3 -c '
+import json, os, sys
+for name, row in json.load(sys.stdin).items():
+    p = os.path.join(sys.argv[1], name + ".json")
+    with open(p, "w") as f:
+        json.dump(row, f)
+    os.chmod(p, 0o600)
+    # A reading is written when it is taken, so its file is as old as it is. Fixtures
+    # that seed an OLD reading would otherwise seed a file that looks brand new.
+    ts = row.get("checked_at") if isinstance(row, dict) else None
+    if isinstance(ts, (int, float)):
+        os.utime(p, (ts, ts))' "$RQD"
+}
+rq_gather() { # every reading as one dict, in a temp file; prints its path
+  python3 -c '
+import glob, json, os, sys, tempfile
+d = {}
+for p in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    try: d[os.path.basename(p)[:-5]] = json.load(open(p))
+    except Exception: pass
+fd, t = tempfile.mkstemp(prefix="rq.", suffix=".json", dir=os.environ["HOME"])
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f)
+print(t)' "$RQD"
+}
+rq_scatter() { # $1=that file, possibly edited → back to one file per account
+  [ -f "$1" ] || return 0
+  rq_put < "$1"; rm -f "$1"
+}
 # The suite must behave identically when launched from inside a ccd session:
 # CCD_ACTIVE would suppress quota-guard warnings and flip the statusline branch.
 unset CCD_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
@@ -656,7 +692,12 @@ import json,os,sys
 p='$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json'
 print(json.load(open(p)).get(sys.argv[1],'') if os.path.exists(p) else '')" "$1" 2>/dev/null; }
 # Quota cache the hook reads to corroborate a rate_limit error.
-quota() { printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" > "$FAKE/.claude/ccd/quota-cache.json"; }
+# The reading is staged in the cache AND behind it. A turn that dies on rate_limit
+# takes the reading again rather than trust one that may be ten minutes old, so a
+# fixture that staged only the cache would have its wall re-measured away by
+# whatever the stand-in dashboard happened to say last.
+quota() { printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" \
+            | tee "$FAKE/.stub-usage.json" > "$FAKE/.claude/ccd/quota-cache.json"; }
 # StopFailure payload as Claude Code delivers it.
 stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"%s"}' "$1" "$2"; }
 
@@ -697,7 +738,7 @@ arm_run() { stopfail "$1" "$2" | fire_stopfail; }
 
 # rate_limit ALONE is not enough — it can be transient throttling. The dashboard
 # reading has to agree, and a missing reading must never arm.
-hf_reset; quota 58 96
+hf_reset; quota 58 100
 arm_run sess-a rate_limit
 [ "$(hf_get armed)" = "True" ] && ok "rate_limit + 96% arms the handoff" \
   || bad "arming on corroborated rate_limit" "armed=$(hf_get armed)"
@@ -719,7 +760,7 @@ printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/provider
 paid_optin_on
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
 sleep 0.3
-hf_reset; quota 58 96
+hf_reset; quota 58 100
 captured_stopfail sess-real | fire_stopfail
 [ "$(hf_get armed)" = "True" ] && ok "the payload Claude Code actually sends arms the handoff" \
   || bad "arming on the real StopFailure payload" "armed=$(hf_get armed)"
@@ -731,7 +772,7 @@ kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 # real key rot unnoticed behind a fixture only this suite ever produces.
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
 sleep 0.3
-hf_reset; quota 58 96
+hf_reset; quota 58 100
 printf '{"session_id":"sess-legacy","cwd":"/tmp/w","hook_event_name":"StopFailure","error_type":"rate_limit"}' \
   | fire_stopfail
 [ -z "$(hf_get armed)" ] && ok "the retired error_type key arms nothing" \
@@ -753,12 +794,14 @@ arm_run sess-b rate_limit
 [ -z "$(hf_get armed)" ] && ok "rate_limit at 40% does not arm (transient throttle)" \
   || bad "must not arm below threshold" "armed=$(hf_get armed)"
 
-hf_reset; quota 58 96
+hf_reset; quota 58 100
 arm_run sess-c overloaded
 [ -z "$(hf_get armed)" ] && ok "overloaded does not arm (not a quota problem)" \
   || bad "must not arm on non-rate_limit" "armed=$(hf_get armed)"
 
-hf_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json"
+# No reading ANYWHERE: a turn that dies on rate_limit takes the reading again, so the
+# stand-in dashboard has to be silent too, or this proves nothing about a missing one.
+hf_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json" "$FAKE/.stub-usage.json"
 arm_run sess-d rate_limit
 [ -z "$(hf_get armed)" ] && ok "no quota reading does not arm (fails closed)" \
   || bad "must not arm without corroboration" "armed=$(hf_get armed)"
@@ -809,7 +852,7 @@ exec /bin/ps "$@"
 PSEOF
   chmod +x "$FAKE/fakebin/ps"
 fi
-quota 58 96
+quota 58 100
 
 "$FAKE/sigbin/claude" 8 & TARGET=$!
 sleep 0.3
@@ -1336,6 +1379,17 @@ case "$out" in
   *CCD-RESUMED*) bad "unproved paid hop" "relaunched onto OpenRouter on an order it did not re-check" ;;
   *"claude --resume sess-unproved"*) ok "a paid hop that is no longer proved does not relaunch, and says how to carry on" ;;
   *) bad "unproved paid hop" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+# ...and the same refusal for a session that never got a transcript must not offer
+# a --resume that fails with "No conversation found".
+rm -f "$FAKE/.launcher-proof" "$FAKE/.claude/projects/-tmp/sess-blank.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-blank","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
+case "$out" in
+  *CCD-*) bad "unproved paid hop" "relaunched a blank session onto OpenRouter unproved" ;;
+  *"--resume"*) bad "resume hint" "offered to resume a conversation that does not exist" ;;
+  *"claude"*) ok "...and with no transcript it says to start again, not to resume nothing" ;;
+  *) bad "resume hint" "said nothing about carrying on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 : > "$FAKE/.launcher-proof"
 
@@ -2117,7 +2171,7 @@ keycase 'unquoted'             'OPENROUTER_API_KEY=sk-or-v1-real'          usabl
 # an unsupervised session would be consumed by a later launcher.
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
 paid_optin_on
-quota 58 96
+quota 58 100
 hf_reset
 stopfail sess-h rate_limit | CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
@@ -2231,7 +2285,7 @@ else ok "a token of the wrong length is refused"; fi
 # The hook must not signal when the state write fails. Point the state at a path
 # whose parent directory does not exist: that fails for root too, unlike chmod,
 # which the container tests run as root and would ignore.
-quota 58 96
+quota 58 100
 set +m 2>/dev/null
 "$FAKE/sigbin/claude" 8 2>/dev/null & TARGET=$!
 sleep 0.3
@@ -2448,7 +2502,7 @@ export CCD_HTTP_TIMEOUT=1
 ACCT="$ROOT/bin/ccd-account"
 ADIR="$FAKE/.claude/ccd/accounts"
 CREDS="$FAKE/.claude/.credentials.json"
-rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-quota.json"
+rm -rf "$ADIR" "$RQD"
 
 # ── The regression that matters most ────────────────────────────────────────
 # Sections 1-20 all ran with no account store at all, which covers the upgrade
@@ -2538,7 +2592,7 @@ set_identity() { # $1=uuid $2=email $3=profileFetchedAt(ms)
   printf '{"oauthAccount":{"accountUuid":"%s","emailAddress":"%s","profileFetchedAt":%s}}\n' \
     "$1" "$2" "$3" > "$FAKE/.claude.json"
 }
-rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-quota.json" "$FAKE/.claude.json"
+rm -rf "$ADIR" "$RQD" "$FAKE/.claude.json"
 
 NOWMS=$(( $(date +%s) * 1000 ))
 set_identity uuid-A a@example.com "$NOWMS"
@@ -2803,7 +2857,7 @@ set_identity uuid-B b@example.com "$(( $(date +%s) * 1000 ))"
 printf '{"b":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"},"a":{"status":"ok","checked_at":%s,"uuid":"%s","cred":"%s","five_hour_percent":7,"seven_day_percent":8}}' \
   "$(( $(date +%s) - 60 ))" "$(acct_uuid "$ADIR/b.json")" "$FP_OLD" \
   "$(( $(date +%s) - 60 ))" "$(acct_uuid "$ADIR/a.json")" "$(cred_fp "$ADIR/a.json")" \
-  > "$FAKE/.claude/ccd/accounts-quota.json"
+  | rq_put
 out=$("$ACCT" --no-color list --json 2>/dev/null)
 python3 - "$out" <<'PY'
 import json, sys
@@ -2822,7 +2876,7 @@ PY
 # survive, or negative caching is gone and every tick re-probes a dead account.
 printf '{"b":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"}}' \
   "$(date +%s)" "$(acct_uuid "$ADIR/b.json")" "$(cred_fp "$ADIR/b.json")" \
-  > "$FAKE/.claude/ccd/accounts-quota.json"
+  | rq_put
 out=$("$ACCT" --no-color list --json 2>/dev/null)
 python3 - "$out" <<'PY'
 import json, sys
@@ -2858,7 +2912,7 @@ set_identity uuid-C c@example.com "$(( $(date +%s) * 1000 ))"
 # Written back AFTER the re-registration, exactly as a writer holding an older
 # copy of the whole cache would. Correctness must not rest on having deleted it.
 printf '{"b":{"status":"ok","checked_at":%s,"uuid":"%s","cred":"deadbeefdeadbeef","five_hour_percent":3,"seven_day_percent":4}}' \
-  "$(date +%s)" "$OLD_UUID" > "$FAKE/.claude/ccd/accounts-quota.json"
+  "$(date +%s)" "$OLD_UUID" | rq_put
 out=$("$ACCT" --no-color list --json 2>/dev/null)
 python3 - "$out" <<'PY'
 import json, sys
@@ -2875,7 +2929,7 @@ PY
 # checked. Asserted in both directions, or "offers nothing" proves nothing.
 seed_pick_row() { # $1=uuid to claim
   printf '{"a":{"status":"ok","checked_at":%s,"uuid":"%s","cred":"%s","five_hour_percent":1,"seven_day_percent":1}}' \
-    "$(date +%s)" "$1" "$(cred_fp "$ADIR/a.json")" > "$FAKE/.claude/ccd/accounts-quota.json"
+    "$(date +%s)" "$1" "$(cred_fp "$ADIR/a.json")" | rq_put
 }
 seed_pick_row "$(acct_uuid "$ADIR/a.json")"
 [ "$("$ACCT" --no-color pick --no-probe 2>/dev/null)" = "a" ] \
@@ -2897,7 +2951,7 @@ d["account_uuid"] = None
 json.dump(d, open(sys.argv[1], "w"))
 PY
 printf '{"a":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":2,"seven_day_percent":2}}' \
-  "$(date +%s)" "$(cred_fp "$ADIR/a.json")" > "$FAKE/.claude/ccd/accounts-quota.json"
+  "$(date +%s)" "$(cred_fp "$ADIR/a.json")" | rq_put
 [ "$("$ACCT" --no-color pick --no-probe 2>/dev/null)" = "a" ] \
   && ok "an identity-less account is trusted while its credential still matches" \
   || bad "no-uuid" "a valid row was retired for want of a uuid"
@@ -2918,7 +2972,7 @@ PY
 printf '{"a":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"},"b":{"status":"dead","checked_at":%s,"uuid":"%s","cred":"%s"}}' \
   "$(date +%s)" "$(acct_uuid "$ADIR/a.json")" "$(cred_fp "$ADIR/a.json")" \
   "$(date +%s)" "$(acct_uuid "$ADIR/b.json")" "$(cred_fp "$ADIR/b.json")" \
-  > "$FAKE/.claude/ccd/accounts-quota.json"
+  | rq_put
 out=$("$ACCT" --no-color list 2>&1)
 hint=$(printf '%s' "$out" | grep -A2 're-login needed for')
 case "$hint" in
@@ -2926,11 +2980,11 @@ case "$hint" in
   *"/login"*) ok "the dead-account hint asks for /login and names no follow-up command" ;;
   *) bad "dead-account hint" "got: $(printf '%s' "$hint" | tr '\n' ' ' | head -c 90)" ;;
 esac
-rm -f "$FAKE/.claude/ccd/accounts-quota.json"
+rm -rf "$RQD"
 rm -f "$FAKE/.claude.json"     # later sections exercise the no-identity fallback
 
 head_ "23. multi-account: choosing where to go"
-seed_quota() { printf '%s' "$1" > "$FAKE/.claude/ccd/accounts-quota.json"; }
+seed_quota() { printf '%s' "$1" | rq_put; }
 NOW=$(date +%s)
 # These accounts are registered without an identity, so a cached row is bound to
 # the credential alone. Omitting `cred` would retire every row and send `pick`
@@ -2945,7 +2999,7 @@ q() { printf '"%s":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent
 rm -rf "$ADIR"
 for n in one two; do write_creds "$n"; "$ACCT" --no-color add --name "$n" >/dev/null 2>&1; done
 "$ACCT" --no-color use one --force >/dev/null 2>&1   # 'one' is spent, 'two' is the spare
-seed_quota "{$(q one 99 99),$(q two 10 20)}"
+seed_quota "{$(q one 100 100),$(q two 10 20)}"
 [ "$("$ACCT" --no-color pick)" = "two" ] \
   && ok "pick returns the spare with room" || bad "pick" "wrong account"
 
@@ -2953,7 +3007,7 @@ seed_quota "{$(q one 99 99),$(q two 10 20)}"
 # Every route into a handoff picks the destination itself; the only place a person
 # supplied it was the one they typed. `use` with no name is that route for people.
 "$ACCT" --no-color use one --force >/dev/null 2>&1
-seed_quota "{$(q one 99 99),$(q two 10 20)}"
+seed_quota "{$(q one 100 100),$(q two 10 20)}"
 out=$("$ACCT" --no-color use 2>&1); rc=$?
 # The pointer alone is not a swap: a move that updates `.active` without installing
 # the target's token leaves the next session authenticating as the spent account.
@@ -2974,7 +3028,7 @@ esac
 
 # Naming one still means that one, even when it is not what pick would choose.
 "$ACCT" --no-color use one --force >/dev/null 2>&1
-seed_quota "{$(q one 10 10),$(q two 99 99)}"
+seed_quota "{$(q one 10 10),$(q two 100 100)}"
 "$ACCT" --no-color use two --force >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && [ "$(cat "$ADIR/.active")" = "two" ] && grep -q 'AT-two' "$CREDS" \
   && ok "...while a named account is still taken at its word" \
@@ -2983,7 +3037,7 @@ seed_quota "{$(q one 10 10),$(q two 99 99)}"
 # Nowhere to go is an answer, not a swap to something spent — and not a half-swap
 # either: the live credentials must still be the ones we came in with.
 "$ACCT" --no-color use one --force >/dev/null 2>&1
-seed_quota "{$(q one 99 99),$(q two 99 99)}"
+seed_quota "{$(q one 100 100),$(q two 100 100)}"
 out=$("$ACCT" --no-color use 2>&1); rc=$?
 [ "$rc" -eq 1 ] && [ "$(cat "$ADIR/.active")" = "one" ] && grep -q 'AT-one' "$CREDS" \
   && ok "...and with every spare spent it stays put and says so" \
@@ -2996,7 +3050,7 @@ esac
 # An empty name is a bad name, not a request to choose one. The difference only
 # shows when there IS something to choose, so put a spare back within reach first:
 # against an exhausted store both readings refuse, for different reasons.
-seed_quota "{$(q one 99 99),$(q two 10 20)}"
+seed_quota "{$(q one 100 100),$(q two 10 20)}"
 out=$("$ACCT" --no-color use "" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && [ "$(cat "$ADIR/.active")" = "one" ] \
   && ok "...while an empty name is rejected rather than quietly resolved" \
@@ -3010,19 +3064,19 @@ seed_quota "{$(q one 10 10),$(q two 10 20)}"
 
 # The 7-day window is not optional: an account whose 5h just reset but whose week
 # is spent dies again within minutes.
-seed_quota "{$(q one 99 99),$(q two 5 99)}"
+seed_quota "{$(q one 100 100),$(q two 5 100)}"
 "$ACCT" --no-color pick >/dev/null 2>&1 \
   && bad "7d gate" "offered an account with a saturated weekly window" \
   || ok "an account with a spent 7-day window is not offered"
 
 # An unreadable account is not an available one. Treating "unknown" as "has room"
 # would hand off into a dead end.
-seed_quota "{$(q one 99 99),\"two\":{\"status\":\"error\",\"checked_at\":$NOW}}"
+seed_quota "{$(q one 100 100),\"two\":{\"status\":\"error\",\"checked_at\":$NOW}}"
 "$ACCT" --no-color pick >/dev/null 2>&1 \
   && bad "error handling" "treated an unreadable account as having room" \
   || ok "an unreadable account is never treated as having room"
 
-seed_quota "{$(q one 99 99),\"two\":{\"status\":\"dead\",\"checked_at\":$NOW}}"
+seed_quota "{$(q one 100 100),\"two\":{\"status\":\"dead\",\"checked_at\":$NOW}}"
 "$ACCT" --no-color pick >/dev/null 2>&1 \
   && bad "dead handling" "offered an account that needs re-login" \
   || ok "an account needing re-login is not offered"
@@ -3032,7 +3086,7 @@ seed_quota "{$(q one 99 99),\"two\":{\"status\":\"dead\",\"checked_at\":$NOW}}"
 write_creds three
 "$ACCT" --no-color add --name three --priority 5 >/dev/null 2>&1
 "$ACCT" --no-color use one --force >/dev/null 2>&1
-seed_quota "{$(q one 99 99),$(q two 40 40),$(q three 1 1)}"
+seed_quota "{$(q one 100 100),$(q two 40 40),$(q three 1 1)}"
 [ "$("$ACCT" --no-color pick)" = "two" ] \
   && ok "priority wins over lower usage" || bad "priority" "picked by usage instead"
 # And a person asking for it gets the same order: with two spares to choose
@@ -3045,7 +3099,7 @@ seed_quota "{$(q one 99 99),$(q two 40 40),$(q three 1 1)}"
 
 # --no-probe is what the prompt hook uses; it must never open a socket, so stale
 # cache entries simply stop counting.
-seed_quota "{$(q one 99 99),\"two\":{\"status\":\"ok\",\"checked_at\":1,\"five_hour_percent\":1,\"seven_day_percent\":1}}"
+seed_quota "{$(q one 100 100),\"two\":{\"status\":\"ok\",\"checked_at\":1,\"five_hour_percent\":1,\"seven_day_percent\":1}}"
 "$ACCT" --no-color pick --no-probe >/dev/null 2>&1 \
   && bad "--no-probe" "used a long-stale cache entry" \
   || ok "--no-probe ignores stale cache instead of reaching for the network"
@@ -3065,7 +3119,7 @@ cp "$ACCT" "$HB/ccd-account"; chmod +x "$HB/ccd-account"
 mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-m.jsonl"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
-seed_quota "{$(q one 99 99),$(q two 10 20)}"
+seed_quota "{$(q one 100 100),$(q two 10 20)}"
 "$ACCT" --no-color use one --force >/dev/null 2>&1
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_account","account":"two","session_id":"sess-m","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 cat > "$FAKE/realbin/claude" <<'EOF'
@@ -3112,7 +3166,10 @@ import json, os, sys, time, types
 # Grab the arguments before clearing sys.argv: ccd-account parses it at import.
 argv = sys.argv[1:]
 m = types.ModuleType("m"); sys.argv = ["x"]
-src = open(os.environ["ROOT"] + "/bin/ccd-account").read()
+# A module loaded from text has no __file__, and the program finds bin/spent-at
+# beside itself. Give it the path it would have had.
+m.__file__ = os.environ["ROOT"] + "/bin/ccd-account"
+src = open(m.__file__).read()
 exec(compile(src.replace('if __name__ == "__main__":', 'if False:'), "x", "exec"), m.__dict__)
 cmd = argv[0] if argv else ""
 if cmd == "mk":                       # mk <name> <days since refresh> <rt days left>
@@ -3344,9 +3401,10 @@ rm -f "$FAKE/.claude/ccd/accounts-stale"
 # an error or dead and overwrite the rows `ka warm` seeded. Their survival is the
 # assertion: the prompt hook's backgrounded picker stayed home.
 for _ in 1 2 3 4 5 6; do sleep 0.3; done
+RQT=$(rq_gather)
 left=$(python3 -c "
 import json
-d = json.load(open('$FAKE/.claude/ccd/accounts-quota.json'))
+d = json.load(open('$RQT'))
 print(sorted({r.get('status') for r in d.values()}))" 2>/dev/null)
 [ "$left" = "['ok']" ] \
   && ok "the prompt hook's quota warm stays off the network in a parked fixture" \
@@ -3448,7 +3506,7 @@ EPY
 rm -rf "$ADIR"; mkdir -p "$ADIR"
 ka mk active-acct 0 8; ka mk race-spare 0 8
 printf 'active-acct\n' > "$ADIR/.active"
-rm -f "$FAKE/.claude/ccd/accounts-keepalive" "$FAKE/.claude/ccd/accounts-quota.json" "$FAKE/.race"
+rm -rf "$FAKE/.claude/ccd/accounts-keepalive" "$RQD" "$FAKE/.race"
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
   > "$FAKE/.claude/ccd/quota-cache.json"
 endpoint_up "$FAKE/.race" 0.4 || bad "refresher race" "local endpoint never came up"
@@ -3609,7 +3667,7 @@ print(" ".join(k for k in sys.argv[2:] if k in d))
 PY
 }
 
-rm -rf "$ADIR" "$FAKE/.claude/ccd/accounts-quota.json"
+rm -rf "$ADIR" "$RQD"
 write_creds one; "$ACCT" --no-color add --name one --label "first@example.com" >/dev/null 2>&1
 write_creds two; "$ACCT" --no-color add --name two --label "second@example.com" >/dev/null 2>&1
 "$ACCT" --no-color use one --force >/dev/null 2>&1
@@ -3781,8 +3839,7 @@ head_ "27. multi-account: the statusline's spare row"
 # from each other, and none of them may read as "no spare" while one is registered
 # — that was the bug: an account merely out of room for the next few minutes was
 # reported as an account the user had never set up.
-SLQ="$FAKE/.claude/ccd/accounts-quota.json"
-rm -rf "$ADIR" "$SLQ" "$FAKE/.claude.json"
+rm -rf "$ADIR" "$RQD" "$FAKE/.claude.json"
 mkdir -p "$ADIR"
 mk_sl_acct() { # $1=name
   printf '{"name":"%s","label":"%s@example.com","account_uuid":"uuid-%s","priority":1,"claudeAiOauth":{"accessToken":"AT-%s"}}\n' \
@@ -3796,7 +3853,8 @@ printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 # Offsets are seconds from now, which is how a reset time is really read — as a
 # distance, not a date. "-" leaves a field out entirely.
 seed_rows() { # name:status:5h:7d:5h_offset:7d_offset ...
-  python3 - "$ADIR" "$SLQ" "$@" <<'PY'
+  RQT=$(rq_gather)
+  python3 - "$ADIR" "$RQT" "$@" <<'PY'
 import datetime, hashlib, json, os, sys
 adir, out, specs = sys.argv[1], sys.argv[2], sys.argv[3:]
 now = datetime.datetime.now(datetime.timezone.utc)
@@ -3817,6 +3875,7 @@ for s in specs:
     rows[name] = rec
 json.dump(rows, open(out, "w"))
 PY
+  rq_scatter "$RQT"
 }
 # Just the account segment, without the colours the assertions do not care about.
 sl_spare() {
@@ -3865,17 +3924,17 @@ esac
 # And the ordering follows the same number, or the row names a spare that is six
 # days away over one that is back in two hours.
 mk_sl_acct sooner
-seed_rows main:ok:0:22:18000:600000 backup:ok:100:100:780:518400 sooner:ok:91:12:7200:518400
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:100:780:518400 sooner:ok:100:12:7200:518400
 row=$(sl_spare)
 case "$row" in
-  *"sooner 91% (2h0m)"*"+1"*) ok "...and outranked by a spare that is actually usable sooner" ;;
+  *"sooner 100% (2h0m)"*"+1"*) ok "...and outranked by a spare that is actually usable sooner" ;;
   *) bad "time to usable" "got: $row" ;;
 esac
 rm -f "$ADIR/sooner.json"
 
 # ── Somebody has to keep the file current ───────────────────────────────────
 # The checks above make a stale row read as unknown, which is honest and useless on
-# its own: before this, nothing refreshed accounts-quota.json except a user-typed
+# its own: before this, nothing refreshed the readings except a user-typed
 # `ccd account` command, so the row would simply go quiet instead of going wrong.
 # A prompt tick warms it in the background.
 # The file appearing is not the point — a failed probe writes one too, and `dead` is
@@ -3917,14 +3976,14 @@ d = json.load(open(p))
 d["claudeAiOauth"]["expiresAt"] = int((time.time() + 8 * 3600) * 1000)
 json.dump(d, open(p, "w"))
 LIVEPY
-  rm -f "$SLQ"
+  rm -rf "$RQD"
   printf '{"session_id":"sess-warm","cwd":"/tmp"}' \
     | CCD_USAGE_URL="http://127.0.0.1:$(cat "$FAKE/.uport")/usage" \
       CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
-  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SLQ" ] && break; sleep 0.3; done
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n "$(ls "$RQD" 2>/dev/null)" ] && break; sleep 0.3; done
   verdict=$(python3 -c "
 import json, sys, time
-try: d = json.load(open('$SLQ'))
+try: d = json.load(open('$(rq_gather)'))
 except Exception: print('unreadable'); raise SystemExit
 rows = [r for r in d.values() if isinstance(r, dict)]
 if not rows: print('empty'); raise SystemExit
@@ -3970,13 +4029,15 @@ esac
 # reset it never recorded. The reporter's machine served a four-day-old row as
 # current for exactly this reason.
 seed_rows main:ok:0:22:18000:600000 backup:ok:8:12:18000:518400
-python3 - "$SLQ" <<'AGEPY'
+RQT=$(rq_gather)
+python3 - "$RQT" <<'AGEPY'
 import json, sys, time
 p = sys.argv[1]
 d = json.load(open(p))
 d["backup"]["checked_at"] = int(time.time()) - 4 * 86400
 json.dump(d, open(p, "w"))
 AGEPY
+rq_scatter "$RQT"
 row=$(sl_spare)
 case "$row" in
   *"backup 12%"*) bad "stale row" "served a four-day-old reading as current: $row" ;;
@@ -3994,11 +4055,11 @@ esac
 # to turn over, so there is no honest number for when the account comes back —
 # and the other window's 13 minutes is not it. (Without the guard this is also
 # where `max()` meets a None and takes the whole row down with it.)
-seed_rows main:ok:0:22:18000:600000 backup:ok:98:95:780:-
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:100:780:-
 row=$(sl_spare)
 case "$row" in
-  *"backup 98%"*"("*) bad "half-timed spare" "timed the account by a window that does not free it: $row" ;;
-  *"backup 98%"*) ok "...and one blocked window we cannot time leaves the whole account untimed" ;;
+  *"backup 100%"*"("*) bad "half-timed spare" "timed the account by a window that does not free it: $row" ;;
+  *"backup 100%"*) ok "...and one blocked window we cannot time leaves the whole account untimed" ;;
   *) bad "half-timed spare" "got: $row" ;;
 esac
 
@@ -4007,52 +4068,52 @@ esac
 # says so, so it outranks a spare that is merely full. That makes precedence the
 # test for which side of the bound an account landed on — no colour matching.
 mk_sl_acct broken
-seed_rows main:ok:0:22:18000:600000 backup:ok:89:12:780:518400 broken:dead:-:-:-:-
-# The countdown belongs on this side of the bound too: a spare at 89% with
-# thirteen minutes left is a net that is about to have a hole in it.
+seed_rows main:ok:0:22:18000:600000 backup:ok:99:12:780:518400 broken:dead:-:-:-:-
+# The countdown belongs on this side of the bound too: a spare at 99% with
+# thirteen minutes left is a net that is about to have a hole in it. And it IS
+# this side: there is no reserve under "spent" — 99% is somewhere to go.
 case "$(sl_spare)" in
-  *"backup 89% (13m)"*) ok "one point under the bound still counts as a spare with room, timed" ;;
-  *) bad "headroom bound" "89% did not read as ready, or lost its countdown: $(sl_spare)" ;;
+  *"backup 99% (13m)"*) ok "one point under spent still counts as a spare with room, timed" ;;
+  *) bad "spent bound" "99% did not read as ready, or lost its countdown: $(sl_spare)" ;;
 esac
-seed_rows main:ok:0:22:18000:600000 backup:ok:90:12:780:518400 broken:dead:-:-:-:-
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:12:780:518400 broken:dead:-:-:-:-
 case "$(sl_spare)" in
-  *"needs re-login"*) ok "...and at the bound the row goes to the spare needing a re-login" ;;
-  *) bad "headroom bound" "90% still read as ready: $(sl_spare)" ;;
+  *"needs re-login"*) ok "...and at 100% the row goes to the spare needing a re-login" ;;
+  *) bad "spent bound" "100% still read as ready: $(sl_spare)" ;;
 esac
 # The bound has to mean the same thing to both halves of the row: an account AT
 # the bound is classified as having no room, so the window holding it there is
 # what has to turn over before it is usable.
-seed_rows main:ok:0:22:18000:600000 backup:ok:90:12:780:518400
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:12:780:518400
 case "$(sl_spare)" in
-  *"backup 90% (13m)"*) ok "...and a spare exactly at the bound is timed by the window holding it there" ;;
-  *) bad "headroom bound" "the bound means two different things: $(sl_spare)" ;;
+  *"backup 100% (13m)"*) ok "...and a spare exactly at the bound is timed by the window holding it there" ;;
+  *) bad "spent bound" "the bound means two different things: $(sl_spare)" ;;
 esac
-# The bound itself is ccd-account's, not a number of the statusline's own: drawing
-# the line in a different place than the swap does would name a spare the handoff
-# then declines to use.
-seed_rows main:ok:0:22:18000:600000 backup:ok:98:12:780:518400 broken:dead:-:-:-:-
-case "$(CCD_HEADROOM=99 sl_spare)" in
-  *"backup 98%"*) ok "...and CCD_HEADROOM moves it, the same as it moves the swap's" ;;
-  *) bad "CCD_HEADROOM" "the statusline kept its own bound: $(CCD_HEADROOM=99 sl_spare)" ;;
+# "Spent" is not a knob any more. The old one, set in somebody's shell, must not
+# move this row away from where the swap and the proof draw the same line.
+seed_rows main:ok:0:22:18000:600000 backup:ok:60:12:780:518400 broken:dead:-:-:-:-
+case "$(CCD_HEADROOM=50 sl_spare)" in
+  *"backup 60%"*) ok "...and the retired CCD_HEADROOM moves nothing: there is one meaning of spent" ;;
+  *) bad "spent bound" "an environment variable redrew the line: $(CCD_HEADROOM=50 sl_spare)" ;;
 esac
 rm -f "$ADIR/broken.json"
 
 # ── Among spares with no room, the one that comes back first ─────────────────
-# Not the least spent one: 91% resetting in two hours is no use to someone whose
-# next command is now, and 99% resetting in three minutes is.
+# Not by percentage — every one of them is at 100 — but by the clock: resetting in
+# two hours is no use to someone whose next command is now, and in three minutes is.
 mk_sl_acct later
-seed_rows main:ok:0:22:18000:600000 backup:ok:99:12:180:518400 later:ok:91:12:7200:518400
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:12:180:518400 later:ok:100:12:7200:518400
 row=$(sl_spare)
 case "$row" in
-  *"backup 99% (3m)"*"+1"*) ok "the full spare named is the soonest to reset, with the rest as +N" ;;
+  *"backup 100% (3m)"*"+1"*) ok "the full spare named is the soonest to reset, with the rest as +N" ;;
   *) bad "full ordering" "got: $row" ;;
 esac
 # A spare we cannot time loses to one we can, whatever their percentages: an
 # unknown wait is not a shorter wait.
-seed_rows main:ok:0:22:18000:600000 backup:ok:99:12:180:518400 later:ok:95:12:-:-
+seed_rows main:ok:0:22:18000:600000 backup:ok:100:12:180:518400 later:ok:100:12:-:-
 row=$(sl_spare)
 case "$row" in
-  *"backup 99% (3m)"*"+1"*) ok "...and a full spare with no timing sorts behind one with it" ;;
+  *"backup 100% (3m)"*"+1"*) ok "...and a full spare with no timing sorts behind one with it" ;;
   *) bad "full ordering" "got: $row" ;;
 esac
 rm -f "$ADIR/later.json"
@@ -4077,7 +4138,7 @@ else
   ok "...and the row has no way left to answer \"no spare\" at a registered one"
 fi
 
-rm -rf "$ADIR" "$SLQ"
+rm -rf "$ADIR" "$RQD"
 
 head_ "27b. the escape hatch fires on a reading, not on a memory"
 # The loudest thing ccd puts on screen, in bold red, was the least qualified: it read
@@ -4192,7 +4253,7 @@ head_ "27c. the warning names the move that actually applies"
 # your other Claude subscription first, OpenRouter as the last resort", and the
 # handoff path already agrees ("Prefer another subscription over paying").
 mkdir -p "$ADIR"
-rm -f "$SLQ"
+rm -rf "$RQD"
 mk_sl_acct here; mk_sl_acct roomyspare
 printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 KEYF="$FAKE/.claude/ccd/providers/keys.env"
@@ -4215,14 +4276,14 @@ case "$full" in
 esac
 
 # Every subscription spent, key configured: the paid hop is the answer again.
-seed_rows here:ok:99:40:18000:518400 roomyspare:ok:97:96:18000:518400
+seed_rows here:ok:99:40:18000:518400 roomyspare:ok:100:100:18000:518400
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
 [ "$row" = "⚠ quota 99% → /exit then ccd -c" ] \
   && ok "...and with every subscription spent it is ccd -c again" || bad "warning target" "got: $row"
 
 # Nothing registered at all is the same answer by a different route.
-rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
+rm -rf "$ADIR" "$RQD"; mkdir -p "$ADIR"
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
 [ "$row" = "⚠ quota 99% → /exit then ccd -c" ] \
@@ -4242,7 +4303,7 @@ row=$(hatch)
 # since a missing one sends the render off to measure them (#54).
 mk_sl_acct here; mk_sl_acct unseen
 printf 'here' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
-printf '{}' > "$SLQ"
+printf '{}' | rq_put
 wcache 99 40 "$(iso 3600)" "$(iso 500000)"
 row=$(hatch)
 [ "$row" = "⚠ quota 99% → no known spare, no OpenRouter key" ] \
@@ -4292,7 +4353,7 @@ head_ "27d. a session that cannot hand off says so where you are looking"
 # except `ccd doctor` reported success. doctor is the command nobody runs BEFORE the
 # thing they installed fails to happen; this row is the one people actually read, and
 # it already carries "needs re-login" for the same reason.
-rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
+rm -rf "$ADIR" "$RQD"; mkdir -p "$ADIR"
 mk_sl_acct main; mk_sl_acct backup
 printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows main:ok:0:22:18000:600000 backup:ok:20:30:18000:600000
@@ -4419,7 +4480,7 @@ paid_optin_off
 rm -rf "$ADIR" "$SHIMD"; mkdir -p "$ADIR"
 
 head_ "27e. the spare's reading keeps pace with the row"
-# #54. The row is only as current as accounts-quota.json, and only a typed prompt
+# #54. The row is only as current as the readings on file, and only a typed prompt
 # refreshed it: an autonomous turn fires tool uses and assistant messages, never a
 # prompt, so a healthy spare aged into `spare ?` exactly while quota burned fastest.
 # The reading has to move on the row's own cadence (prompt, tool use, render, and a
@@ -4429,7 +4490,7 @@ head_ "27e. the spare's reading keeps pace with the row"
 # Every trigger runs from a copy of the plugin whose ccd-account logs, then execs the
 # real one. The log tells "nothing needed refreshing" apart from "nothing was started";
 # the local endpoint (section 25) says whether a refresh landed, and how many overlapped.
-SPD="$FAKE/.claude/ccd"; SPQ="$SPD/accounts-quota.json"
+SPD="$FAKE/.claude/ccd"
 SPROOT="$FAKE/spareroot"; SPLOG="$FAKE/.spare-calls"; SPHITS="$FAKE/.spare-hits"
 rm -rf "$SPROOT"; mkdir -p "$SPROOT"
 cp -R "$ROOT/bin" "$ROOT/scripts" "$SPROOT/"
@@ -4450,8 +4511,9 @@ sp_render() {
 }
 spare_fixture() { # $1 = age of every reading on file, in seconds; $2 = "due" for a spare
                   # whose keepalive is due and whose access token has expired
-  rm -rf "$ADIR" "$SPQ" "$SPLOG" "$SPHITS" "$FAKE/.claude.json"; mkdir -p "$ADIR"
-  python3 - "$ADIR" "$SPQ" "$1" "${2:-}" <<'PY'
+  rm -rf "$ADIR" "$RQD" "$SPLOG" "$SPHITS" "$FAKE/.claude.json"; mkdir -p "$ADIR"
+  RQT=$(rq_gather)
+  python3 - "$ADIR" "$RQT" "$1" "${2:-}" <<'PY'
 import datetime, hashlib, json, os, sys, time
 adir, qfile, age, due = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "due"
 now = time.time()
@@ -4471,6 +4533,7 @@ for name in ("main", "backup"):
 json.dump(rows, open(qfile, "w"))
 os.utime(qfile, (now - age, now - age))
 PY
+  rq_scatter "$RQT"
   printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
   # The hook's own reading of the signed-in account is not what this section measures.
   printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
@@ -4478,7 +4541,8 @@ PY
   if [ "${2:-}" = "due" ]; then rm -f "$SPD/accounts-keepalive"; else printf '{"fails": 0}' > "$SPD/accounts-keepalive"; fi
 }
 sp_reading() {
-  python3 - "$SPQ" <<'PY'
+  RQT=$(rq_gather)
+  python3 - "$RQT" <<'PY'
 import json, sys, time
 try: r = json.load(open(sys.argv[1]))["backup"]
 except Exception: print("unreadable"); raise SystemExit
@@ -4486,6 +4550,7 @@ t = r.get("checked_at")
 fresh = isinstance(t, (int, float)) and time.time() - t < 60
 print(f"{r.get('status')}:{'fresh' if fresh else 'stale'}:{r.get('five_hour_percent')}")
 PY
+  rm -f "$RQT"            # read only: nothing to publish
 }
 sp_landed() { # the endpoint's reading, on file
   n=0; while [ "$(sp_reading)" != "ok:fresh:12" ] && [ $n -lt 60 ]; do sleep 0.25; n=$((n+1)); done
@@ -4714,7 +4779,7 @@ else
 fi
 
 kill "$EP_PID" 2>/dev/null; wait "$EP_PID" 2>/dev/null
-rm -rf "$SPROOT" "$ADIR" "$SPQ" "$SPLOG" "$SPHITS" "$SPD/accounts-keepalive"
+rm -rf "$SPROOT" "$ADIR" "$RQD" "$SPLOG" "$SPHITS" "$SPD/accounts-keepalive"
 mkdir -p "$ADIR"
 unset -f sp_env sp_hook sp_render sp_cancelled solo_fixture spare_fixture sp_reading sp_landed cas_state
 
@@ -4871,7 +4936,7 @@ case "$out" in
 esac
 
 # ── The statusline ──────────────────────────────────────────────────────────
-rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
+rm -rf "$ADIR" "$RQD"; mkdir -p "$ADIR"
 mk_sl_acct main; mk_sl_acct backup
 printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows main:ok:0:22:18000:600000 backup:ok:20:30:18000:600000
@@ -4914,11 +4979,11 @@ nd_arm() { # $1=session id ; leaves the hook's exit code in $ND_RC
 }
 
 # Nothing registered: the only place left to go is OpenRouter.
-rm -rf "$ADIR" "$SLQ"
+rm -rf "$ADIR" "$RQD"
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
-stage_usage 58 96
+stage_usage 58 100
 nd_arm sess-nd1
-[ "$(hf_get armed)" = "True" ] && ok "rate_limit + a self-measured 96% arms the handoff" \
+[ "$(hf_get armed)" = "True" ] && ok "rate_limit + a self-measured 100% arms the handoff" \
   || bad "arming without a dashboard" "armed=$(hf_get armed)"
 [ "$(hf_get direction)" = "to_fallback" ] && ok "...toward OpenRouter when no subscription is registered" \
   || bad "direction" "got: $(hf_get direction)"
@@ -4928,7 +4993,7 @@ nd_arm sess-nd1
 # that quota exhaustion may start billing while they are not at the keyboard.
 paid_optin_off
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
-stage_usage 58 96
+stage_usage 58 100
 nd_arm sess-nd1b
 [ -z "$(hf_get armed)" ] \
   && ok "...and not at all when the paid hop was never opted into" \
@@ -4947,7 +5012,8 @@ for n in nd_one nd_two; do write_creds "$n"; "$ACCT" --no-color add --name "$n" 
 # network, and there it would read the signed-in account's numbers for every
 # account, which is a fixture bug that looks exactly like a product bug.
 nd_seed_rows() { # name:5h:7d ...
-  python3 - "$ADIR" "$SLQ" "$@" <<'NDEOF'
+  RQT=$(rq_gather)
+  python3 - "$ADIR" "$RQT" "$@" <<'NDEOF'
 import hashlib, json, os, sys, time
 adir, out, specs = sys.argv[1], sys.argv[2], sys.argv[3:]
 rows = {}
@@ -4965,8 +5031,9 @@ for spec in specs:
     }
 json.dump(rows, open(out, "w"))
 NDEOF
+  rq_scatter "$RQT"
 }
-nd_seed_rows nd_one:99:99 nd_two:10:20
+nd_seed_rows nd_one:100:100 nd_two:10:20
 paid_optin_off
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 nd_arm sess-nd2
@@ -4982,9 +5049,9 @@ paid_optin_on
 # ── Fails closed ────────────────────────────────────────────────────────────
 # No dashboard AND no reading is the same as no reading: a bare rate_limit can be
 # transient throttling, and arming on one would end a session on a guess.
-rm -rf "$ADIR" "$SLQ"
+rm -rf "$ADIR" "$RQD"
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
-stage_usage 58 96 500
+stage_usage 58 100 500
 nd_arm sess-nd3
 [ -z "$(hf_get armed)" ] && ok "an unmeasurable account still refuses to arm" \
   || bad "armed on no reading" "armed=$(hf_get armed)"
@@ -5012,17 +5079,17 @@ n2=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
 "$FAKE/sigbin/claude" 8 2>/dev/null & NDPID=$!
 sleep 0.3
 kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
-rm -rf "$ADIR" "$SLQ"
+rm -rf "$ADIR" "$RQD"
 hf_reset; rm -f "$CCDD/.usage-probe-backoff"
-quota 58 96                      # a good reading...
+quota 58 100                      # a good reading...
 nd_age "$CCDD/quota-cache.json" 5400     # ...taken an hour and a half ago
-stage_usage 58 96 500            # and every refresh since has failed
+stage_usage 58 100 500            # and every refresh since has failed
 nd_arm sess-nd4
 [ -z "$(hf_get armed)" ] && ok "a reading too old to describe now does not arm" \
   || bad "armed on a stale reading" "armed=$(hf_get armed)"
 # The bound has to be an upper one, not a rejection of everything: a reading from
 # four minutes ago is what a working install always has.
-hf_reset; quota 58 96
+hf_reset; quota 58 100
 nd_age "$CCDD/quota-cache.json" 240
 nd_arm sess-nd5
 [ "$(hf_get armed)" = "True" ] && ok "...while a recent one still does" \
@@ -5034,16 +5101,16 @@ nd_arm sess-nd5
 hf_reset; rm -f "$CCDD/.usage-probe-backoff"
 past=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=3)).isoformat())")
 future=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).isoformat())")
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":100,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
   "$past" "$future" > "$CCDD/quota-cache.json"
 nd_age "$CCDD/quota-cache.json" 240
-stage_usage 58 96 500
+stage_usage 58 100 500
 nd_arm sess-nd6
 [ -z "$(hf_get armed)" ] && ok "a window that has already reset does not corroborate" \
   || bad "armed across a reset" "armed=$(hf_get armed)"
 # The same reading before its reset is exactly what a real handoff runs on.
 hf_reset
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":100,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
   "$future" "$future" > "$CCDD/quota-cache.json"
 nd_age "$CCDD/quota-cache.json" 240
 nd_arm sess-nd7
@@ -5056,7 +5123,7 @@ nd_arm sess-nd7
 # socket, which is the shape that turns one slow endpoint into a stalled session.
 rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 : > "$CCD_FAKE_USAGE_LOG"
-stage_usage 58 96 500
+stage_usage 58 100 500
 for _ in 1 2 3 4 5 6; do nd_hook PostToolUse >/dev/null 2>&1 & done; wait
 calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
 [ "${calls:-0}" -eq 1 ] && ok "six concurrent hooks make exactly one request" \
@@ -5069,13 +5136,13 @@ calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
 rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 rm -rf "$CCDD/.usage-probe.lock"
 : > "$CCD_FAKE_USAGE_LOG"
-stage_usage 58 96
+stage_usage 58 100
 for _ in 1 2 3 4 5 6; do nd_hook PostToolUse >/dev/null 2>&1 & done; wait
 calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
 [ "${calls:-0}" -eq 1 ] && ok "...and exactly one when the request succeeds" \
   || bad "probe stampede on success" "6 concurrent hooks made $calls requests, expected 1"
 got=$(python3 -c "import json;print((json.load(open('$CCDD/quota-cache.json')).get('claude') or {}).get('sevenDayPercent'))" 2>/dev/null)
-[ "$got" = "96" ] && ok "...with the reading published exactly once" \
+[ "$got" = "100" ] && ok "...with the reading published exactly once" \
   || bad "publication" "cache holds: $got"
 [ ! -d "$CCDD/.usage-probe.lock" ] && ok "...and the lease released after publication" \
   || bad "lease leak" "the lock outlived the probe"
@@ -5098,17 +5165,17 @@ NEOF
 chmod +x "$FAKE/fakebin/node"
 rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"; rm -rf "$CCDD/.usage-probe.lock"
 : > "$CCD_FAKE_USAGE_LOG"
-stage_usage 58 96
+stage_usage 58 100
 nd_hook UserPromptSubmit >/dev/null 2>&1
 [ "$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')" -ge 1 ] \
   && ok "a dashboard that answers with an error still falls through to ccd" \
   || bad "fallback suppressed" "the dashboard's error payload was taken as an answer"
 got=$(python3 -c "import json;print((json.load(open('$CCDD/quota-cache.json')).get('claude') or {}).get('sevenDayPercent'))" 2>/dev/null)
-[ "$got" = "96" ] && ok "...and the reading that lands is the usable one" \
+[ "$got" = "100" ] && ok "...and the reading that lands is the usable one" \
   || bad "unusable publication" "cache holds: $got"
 # ...and when neither producer can answer, the last good reading is left alone.
 quota 58 91
-stage_usage 58 96 500
+stage_usage 58 100 500
 nd_age "$CCDD/quota-cache.json" 900
 rm -f "$CCDD/.usage-probe-backoff"; rm -rf "$CCDD/.usage-probe.lock"
 nd_hook UserPromptSubmit >/dev/null 2>&1
@@ -5127,7 +5194,7 @@ doctor_out() {
     "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g'
 }
 rm -f "$CCDD/quota-cache.json" "$CCDD/refresh-failed" "$CCDD/.usage-probe-backoff"
-stage_usage 58 96 500
+stage_usage 58 100 500
 nd_hook UserPromptSubmit >/dev/null 2>&1      # probe fails, leaves the breadcrumb
 out=$(doctor_out)
 case "$out" in
@@ -5144,11 +5211,11 @@ case "$out" in
 esac
 
 rm -f "$CCDD/quota-cache.json" "$CCDD/refresh-failed" "$CCDD/.usage-probe-backoff"
-stage_usage 58 96
+stage_usage 58 100
 nd_hook UserPromptSubmit >/dev/null 2>&1
 out=$(doctor_out)
 case "$out" in
-  *"5h 58%"*"7d 96%"*) ok "...and reports the numbers once a reading lands" ;;
+  *"5h 58%"*"7d 100%"*) ok "...and reports the numbers once a reading lands" ;;
   *) bad "doctor with a reading" "got: $(printf '%s' "$out" | grep -A2 'Quota readings' | head -3)" ;;
 esac
 
@@ -5175,7 +5242,7 @@ esac
 # more, and a green check on it is exactly the false healthy this section exists
 # to end.
 gone=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=3)).isoformat())")
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s"}}\n' \
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":100,"fiveHourReset":"%s"}}\n' \
   "$gone" > "$CCDD/quota-cache.json"
 nd_age "$CCDD/quota-cache.json" 240
 case "$(doctor_out)" in
@@ -5201,7 +5268,7 @@ rm -f "$CCDD/refresh-failed"
 # validation used to leave the lock behind, and every later hook then had to wait
 # out the stale-lock reaper before it could refresh at all.
 rm -rf "$CCDD/.usage-probe.lock"; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
-stage_usage 58 96
+stage_usage 58 100
 nd_hook UserPromptSubmit >/dev/null 2>&1
 [ ! -d "$CCDD/.usage-probe.lock" ] && ok "a completed refresh leaves no lease behind" \
   || bad "lease leak" "the lock outlived a normal refresh"
@@ -5234,7 +5301,7 @@ rm -rf "$FAKE/slowplug"
 # StopFailure takes no lease, so an armed handoff fires straight through it.
 rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 mkdir -p "$CCDD/.usage-probe.lock"          # as a killed hook would leave it
-stage_usage 58 96
+stage_usage 58 100
 hf_reset
 nd_arm sess-nd8
 [ "$(hf_get armed)" = "True" ] && ok "...and a stranded lease never blocks a handoff" \
@@ -5245,7 +5312,7 @@ rm -rf "$CCDD/.usage-probe.lock"
 # markers there would advertise a fresh reading the cache never received.
 rm -rf "$CCDD/.usage-probe.lock"; rm -f "$CCDD/quota-cache.json" "$CCDD/refresh-failed"
 : > "$CCDD/.usage-probe-backoff"; nd_age "$CCDD/.usage-probe-backoff" 400
-stage_usage 58 96
+stage_usage 58 100
 # Fail the move itself. A directory at the cache path does not do it: `mv file
 # dir` moves the file into the directory and reports success.
 cat > "$FAKE/fakebin/mv" <<'MVEOF'
@@ -5284,7 +5351,7 @@ case "$nokey_out" in
 esac
 
 unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
-rm -rf "$ADIR" "$SLQ"
+rm -rf "$ADIR" "$RQD"
 
 head_ "29. the swap that happens inside the session"
 # Ending a session to change account was always the expensive half of the hop: the
@@ -5312,15 +5379,17 @@ sw_hook() { CLAUDE_PLUGIN_ROOT="${SW_ROOT:-$ROOT}" CCD_SWAP_SETTLE="${SW_SETTLE:
 # inherited: a case that ran on the previous one's leftovers would have nothing to
 # distinguish a swap that happened from one that already had.
 sw_fixture() { # $1=signed-in 5h  $2=signed-in 7d  [$3=spare 5h  $4=spare 7d]
-  rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$FAKE/.claude.json" \
+  # No canned endpoint answer left over from the case before: each case stages its own.
+  rm -f "${CCD_FAKE_USAGE:-/nonexistent}"
+  rm -rf "$ADIR" "$RQD" "$SWD/swapped-windows" "$FAKE/.claude.json" \
          "$SWD/handoff-00000000000000000000000000000002.json"
   mkdir -p "$ADIR"
   write_creds spent; "$ACCT" --no-color add --name spent --label "spent@example.com" >/dev/null 2>&1
   write_creds spare; "$ACCT" --no-color add --name spare --label "spare@example.com" >/dev/null 2>&1
   "$ACCT" --no-color use spent --force >/dev/null 2>&1
-  printf '{"spent":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":99,"seven_day_percent":99},"spare":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":%s,"seven_day_percent":%s}}' \
+  printf '{"spent":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":100,"seven_day_percent":100},"spare":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":%s,"seven_day_percent":%s}}' \
     "$(date +%s)" "$(cred_fp "$ADIR/spent.json")" \
-    "$(date +%s)" "$(cred_fp "$ADIR/spare.json")" "${3:-10}" "${4:-20}" > "$SWD/accounts-quota.json"
+    "$(date +%s)" "$(cred_fp "$ADIR/spare.json")" "${3:-10}" "${4:-20}" | rq_put
   # Nothing here may spend a one-time refresh token, so keepalive is not due.
   printf '{"fails":0}' > "$SWD/accounts-keepalive"
   quota "$1" "$2"          # written last: the swap above deletes this file
@@ -5339,7 +5408,7 @@ sw_prompt() { # $1=event  $2=session id ; stdout is the hook's own
 set +m 2>/dev/null
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 out=$(sw_prompt UserPromptSubmit sess-sw1)
 grep -q 'AT-spare' "$CREDS" \
   && ok "a corroborated 96% with a spare in reach swaps the session in place" \
@@ -5365,7 +5434,7 @@ else bad "in-session swap" "ended the session it was supposed to keep"; fi
 
 # An autonomous turn fires tool uses and never a prompt, and that is exactly the
 # turn that burns the last of the quota.
-sw_fixture 58 96
+sw_fixture 58 100
 sw_prompt PostToolUse sess-sw2 >/dev/null
 grep -q 'AT-spare' "$CREDS" \
   && ok "a tool-use tick swaps too, not only a typed prompt" \
@@ -5378,7 +5447,7 @@ grep -q 'AT-spent' "$CREDS" \
   && ok "a reading below the arm threshold swaps nothing" \
   || bad "threshold" "swapped on a reading that corroborates nothing"
 
-sw_fixture 58 96 99 99
+sw_fixture 58 100 100 100
 out=$(sw_prompt UserPromptSubmit sess-sw4)
 grep -q 'AT-spent' "$CREDS" \
   && ok "...and neither does a spare with no room left" \
@@ -5398,22 +5467,22 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 # registered. So a swap records where it came FROM, and that account stops being a
 # destination while the record is live. Leaving is never blocked.
 sw_fixture3() { # three accounts; the signed-in one is the most attractive row of all
-  sw_fixture 58 96
+  sw_fixture 58 100
   write_creds spare2; "$ACCT" --no-color add --name spare2 --label "spare2@example.com" >/dev/null 2>&1
   "$ACCT" --no-color use spent --force >/dev/null 2>&1
   printf '{"spent":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":1,"seven_day_percent":1,"five_hour_reset":"R1","seven_day_reset":"D1"},"spare":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":10,"seven_day_percent":20,"five_hour_reset":"R1","seven_day_reset":"D1"},"spare2":{"status":"ok","checked_at":%s,"cred":"%s","five_hour_percent":30,"seven_day_percent":40,"five_hour_reset":"R1","seven_day_reset":"D1"}}' \
     "$(date +%s)" "$(cred_fp "$ADIR/spent.json")" \
     "$(date +%s)" "$(cred_fp "$ADIR/spare.json")" \
-    "$(date +%s)" "$(cred_fp "$ADIR/spare2.json")" > "$SWD/accounts-quota.json"
+    "$(date +%s)" "$(cred_fp "$ADIR/spare2.json")" | rq_put
   quota "$1" "$2"
 }
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture3 58 96
+sw_fixture3 58 100
 sw_prompt UserPromptSubmit sess-sw5 >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
   || bad "flap guard" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
-quota 58 96                        # the account it landed on is spent too
+quota 58 100                        # the account it landed on is spent too
 sw_prompt UserPromptSubmit sess-sw6 >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
   && ok "the account a swap just left is not offered as the next destination" \
@@ -5422,13 +5491,13 @@ sw_prompt UserPromptSubmit sess-sw6 >/dev/null
 # A reading that names no window at all is the same situation, not a hole in the
 # rule: without a record there, one unreadable reading walks the session through
 # every account it owns.
-sw_fixture3 58 96
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"sevenDayPercent":96}}\n' \
+sw_fixture3 58 100
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"sevenDayPercent":100}}\n' \
   > "$SWD/quota-cache.json"
 sw_prompt UserPromptSubmit sess-sw5b >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
   || bad "no-window guard" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
-printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"sevenDayPercent":96}}\n' \
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"sevenDayPercent":100}}\n' \
   > "$SWD/quota-cache.json"
 sw_prompt UserPromptSubmit sess-sw6b >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
@@ -5437,15 +5506,15 @@ sw_prompt UserPromptSubmit sess-sw6b >/dev/null
 
 # Bounded by time, not by how many entries fit: an account left long enough ago is
 # a destination again, whatever else has been recorded since.
-sw_fixture3 58 96
+sw_fixture3 58 100
 export CCD_SWAP_GUARD_TTL=1
 sw_prompt UserPromptSubmit sess-sw7 >/dev/null
-quota 58 96
+quota 58 100
 sw_prompt UserPromptSubmit sess-sw7b >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
   || bad "guard ttl" "the second hop went to $(cat "$ADIR/.active" 2>/dev/null)"
 sleep 2
-quota 58 96
+quota 58 100
 sw_prompt UserPromptSubmit sess-sw7c >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spent" ] \
   && ok "...and a record that has aged out stops excluding anything" \
@@ -5468,7 +5537,7 @@ sw_stopfail() { # $1=session id ; prints the hook's exit code
 }
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 rc=$(sw_stopfail sess-sw8)
 grep -q 'AT-spare' "$CREDS" \
   && ok "a limit that arrived before the reading could see it still swaps in place" \
@@ -5497,7 +5566,7 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 # (which is what this fixture is) agree about every plan field there is.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 cp "$CREDS" "$FAKE/.creds-before"            # the outgoing account's live blob
 ( sleep 0.7; cp "$FAKE/.creds-before" "$CREDS" ) &
 REVERT=$!
@@ -5511,7 +5580,7 @@ wait "$REVERT" 2>/dev/null
 # credential, the pointer and the guard record have all moved by then; arming the
 # paid hop on top of that bills the user for a swap that may well have worked.
 paid_optin_on
-sw_fixture 58 96
+sw_fixture 58 100
 cp "$CREDS" "$FAKE/.creds-before"
 ( sleep 0.7; cp "$FAKE/.creds-before" "$CREDS" ) &
 REVERT=$!
@@ -5559,7 +5628,7 @@ PY
 # plain return, so the relaunch simply lands on whatever is live.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 printf '{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5}\n' > "$SWD/run-state.json"
 hf_reset
 out=$(printf '{"session_id":"sess-sw10","cwd":"/tmp/w"}' \
@@ -5596,10 +5665,10 @@ head_ "30. the swap is one transaction, under one lock"
 # HTTP request.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 # The background job's own single-flight lock, held while it rotates the spare —
 # exactly what `ccd-account keepalive` does behind REFRESH_LOCK.
-python3 - "$ADIR/.lock" "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY' &
+python3 - "$ADIR/.lock" "$ADIR/spare.json" "$RQD/spare.json" <<'PY' &
 import fcntl, hashlib, json, os, sys, time
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -5612,8 +5681,8 @@ with open(sys.argv[2], "w") as f:
 # verdict that still named the retired token would be discarded as somebody
 # else's, and this test would pass for the wrong reason.
 q = json.load(open(sys.argv[3]))
-q["spare"]["cred"] = hashlib.sha256(b"AT-spare-rotated").hexdigest()[:16]
-q["spare"]["checked_at"] = int(time.time())
+q["cred"] = hashlib.sha256(b"AT-spare-rotated").hexdigest()[:16]
+q["checked_at"] = int(time.time())
 with open(sys.argv[3], "w") as f:
     json.dump(q, f)
 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -5631,8 +5700,8 @@ grep -q 'AT-spare-rotated' "$CREDS" \
 # not the single-flight, so holding the single-flight is not enough: the account
 # has to be READ inside the store lock too, or the swap installs a copy that was
 # already stale when it got there.
-sw_fixture 58 96
-python3 - "$ADIR/.lock" "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY' &
+sw_fixture 58 100
+python3 - "$ADIR/.lock" "$ADIR/spare.json" "$RQD/spare.json" <<'PY' &
 import fcntl, hashlib, json, os, sys, time
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -5642,8 +5711,8 @@ d["claudeAiOauth"]["accessToken"] = "AT-spare-rotated"
 with open(sys.argv[2], "w") as f:
     json.dump(d, f)
 q = json.load(open(sys.argv[3]))
-q["spare"]["cred"] = hashlib.sha256(b"AT-spare-rotated").hexdigest()[:16]
-q["spare"]["checked_at"] = int(time.time())
+q["cred"] = hashlib.sha256(b"AT-spare-rotated").hexdigest()[:16]
+q["checked_at"] = int(time.time())
 with open(sys.argv[3], "w") as f:
     json.dump(q, f)
 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -5662,7 +5731,7 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 # Two sessions can reach the same reading and both decide to leave the same
 # account. The second one has to notice the store moved while it was deciding, or
 # one reading walks the session through two accounts.
-sw_fixture3 58 96
+sw_fixture3 58 100
 out=$("$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" --no-probe 2>/dev/null); rc=$?
 { [ "$rc" -eq 0 ] && [ "$(printf '%s' "$out" | cut -f1)" = "spare" ]; } \
   && ok "a swap names where it went, and the credential it installed" \
@@ -5697,9 +5766,9 @@ PY
 # timeout, and a hook killed there wakes nobody.
 export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
 export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
-stage_usage 5 5
-sw_fixture3 58 96
-rm -f "$SWD/accounts-quota.json"        # nothing measured: every candidate needs a probe
+sw_fixture3 58 100
+stage_usage 5 5          # after the fixture: it clears the canned answer of the case before
+rm -rf "$RQD"        # nothing measured: every candidate needs a probe
 : > "$CCD_FAKE_USAGE_LOG"
 "$ACCT" --no-color swap --from spent --window "5h=R1;7d=D1" --deadline 0 >/dev/null 2>&1; rc=$?
 calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
@@ -5741,11 +5810,12 @@ PY
 # already retired, which is a dead spare handed to a session that has just run out.
 export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
 export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
-sw_fixture 58 96
+sw_fixture 58 100
 stage_usage 5 5 200 0 AT-spare-rotated
 # Expire the spare's stored token and age its verdict, so the pick has to rotate
 # before it can measure.
-python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$ADIR/spare.json" "$RQT" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1]))
 d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
@@ -5754,6 +5824,7 @@ q = json.load(open(sys.argv[2]))
 q["spare"]["checked_at"] = int(time.time()) - 99999
 json.dump(q, open(sys.argv[2], "w"))
 PY
+rq_scatter "$RQT"
 # Another writer owns the store for the next second and a half, and changes a
 # field of the very account the pick is about to rotate before it lets go.
 python3 - "$ADIR/.lock" "$ADIR/spare.json" <<'PY' &
@@ -5799,7 +5870,7 @@ chmod +x "$FAKE/brokenroot/bin/ccd-account"
 paid_optin_on
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 rc=$(SW_ROOT="$FAKE/brokenroot" sw_stopfail sess-f2)
 [ ! -f "$SWD/handoff-00000000000000000000000000000002.json" ] \
   && ok "an account tool that cannot answer never reaches the paid hop" \
@@ -5813,9 +5884,9 @@ paid_optin_off
 # the account we are now on, and moves the session a second time.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture3 58 96
+sw_fixture3 58 100
 f3_reading() {  # the shape ccd's own probe writes: the reading names its account
-  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"fiveHourReset":"R1","sevenDayPercent":96,"sevenDayReset":"D1"},"account":"%s"}\n' "$1" \
+  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"fiveHourReset":"R1","sevenDayPercent":100,"sevenDayReset":"D1"},"account":"%s"}\n' "$1" \
     > "$SWD/quota-cache.json"
 }
 "$ACCT" --no-color use spare --force >/dev/null 2>&1   # another session got there first
@@ -5836,18 +5907,20 @@ sw_prompt UserPromptSubmit sess-f3b >/dev/null
 # The record carries the windows it was written in. An account whose own reading
 # now names different resets has had a reset since; keeping it excluded on the
 # name alone strands a two-account install for the rest of the TTL.
-sw_fixture3 58 96
+sw_fixture3 58 100
 sw_prompt UserPromptSubmit sess-f4 >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
   || bad "window release" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
-python3 - "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys
 q = json.load(open(sys.argv[1]))
 q["spent"]["five_hour_reset"] = "R2"      # the window we left it in has turned over
 q["spent"]["seven_day_reset"] = "D2"
 json.dump(q, open(sys.argv[1], "w"))
 PY
-quota 58 96
+rq_scatter "$RQT"
+quota 58 100
 sw_prompt UserPromptSubmit sess-f4b >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spent" ] \
   && ok "an account whose windows have turned over is a destination again" \
@@ -5860,7 +5933,7 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 # exactly the people who need it most.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 rm -f "$ADIR/spent.json" "$ADIR/.active" "$ADIR/.active-at"
 sw_prompt UserPromptSubmit sess-f7 >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
@@ -5873,7 +5946,7 @@ sw_prompt UserPromptSubmit sess-f7 >/dev/null
 # command banks what Claude Code rotated into that account's own file — so both
 # halves end up holding it, the credential is still provably the target's, and
 # byte equality would be the only thing calling that a failure.
-sw_fixture 58 96
+sw_fixture 58 100
 ( sleep 0.7; python3 - "$CREDS" "$ADIR/spare.json" <<'PY'
 import json, sys
 for path in sys.argv[1:3]:
@@ -5891,8 +5964,8 @@ wait "$ROT" 2>/dev/null
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
 # ── The budget reaches the socket, and the prompt path never waits on it ────
-sw_fixture3 58 96
-rm -f "$SWD/accounts-quota.json"
+sw_fixture3 58 100
+rm -rf "$RQD"
 stage_usage 5 5
 : > "$CCD_FAKE_USAGE_LOG"
 # A ten-second per-request bound against a three-second budget: the bound that
@@ -5908,7 +5981,7 @@ python3 -c "import sys; sys.exit(0 if 0 < float(sys.argv[1]) <= 3 else 1)" "${wo
 # is a frozen prompt, and the next tick can decide just as well.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 python3 - "$ADIR/.refresh.lock" <<'PY' &
 import fcntl, os, sys, time
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
@@ -5946,8 +6019,9 @@ pay_case() { # $1=spare 5h  $2=spare 7d
   "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
   sleep 0.3
   rm -f "$SWD/store-split" "$SWD/swap-note"
-  sw_fixture 58 96 "$1" "$2"
-  python3 - "$SWD/accounts-quota.json" <<'PY'
+  sw_fixture 58 100 "$1" "$2"
+  RQT=$(rq_gather)
+  python3 - "$RQT" <<'PY'
 import datetime, json, sys
 ahead = lambda h: (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=h)).isoformat()
 q = json.load(open(sys.argv[1]))
@@ -5955,17 +6029,19 @@ for row in q.values():
     row["five_hour_reset"], row["seven_day_reset"] = ahead(2), ahead(72)
 json.dump(q, open(sys.argv[1], "w"))
 PY
+  rq_scatter "$RQT"
   hf_reset
   paid_optin_on
   mkdir -p "$SWD/providers"
   printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$SWD/providers/keys.env"
 }
 age_spare_row() { age_row spare; }
-age_row() { python3 - "$SWD/accounts-quota.json" "$1" <<'PY'
+age_row() { RQT=$(rq_gather); python3 - "$RQT" "$1" <<'PY'
 import json, sys, time
 q = json.load(open(sys.argv[1])); q[sys.argv[2]]["checked_at"] = int(time.time()) - 99999
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 }
 note_text() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["message"])' "$SWD/swap-note" 2>/dev/null; }
 unpaid() { # $1=what was missing  [$2=nonote]
@@ -5976,12 +6052,12 @@ unpaid() { # $1=what was missing  [$2=nonote]
 }
 
 # The two proofs.
-pay_case 99 99
+pay_case 100 100
 sw_stopfail sess-p1 >/dev/null
 { [ "$(hf_get direction)" = "to_fallback" ] && died_within "$SWPID" 5; } \
   && ok "every spare freshly measured and spent, a key, the opt-in and a launcher: the paid hop fires" \
   || bad "paid proof" "direction=$(hf_get direction), note: $(note_text | head -c 120)"
-pay_case 99 99
+pay_case 100 100
 "$ACCT" --no-color rm spare >/dev/null 2>&1
 sw_stopfail sess-p2 >/dev/null
 { [ "$(hf_get direction)" = "to_fallback" ] && died_within "$SWPID" 5; } \
@@ -5995,15 +6071,15 @@ sw_stopfail sess-p2 >/dev/null
 # subscription with room. Codex's interleaving, as it happens:
 pay_case 10 20                          # B (spare) has room
 "$ACCT" --no-color use spare --force >/dev/null 2>&1   # ...and another session moved the store onto it
-quota 58 96                             # this session's own reading still says: spent
+quota 58 100                             # this session's own reading still says: spent
 hf_reset; rm -f "$SWD/swap-note"
 sw_stopfail sess-p2b >/dev/null
 unpaid "the store moved onto an account with room while this session hit the wall" nonote
 
 # The active account is measured on the way, because nothing else on this path
 # does it: with one account registered its reading is the whole proof.
-pay_case 99 99; "$ACCT" --no-color rm spare >/dev/null 2>&1
-age_row spent; stage_usage 99 99
+pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
+age_row spent; stage_usage 100 100
 : > "$CCD_FAKE_USAGE_LOG"
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2c >/dev/null
 { [ "$(hf_get direction)" = "to_fallback" ] && [ -s "$CCD_FAKE_USAGE_LOG" ]; } \
@@ -6014,31 +6090,183 @@ CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2c >/dev/null
 # it, here or anywhere. So an expired copy is simply not a measurement, which makes
 # it not proof. (That no exchange happens is enforced twice: this probe asks for
 # none, and account_refresh refuses the active account whoever asks.)
-pay_case 99 99; "$ACCT" --no-color rm spare >/dev/null 2>&1
+pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
 age_row spent
 python3 - "$ADIR/spent.json" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1])); d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
 json.dump(d, open(sys.argv[1], "w"))
 PY
-stage_usage 99 99 200 0 AT-spent-rotated
+stage_usage 100 100 200 0 AT-spent-rotated
 : > "$CCD_FAKE_USAGE_LOG"
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2e >/dev/null
 unpaid "the active account's stored token has expired, so it could not be measured"
 ptok() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$1"; }
-{ [ "$(ptok "$ADIR/spent.json")" = "AT-spent" ] && [ ! -s "$CCD_FAKE_USAGE_LOG" ]; } \
+# The endpoint is staged to ROTATE on an exchange, so one would show: the stored
+# token would now read AT-spent-rotated. (Usage calls are expected here — a turn
+# that died at the wall re-reads the live account — so they are not what is counted.)
+[ "$(ptok "$ADIR/spent.json")" = "AT-spent" ] \
   && ok "...and nothing is exchanged to find out: that token belongs to the running session" \
-  || bad "spent the live token" "stored token $(ptok "$ADIR/spent.json"), $(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ') network calls"
+  || bad "spent the live token" "the stored token is now $(ptok "$ADIR/spent.json")"
 
-pay_case 99 99; "$ACCT" --no-color rm spare >/dev/null 2>&1
+pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
 age_row spent; stage_usage 5 5 503
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2d >/dev/null
 unpaid "the one registered account could not be measured"
 
+# ONE meaning of "spent", and it is 100%. The 90% reserve used to decide two things
+# at once — "not worth hopping to" and "spent enough to pay" — so a spare at 90%
+# was skipped by the swap AND proved spent, and ccd paid with a tenth of a
+# subscription left. A spare is a destination while it is under 100; ccd pays only
+# when every registered account is AT 100; and a session moves when its own
+# account gets there, not before.
+moved_to_spare() { grep -q 'AT-spare' "$CREDS" && [ -z "$(hf_get direction)" ]; }
+pay_case 90 90
+sw_stopfail sess-s1 >/dev/null
+moved_to_spare && ok "a spare at 90% is a destination: the session moves there and nothing is billed" \
+  || bad "paid past a spare with room" "direction=$(hf_get direction), credential $(grep -o 'AT-[a-z]*' "$CREDS" | head -1)"
+pay_case 99 99
+sw_stopfail sess-s2 >/dev/null
+moved_to_spare && ok "...and so is a spare at 99%" \
+  || bad "paid past a spare with room" "direction=$(hf_get direction), credential $(grep -o 'AT-[a-z]*' "$CREDS" | head -1)"
+pay_case 100 100
+sw_stopfail sess-s3 >/dev/null
+[ "$(hf_get direction)" = "to_fallback" ] && ok "...while every registered account at 100% is what paying takes" \
+  || bad "paid proof" "direction=$(hf_get direction), note: $(note_text | head -c 120)"
+pay_case 10 20; quota 58 97
+sw_prompt UserPromptSubmit sess-s4 >/dev/null
+grep -q 'AT-spent' "$CREDS" && ok "a tick at 97% moves nothing: the account still answers" \
+  || bad "moved before the wall" "the session left an account with quota still on it"
+pay_case 10 20; quota 58 100
+sw_prompt UserPromptSubmit sess-s5 >/dev/null
+grep -q 'AT-spare' "$CREDS" && ok "...and a tick at 100% moves it" \
+  || bad "did not move at the wall" "credential $(grep -o 'AT-[a-z]*' "$CREDS" | head -1)"
+
+# "Spent" is written down once. Every program that decides on it reads that file;
+# none carries a number of its own, and the two knobs that used to disagree are gone.
+{ [ "$(cat "$ROOT/bin/spent-at")" = "100" ] \
+  && grep -q 'spent-at' "$ROOT/bin/ccd-account" && grep -q 'spent-at' "$ROOT/scripts/quota-guard.sh" \
+  && grep -q 'spent-at' "$ROOT/bin/ccd-statusline" \
+  && ! grep -qE 'HEADROOM|ARM_THRESHOLD' "$ROOT/bin/ccd-account" "$ROOT/bin/ccd-statusline" "$ROOT/bin/ccd" \
+         "$ROOT/bin/ccd-handoff" "$ROOT/scripts/quota-guard.sh"; } \
+  && ok "one definition of spent, read by the hook, the account tool and the statusline alike" \
+  || bad "spent is defined twice" "a program carries its own threshold again"
+# ...and nothing in somebody's shell moves it for the swap, as nothing moves it for the row.
+pay_case 95 95
+CCD_HEADROOM=50 "$ACCT" --no-color pick >/dev/null 2>&1 \
+  && ok "...and the retired CCD_HEADROOM cannot make a spare with room look spent" \
+  || bad "spent is a knob again" "an environment variable took a destination away"
+# The hook fails closed without it: a hook that cannot tell "spent" moves nothing.
+rm -rf "$FAKE/nospent"; mkdir -p "$FAKE/nospent"; cp -R "$ROOT/bin" "$ROOT/scripts" "$FAKE/nospent/"; rm -f "$FAKE/nospent/bin/spent-at"
+pay_case 10 20
+printf '{"session_id":"sess-ns","cwd":"/tmp/w"}' \
+  | CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 \
+    "$FAKE/nospent/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+grep -q 'AT-spent' "$CREDS" && ok "...and a hook that cannot read it acts on no guess of its own" \
+  || bad "guessed at spent" "the hook moved a session without knowing what spent means"
+rm -rf "$FAKE/nospent"
+
+# A reading belongs to its account for as long as the account is registered.
+pay_case 10 20
+{ [ -f "$RQD/spare.json" ] && "$ACCT" --no-color rm spare >/dev/null 2>&1 && [ ! -e "$RQD/spare.json" ] && [ -f "$RQD/spent.json" ]; } \
+  && ok "removing an account removes its reading, and only its reading" \
+  || bad "orphaned reading" "readings on file: $(ls "$RQD" 2>/dev/null | tr '\n' ' ')"
+# The shared cache is gone for good: no reader, no migration, and the file itself
+# goes the first time a command sets up the store.
+printf '{"spare":{"status":"ok","five_hour_percent":1}}' > "$SWD/accounts-quota.json"
+"$ACCT" --no-color current >/dev/null 2>&1
+[ ! -e "$SWD/accounts-quota.json" ] && ok "the old shared cache is deleted where it is found, not read" \
+  || bad "old cache survives" "accounts-quota.json is still on disk"
+
+# At the wall the reading is taken AGAIN. It is cached for ten minutes, so the one on
+# file can say 96 while the account is at 100 — and with spent meaning 100, a
+# backstop that trusted it would sit beside a spare with room and do nothing, on
+# exactly the turn it exists for.
+pay_case 10 20
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58,"fiveHourReset":"R1","sevenDayPercent":96,"sevenDayReset":"D1"}}\n' \
+  > "$SWD/quota-cache.json"            # what the cache still says (not staged behind it)
+stage_usage 100 100                     # what the account says now
+rc=$(CCD_HTTP_TIMEOUT=5 sw_stopfail sess-s6)
+{ [ "$rc" = "2" ] && grep -q 'AT-spare' "$CREDS"; } \
+  && ok "a turn that dies on rate_limit re-reads the account rather than trust a reading that lags it" \
+  || bad "stale reading at the wall" "rc=$rc, credential $(grep -o 'AT-[a-z]*' "$CREDS" | head -1): the backstop believed a cached 96%"
+
+# A reading is published by whoever measured it, and by nobody else. The active
+# account's measurement used to load every account's row, wait on the network, and
+# write every row back — putting a spare's stale 503 back over the healthy reading a
+# background prober had recorded in the meantime, and stranding the turn beside a
+# subscription that had just been measured free. One file per account: a prober can
+# only ever publish the account it measured.
+pay_case 10 20
+python3 - "$RQD" <<'PY'
+import json, os, sys, time
+d = sys.argv[1]
+sp = json.load(open(os.path.join(d, "spare.json")))
+json.dump({"status": "error", "http_status": 503, "checked_at": int(time.time()),
+           "cred": sp["cred"], "uuid": sp.get("uuid")}, open(os.path.join(d, "spare.json"), "w"))
+me = json.load(open(os.path.join(d, "spent.json")))
+me["checked_at"] = int(time.time()) - 99999          # so the active account IS measured
+json.dump(me, open(os.path.join(d, "spent.json"), "w"))
+PY
+stage_usage 100 100 200 3
+( sleep 1.2
+  python3 - "$RQD/spare.json" "$ADIR/spare.json" <<'PY'
+import datetime, hashlib, json, os, sys, time
+ahead = lambda h: (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=h)).isoformat()
+at = json.load(open(sys.argv[2]))["claudeAiOauth"]["accessToken"]
+row = {"status": "ok", "checked_at": int(time.time()), "cred": hashlib.sha256(at.encode()).hexdigest()[:16],
+       "uuid": None, "five_hour_percent": 10, "seven_day_percent": 20,
+       "five_hour_reset": ahead(2), "seven_day_reset": ahead(72)}
+tmp = sys.argv[1] + ".bg"
+json.dump(row, open(tmp, "w")); os.replace(tmp, sys.argv[1])
+PY
+) & BGP=$!
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color swap --from spent --window none --deadline 30 >/dev/null 2>&1
+wait "$BGP" 2>/dev/null
+spare_row() { python3 -c 'import json,sys
+try: r = json.load(open(sys.argv[1]))
+except Exception: r = {}
+print(str(r.get("status")) + ":" + str(r.get("five_hour_percent")))' "$RQD/spare.json"; }
+[ "$(spare_row)" = "ok:10" ] \
+  && ok "a measurement in flight does not write back over another account's newer reading" \
+  || bad "lost update" "the spare's reading is now $(spare_row)"
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color swap --from spent --window none --deadline 30 >/dev/null 2>&1
+grep -q 'AT-spare' "$CREDS" && ok "...so the next attempt finds the spare and moves there" \
+  || bad "lost update" "the healthy spare was never reached"
+# Two probers of the SAME account can finish out of order. The later look wins.
+PYTHONDONTWRITEBYTECODE=1 HOME="$FAKE" python3 - "$ROOT/bin/ccd-account" <<'PY' \
+  && ok "an older measurement of an account never replaces a newer one" \
+  || bad "stale reading published" "a slow probe overwrote the reading a faster one had already recorded"
+import importlib.machinery, importlib.util, sys, time
+loader = importlib.machinery.SourceFileLoader("ccdread", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(m)
+t = int(time.time())
+m.reading_save("race", {"status": "ok", "checked_at": t, "five_hour_percent": 10})
+m.reading_save("race", {"status": "error", "checked_at": t - 5})          # asked earlier, answered later
+assert m.reading_load("race")["status"] == "ok", m.reading_load("race")
+m.reading_save("race", {"status": "ok", "checked_at": t + 1, "five_hour_percent": 11})
+assert m.reading_load("race")["five_hour_percent"] == 11, "a newer reading was refused"
+m.reading_save("race", {"status": "ok", "checked_at": t + 99999, "five_hour_percent": 12})   # a wrong clock
+m.reading_save("race", {"status": "ok", "checked_at": t + 2, "five_hour_percent": 13})
+assert m.reading_load("race")["five_hour_percent"] == 13, "a reading from the future blocked every later one"
+# "Later stamp wins" only means "later look wins" if the stamp is when the ANSWER
+# arrived. A probe stamps itself when it starts; quota_for re-stamps on the way out.
+m.probe_account = lambda n, a, allow_refresh=True: {"status": "ok", "checked_at": t - 50, "five_hour_percent": 1}
+rec = m.quota_for("stamp", {"claudeAiOauth": {"accessToken": "AT-stamp"}})
+assert rec["checked_at"] >= t, "stamped when the question was asked, not when it was answered"
+assert m.reading_load("stamp")["checked_at"] >= t, "the reading on file carries the asking time"
+m.reading_drop("stamp")
+import os, stat
+assert stat.S_IMODE(os.stat(m.reading_path("race")).st_mode) == 0o600
+assert stat.S_IMODE(os.stat(m.READINGS_DIR).st_mode) == 0o700
+m.reading_drop("race")
+PY
+
 # The user's three conditions, one missing at a time.
-pay_case 99 99; rm -f "$SWD/providers/keys.env"
+pay_case 100 100; rm -f "$SWD/providers/keys.env"
 sw_stopfail sess-p3 >/dev/null; unpaid "no key stored"
-pay_case 99 99; paid_optin_off
+pay_case 100 100; paid_optin_off
 sw_stopfail sess-p4 >/dev/null; unpaid "no opt-in"
 case "$(note_text)" in
   *"ccd -c"*) ok "...and the note still names the way there by hand" ;;
@@ -6046,7 +6274,7 @@ case "$(note_text)" in
 esac
 
 # The mechanical one: the hop is a relaunch, and only a launcher can relaunch.
-pay_case 99 99
+pay_case 100 100
 printf '{"session_id":"sess-p5","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"rate_limit"}' \
   | env -u CCD_HANDOFF -u CCD_HANDOFF_STATE CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID \
       CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
@@ -6055,7 +6283,7 @@ case "$(note_text)" in
   *"launcher"*"claude"*) ok "...and the note says the opt-in is on but this session cannot take it, and what fixes that" ;;
   *) bad "launcher note" "got: $(note_text | head -c 160)" ;;
 esac
-pay_case 99 99
+pay_case 100 100
 CCD_HANDOFF_HEADLESS=1 sw_stopfail sess-p6 >/dev/null; unpaid "a headless run"
 
 # What is NOT proof. Each of these once reached the paying branch, or could have.
@@ -6070,21 +6298,23 @@ CCD_SWAP_PICK_BUDGET=3 sw_stopfail sess-p7 >/dev/null
 kill -9 "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
 unpaid "a store lock that timed out"
 
-pay_case 99 99; age_spare_row; stage_usage 5 5 503
+pay_case 100 100; age_spare_row; stage_usage 5 5 503
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p8 >/dev/null; unpaid "a spare that answered 503"
 
-pay_case 99 99; age_spare_row
+pay_case 100 100; age_spare_row
 CCD_SWAP_PICK_BUDGET=0 sw_stopfail sess-p9 >/dev/null; unpaid "a deadline that expired before anything was measured"
 
-pay_case 99 99
-python3 - "$SWD/accounts-quota.json" <<'PY'
+pay_case 100 100
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys, time
 q = json.load(open(sys.argv[1])); q["spare"] = {"status": "unknown", "checked_at": int(time.time())}
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 sw_stopfail sess-p10 >/dev/null; unpaid "a spare whose reading is not a measurement"
 
-pay_case 99 99
+pay_case 100 100
 printf '{"detail":"x","stores":["file","keychain"]}' > "$SWD/store-split"
 sw_stopfail sess-p11 >/dev/null; unpaid "credential stores that disagree"
 rm -f "$SWD/store-split"
@@ -6137,13 +6367,13 @@ finally:
     m.os.listdir = real
 assert verdict is not True, "an unlistable store was proof that nothing is registered"
 PY
-pay_case 99 99; mv "$ADIR" "$ADIR.real"; : > "$ADIR"
+pay_case 100 100; mv "$ADIR" "$ADIR.real"; : > "$ADIR"
 sw_stopfail sess-p14 >/dev/null
 rm -f "$ADIR"; mv "$ADIR.real" "$ADIR"
 unpaid "an accounts path that is not a directory" nonote
 
 # ccd does not start billing while the subscription still answers.
-pay_case 99 99
+pay_case 100 100
 sw_prompt UserPromptSubmit sess-p15 >/dev/null
 unpaid "the tick before the wall, with everything else in place" nonote
 
@@ -6160,7 +6390,7 @@ for shape in silent-success wrong-word right-word-but-failed crashed; do
   printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = exhausted ] && { %s; }; done\nexec "$CCD_REAL_ACCOUNT" "$@"\n' "$body" \
     > "$FAKE/proofroot-$shape/bin/ccd-account"
   chmod +x "$FAKE/proofroot-$shape/bin/ccd-account"
-  pay_case 99 99
+  pay_case 100 100
   SW_ROOT="$FAKE/proofroot-$shape" sw_stopfail "sess-p16-$shape" >/dev/null
   unpaid "an answer that is not the proof ($shape)"
 done
@@ -6173,41 +6403,55 @@ done
 # The question itself, asked directly. It reads what the measurement left behind
 # and opens no socket of its own, so nothing in it can time out into a yes.
 proves() { [ "$("$ACCT" --no-color exhausted 2>/dev/null)" = "$PROOF" ]; }
-pay_case 99 99
+pay_case 100 100
 : > "$CCD_FAKE_USAGE_LOG"
 { proves && [ ! -s "$CCD_FAKE_USAGE_LOG" ]; } \
   && ok "every spare measured, fresh and spent is proof, read without a network call" \
   || bad "proof" "refused proof in hand, or went to the network for it"
-pay_case 10 99
+pay_case 10 100
 proves && ok "...one window spent is an account spent" || bad "proof" "a spare at 99% weekly was called free"
 pay_case 10 20
 proves && bad "proof" "a spare with room was called spent" || ok "...and a spare with room is not"
-pay_case 99 99; age_spare_row
+# The same line the swap draws, from the other side: whatever is still a destination
+# is not spent. Through the hook this cannot be seen — a spare under 100 is swapped
+# TO and the proof is never asked — so it is asked here.
+for pct in 90 99; do
+  pay_case "$pct" "$pct"
+  proves && bad "proof" "a spare at ${pct}% counted as spent" || ok "...nor is a spare at ${pct}%: only 100 is spent"
+done
+pay_case 100 100; age_spare_row
 proves && bad "proof" "a reading past its TTL was proof" || ok "...nor is a reading too old to describe now"
-pay_case 99 99
-python3 - "$SWD/accounts-quota.json" <<'PY'
+pay_case 100 100
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys
 q = json.load(open(sys.argv[1])); q["spare"]["status"] = "error"
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 proves && bad "proof" "a failed measurement was proof" || ok "...nor a measurement that failed"
-pay_case 99 99
-python3 - "$SWD/accounts-quota.json" <<'PY'
+pay_case 100 100
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys
 q = json.load(open(sys.argv[1])); del q["spare"]
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 proves && bad "proof" "an unmeasured spare was proof" || ok "...nor a spare nobody measured"
-pay_case 99 99
-python3 - "$SWD/accounts-quota.json" <<'PY'
+pay_case 100 100
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import datetime, json, sys
 past = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)).isoformat()
 q = json.load(open(sys.argv[1])); q["spare"]["five_hour_reset"] = past; q["spare"]["seven_day_reset"] = past
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 proves && bad "proof" "a window that has since reset was proof" || ok "...nor a window that has reset since it was read"
 set_resets() { # $1=account  $2=python expression for the value
-  python3 - "$SWD/accounts-quota.json" "$1" "$2" <<'PY'
+  RQT=$(rq_gather)
+  python3 - "$RQT" "$1" "$2" <<'PY'
 import datetime, json, sys
 now = datetime.datetime.now(datetime.timezone.utc)
 q = json.load(open(sys.argv[1])); v = eval(sys.argv[3])
@@ -6216,24 +6460,27 @@ for k in ("five_hour_reset", "seven_day_reset"):
     else: q[sys.argv[2]][k] = v
 json.dump(q, open(sys.argv[1], "w"))
 PY
+  rq_scatter "$RQT"
 }
 # A window is spent only while it is KNOWN to still be open. 99% with no usable
 # reset can have reset a second later, and the row stays "fresh" for five minutes.
 for shape in 'missing:None' 'malformed:"soon"' 'naive:(now + datetime.timedelta(hours=48)).replace(tzinfo=None).isoformat()'; do
-  pay_case 99 99; set_resets spare "${shape#*:}"
+  pay_case 100 100; set_resets spare "${shape#*:}"
   proves && bad "proof" "a ${shape%%:*} reset time was proof" \
     || ok "...nor a spent window whose reset time is ${shape%%:*}"
 done
-pay_case 99 99; set_resets spare '(now + datetime.timedelta(hours=2)).isoformat().replace("+00:00", "Z")'
+pay_case 100 100; set_resets spare '(now + datetime.timedelta(hours=2)).isoformat().replace("+00:00", "Z")'
 proves && ok "...while a reset written with Z is as good as one written with an offset" \
   || bad "proof" "a valid future reset in Z form was refused"
 # The active account is a registered account. Its row counts like any other.
-pay_case 99 99
-python3 - "$SWD/accounts-quota.json" <<'PY'
+pay_case 100 100
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys
 q = json.load(open(sys.argv[1])); q["spent"]["five_hour_percent"] = 10; q["spent"]["seven_day_percent"] = 20
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 proves && bad "proof" "the account the store is on was left out of the proof" \
   || ok "...nor anything while the account the store is on shows room"
 # Asking is not acting: no directory made, no credential banked, no pointer moved.
@@ -6242,10 +6489,10 @@ out=$(HOME="$FAKE/proof-ro" "$ACCT" --no-color exhausted 2>/dev/null); rc=$?
 { [ "$out" = "$PROOF" ] && [ "$rc" -eq 0 ] && [ ! -e "$FAKE/proof-ro/.claude/ccd" ]; } \
   && ok "a store that was never created is an honest zero, and asking does not create it" \
   || bad "proof is not read-only" "out=$out rc=$rc, made: $(ls -A "$FAKE/proof-ro/.claude")"
-pay_case 99 99; printf 'not json' > "$ADIR/spare.json"
+pay_case 100 100; printf 'not json' > "$ADIR/spare.json"
 proves && bad "proof" "an account that cannot be read was skipped" || ok "...nor a store with an account file it cannot read"
 # Naming a store this suite cannot see, so the stop cannot lift itself first.
-pay_case 99 99; printf '{"detail":"x","stores":["file","keychain"]}' > "$SWD/store-split"
+pay_case 100 100; printf '{"detail":"x","stores":["file","keychain"]}' > "$SWD/store-split"
 proves && bad "proof" "proved over a standing stop" || ok "...nor anything at all while the credential stores disagree"
 rm -f "$SWD/store-split"
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
@@ -6268,12 +6515,12 @@ chmod +x "$FAKE/warnroot/bin/ccd-account"
 export CCD_REAL_ACCOUNT="$ACCT"
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 rc=$(SW_ROOT="$FAKE/warnroot" sw_stopfail sess-w1)
 { [ "$rc" = "2" ] && grep -q 'switched this session to spare,' "$FAKE/.sw-err"; } \
   && ok "a swap that warned still wakes the turn, naming the account it moved to" \
   || bad "warning read as the result" "rc=$rc: $(tr '\n' ' ' < "$FAKE/.sw-err" | head -c 160)"
-sw_fixture 58 96
+sw_fixture 58 100
 out=$(SW_ROOT="$FAKE/warnroot" sw_prompt UserPromptSubmit sess-w2)
 case "$out" in
   *warning*) bad "warning read as the result" "the tick announced: ${out:0:160}" ;;
@@ -6283,7 +6530,7 @@ esac
 
 # A swap refused by a standing stop has a remedy, and 120 characters of stderr do
 # not reach it. One fixed line that points at doctor, which carries all of it.
-sw_fixture 58 96
+sw_fixture 58 100
 printf '{"detail":"keychain took b, file kept a","stores":["file","keychain"]}' > "$SWD/store-split"
 rm -f "$SWD/swap-note"
 sw_stopfail sess-w3 >/dev/null
@@ -6332,7 +6579,7 @@ for shape in wakes unconfirmed tick; do
   # Before the fixture, not after: the stop the last shape left standing would
   # refuse the fixture's own `use`, and this shape would start on the wrong account.
   rm -f "$SWD/swap-note" "$SWD/store-split" "$FAKE/.split-swapped"
-  sw_fixture 58 96
+  sw_fixture 58 100
   case "$shape" in
     wakes)       rc=$(SW_ROOT="$FAKE/splitroot" sw_stopfail sess-s1); want=2 ;;
     unconfirmed) rc=$(SPLIT_UNCONFIRMED=1 SW_ROOT="$FAKE/splitroot" sw_stopfail sess-s2); want=0 ;;
@@ -6356,7 +6603,7 @@ for a in "$@"; do [ "$a" = swap ] && { : > "$HOME/.swap-started"; sleep 2; echo 
 exec "$CCD_REAL_ACCOUNT" "$@"
 LEOF
 chmod +x "$FAKE/slowroot/bin/ccd-account"
-sw_fixture 58 96
+sw_fixture 58 100
 rm -f "$FAKE/.swap-started" "$SWD"/.swap-err.*
 printf '{"session_id":"sess-k1","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"rate_limit"}' > "$FAKE/.k1-in"
 # exec, so that $! is the hook itself: a signal sent to a wrapping subshell kills
@@ -6390,7 +6637,7 @@ chmod +x "$FAKE/countroot/bin/ccd-account"
 export CCD_REAL_ACCOUNT="$ACCT"
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 rm -f "$FAKE/.swap-tries"
 SW_ROOT="$FAKE/countroot" sw_prompt UserPromptSubmit sess-r1 >/dev/null
 tries=$(grep -c . "$FAKE/.swap-tries" 2>/dev/null || echo 0)
@@ -6401,7 +6648,7 @@ tries=$(grep -c . "$FAKE/.swap-tries" 2>/dev/null || echo 0)
 # ── A failure the user hears about once, without a doomed wake ──────────────
 # The spare is spent as well, so the ticks that follow have nothing to swap to
 # and the note is the only thing they can have to say.
-sw_fixture 58 96 99 99
+sw_fixture 58 100 100 100
 rm -f "$SWD/swap-note" "$FAKE/.swap-tries"
 SW_ROOT="$FAKE/countroot" sw_stopfail sess-r2 >/dev/null
 [ -f "$SWD/swap-note" ] \
@@ -6426,9 +6673,10 @@ rm -f "$SWD/providers/keys.env"
 # An exchange is a write — it consumes a one-time credential — so it holds the
 # store lock across the request and the write it produces, as one step. Anything
 # else can land on a record that was re-registered while it was in flight.
-sw_fixture 58 96
+sw_fixture 58 100
 stage_usage 5 5 200 2 AT-spare-rotated
-python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$ADIR/spare.json" "$RQT" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1]))
 d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)   # needs a rotation
@@ -6437,6 +6685,7 @@ q = json.load(open(sys.argv[2]))
 q["spare"]["checked_at"] = int(time.time()) - 99999                # and a measurement
 json.dump(q, open(sys.argv[2], "w"))
 PY
+rq_scatter "$RQT"
 lock_free() {  # is the store lock takeable right now?
   python3 - "$ADIR/.lock" <<'PY'
 import fcntl, os, sys
@@ -6458,14 +6707,16 @@ wait "$PICKPID" 2>/dev/null
 
 # ...and the read-only half takes nothing: a spare whose token is fine is simply
 # measured, and every other writer carries on while that request is open.
-sw_fixture 58 96
+sw_fixture 58 100
 stage_usage 5 5 200 2
-python3 - "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys, time
 q = json.load(open(sys.argv[1]))
 q["spare"]["checked_at"] = int(time.time()) - 99999
 json.dump(q, open(sys.argv[1], "w"))
 PY
+rq_scatter "$RQT"
 CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
 PICKPID=$!
 sleep 0.8
@@ -6480,7 +6731,7 @@ unset -f lock_free
 # the outgoing account's next rotation, by anything at all that moved.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96
+sw_fixture 58 100
 # A token belonging to neither account: not the one the swap installs, not the
 # one it replaces. "Different from what we replaced" says yes to this.
 python3 - "$CREDS" "$FAKE/.creds-third" <<'PY'
@@ -6503,9 +6754,10 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 # one while a probe is mid-exchange, and finishing that rotation consumes a
 # one-time token the session is still carrying — with the replacement landing in
 # the account file and nowhere else.
-sw_fixture 58 96
+sw_fixture 58 100
 stage_usage 5 5 200 2 AT-spare-rotated
-python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$ADIR/spare.json" "$RQT" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1]))
 d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
@@ -6514,6 +6766,7 @@ q = json.load(open(sys.argv[2]))
 q["spare"]["checked_at"] = int(time.time()) - 99999
 json.dump(q, open(sys.argv[2], "w"))
 PY
+rq_scatter "$RQT"
 CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
 PICKPID=$!
 sleep 0.5
@@ -6527,8 +6780,8 @@ tok() { python3 -c 'import json,sys;print(((json.load(open(sys.argv[1])).get("cl
 # ── A decision installed only where it was still true ───────────────────────
 # Measuring takes time, and a person can run `ccd account use` inside it. The
 # check that the store has not moved belongs with the install, under the lock.
-sw_fixture3 58 96
-rm -f "$SWD/accounts-quota.json"
+sw_fixture3 58 100
+rm -rf "$RQD"
 stage_usage 5 5 200 2
 ( sleep 0.7; "$ACCT" --no-color use spare2 --force >/dev/null 2>&1 ) &
 RACE=$!
@@ -6540,7 +6793,7 @@ wait "$RACE" 2>/dev/null
   || bad "install cas" "overwrote a swap made while it was measuring: $(cat "$ADIR/.active" 2>/dev/null)"
 
 # ── A reading is labelled with the account it measured ──────────────────────
-sw_fixture 58 96
+sw_fixture 58 100
 stage_usage 5 5 200 2
 ( CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color usage --json > "$FAKE/.usage-out" 2>/dev/null ) &
 USAGEPID=$!
@@ -6558,24 +6811,26 @@ sys.exit(0 if d.get("account") == "spent" else 1)' "$FAKE/.usage-out" \
 # One window in common and one missing is not a reset; it is half an answer.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture3 58 96
+sw_fixture3 58 100
 sw_prompt UserPromptSubmit sess-w1 >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare" ] \
   || bad "partial window" "the fixture's first swap went to $(cat "$ADIR/.active" 2>/dev/null)"
-python3 - "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
 import json, sys
 q = json.load(open(sys.argv[1]))
 q["spent"].pop("five_hour_reset", None)     # only half the windows can be named
 json.dump(q, open(sys.argv[1], "w"))
 PY
-quota 58 96
+rq_scatter "$RQT"
+quota 58 100
 sw_prompt UserPromptSubmit sess-w2 >/dev/null
 [ "$(cat "$ADIR/.active" 2>/dev/null)" = "spare2" ] \
   && ok "half a window is not a reset, and the exclusion holds" \
   || bad "partial window" "released on partial information: $(cat "$ADIR/.active" 2>/dev/null)"
 
 # ── One budget, end to end, on the prompt path ──────────────────────────────
-sw_fixture 58 96
+sw_fixture 58 100
 python3 - "$ADIR/.lock" <<'PY' &
 import fcntl, os, sys, time
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
@@ -6604,9 +6859,10 @@ export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage
 # holds the store lock across it. A `use` arriving mid-exchange therefore waits,
 # and what it then installs is the credential the exchange wrote — not the one it
 # read before.
-sw_fixture 58 96
+sw_fixture 58 100
 stage_usage 5 5 200 2 AT-spare-rotated
-python3 - "$ADIR/spare.json" "$SWD/accounts-quota.json" <<'PY'
+RQT=$(rq_gather)
+python3 - "$ADIR/spare.json" "$RQT" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1]))
 d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
@@ -6615,6 +6871,7 @@ q = json.load(open(sys.argv[2]))
 q["spare"]["checked_at"] = int(time.time()) - 99999
 json.dump(q, open(sys.argv[2], "w"))
 PY
+rq_scatter "$RQT"
 CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color pick >/dev/null 2>&1 &
 PICKPID=$!
 sleep 0.5
@@ -6631,8 +6888,8 @@ tok() { python3 -c 'import json,sys;print(((json.load(open(sys.argv[1])).get("cl
 # ── The departure record is read where the install happens ──────────────────
 # Measuring takes time; another swap can record a departure inside it, and a
 # target that was free when we looked may be the account somebody just left.
-sw_fixture3 58 96
-rm -f "$SWD/accounts-quota.json" "$SWD/swapped-windows"
+sw_fixture3 58 100
+rm -rf "$RQD" "$SWD/swapped-windows"
 stage_usage 5 5 200 2
 # Recorded with no window of its own, which is the case that holds whatever the
 # candidate's own reading says: this is about WHEN the record is read, not about
@@ -6651,7 +6908,7 @@ wait "$RACE" 2>/dev/null
 # note it cannot read — the explanation disappearing exactly when there is one.
 "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
 sleep 0.3
-sw_fixture 58 96 99 99
+sw_fixture 58 100 100 100
 rm -f "$SWD/swap-note"
 mkdir -p "$SWD/swap-note.tmp"          # the one name a careless writer would take
 SW_ROOT="$FAKE/countroot" sw_stopfail sess-n5 >/dev/null
@@ -6684,7 +6941,7 @@ case "$out" in
   *) bad "status promise" "said neither: $(printf '%s' "$out" | tr '\n' ' ' | head -c 140)" ;;
 esac
 
-rm -rf "$ADIR" "$SWD/accounts-quota.json" "$SWD/swapped-windows" "$SWD/accounts-keepalive" \
+rm -rf "$ADIR" "$RQD" "$SWD/swapped-windows" "$SWD/accounts-keepalive" \
        "$FAKE/.sw-out" "$FAKE/.sw-err" "$FAKE/.creds-before"
 hf_reset
 unset CCD_USAGE_URL CCD_TOKEN_URL
@@ -6700,7 +6957,7 @@ TXD="$FAKE/.claude/ccd"
 export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
 export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
 tx_fixture() {  # one registered account, its stored token expired and due a refresh
-  rm -rf "$ADIR" "$TXD/accounts-quota.json" "$FAKE/.claude.json"
+  rm -rf "$ADIR" "$RQD" "$FAKE/.claude.json"
   mkdir -p "$ADIR"
   write_creds tx_b; "$ACCT" --no-color add --name tx_b --label B-original >/dev/null 2>&1
   write_creds tx_c; "$ACCT" --no-color add --name tx_c --label C-other >/dev/null 2>&1
@@ -6834,7 +7091,7 @@ PY
 # enough to make that account live while we wait — and consuming its refresh
 # token then leaves the running session holding one that can never be renewed.
 r1_fixture() {
-  rm -rf "$ADIR" "$TXD/accounts-quota.json"; rm -f "$FAKE/.claude.json"
+  rm -rf "$ADIR" "$RQD"; rm -rf "$FAKE/.claude.json"
   mkdir -p "$ADIR"
   write_creds r1_b; "$ACCT" --no-color add --name r1_b >/dev/null 2>&1
   write_creds r1_other; "$ACCT" --no-color add --name r1_other >/dev/null 2>&1
@@ -7587,6 +7844,30 @@ assert not os.path.exists(m.STORE_SPLIT), "a clean single-store install left its
 ' "$ROOT/bin/ccd-account" "$(split_home nobank2)" \
   && ok "...nor banked on the way out to another account, and a one-store install still clears its record" \
   || bad "snapshot overwritten" "a swap away banked a credential-free blob"
+
+# measure_active() never refreshes, and that is load-bearing. It captures who is
+# active, and another session can swap the store before the probe runs: by then the
+# captured account is a SPARE, account_refresh() no longer refuses it, and an
+# expired token there would be exchanged — from the one path that must never spend
+# a token. (I called the refreshing variant an equivalent mutant. It is not.)
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+A = {"accessToken": "AT-a", "refreshToken": "RT-a", "expiresAt": int((time.time() - 60) * 1000)}
+B = {"accessToken": "AT-b", "refreshToken": "RT-b", "expiresAt": int((time.time() + 99999) * 1000)}
+m.use_keychain = lambda: False
+m.account_save("a", {"name": "a", "claudeAiOauth": A})
+m.account_save("b", {"name": "b", "claudeAiOauth": B})
+m.write_json(m.credentials_file(), {"claudeAiOauth": B})   # the store is on B by the time A is probed
+seen = iter(["a"])                                          # ...but A is who was active when we looked
+m.active_name = lambda: next(seen, "b")
+exchanged, asked = [], []
+m.token_refresh = lambda rt: (exchanged.append(rt), (None, 500))[1]
+m.usage_fetch = lambda at: (asked.append(at), (401, None))[1]
+m.measure_active(time.time() + 30)
+assert exchanged == [], f"a token was exchanged from the measuring path: {exchanged!r}"
+assert m.reading_load("a")["status"] != "ok", "an expired token produced a measurement"
+' "$ROOT/bin/ccd-account" "$(split_home measureonly)" \
+  && ok "measuring the active account never exchanges a token, even once the store has moved on" \
+  || bad "spent a token while measuring" "the active-account measurement refreshed an account that had stopped being active"
 
 # ...and while the stop stands, nothing else may touch the credential stores. The
 # record names both backends; this suite can only see the file one, so it cannot
