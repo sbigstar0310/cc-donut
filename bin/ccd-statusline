@@ -364,7 +364,7 @@ PY
 fi
 
 # ── Normal (subscription) session ────────────────────────────────────────────
-# The row below is only as current as accounts-quota.json, so when it finds that reading
+# The row below is only as current as the files under readings/, so when it finds them
 # aged out it asks (exit 3, see the end of the block) for the same background job the
 # hook runs. That is what keeps the reading moving through a turn with no prompt in it:
 # every assistant message re-runs this, and so does the 60s tick `ccd setup` asks for
@@ -385,19 +385,16 @@ fi
 # this path must never spawn a keychain read, a subprocess, or an HTTP call.
 row=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" WARN_MAX_AGE="$WARN_MAX_AGE" \
   THRESHOLD="$THRESHOLD" CCD_DIR="$CCD_DIR" \
-  python3 - "$CCD_DIR/accounts" "$CCD_DIR/accounts-quota.json" \
+  SPENT_AT="$(cat "$SELF_DIR/spent-at" 2>/dev/null)" \
+  python3 - "$CCD_DIR/accounts" "$CCD_DIR/readings" \
            "$CACHE" "$CCD_DIR/providers/keys.env" 2>/dev/null <<'PY'
 import datetime, hashlib, json, os, re, sys, time
-adir, qfile, cache_file, keys_file = sys.argv[1:5]
+adir, qdir, cache_file, keys_file = sys.argv[1:5]
 
-# The ready/full bound, read the way ccd-account reads it (HEADROOM,
-# bin/ccd-account:71). Drawing the line at 90 here while the swap draws it
-# somewhere else would name a spare that the handoff then declines to use. A junk
-# value must not take the row down with it.
-try:
-    HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
-except ValueError:
-    HEADROOM = 90
+# The ready/full bound is ccd's one meaning of "spent" (bin/spent-at), read from
+# the same file ccd-account and the hook read. Drawing the line anywhere else here
+# would name a spare the handoff then declines to use, or hide one it would take.
+SPENT_AT = int(os.environ["SPENT_AT"])
 # Past this, a percentage is not a stale reading but a wrong one — the same call
 # the dashboard row makes about its own cache. The background refresh keeps it well
 # inside this, but a machine that was asleep or offline can hand the render a row
@@ -467,7 +464,8 @@ display = active or (ident_email.split("@")[0] if ident_email else "")
 if len(display) > 18:            # long email local parts must not eat the row
     display = display[:17] + "…"
 
-quota = load(qfile)
+# One reading per account, one file each (bin/ccd-account reading_save).
+quota = {n: load(os.path.join(qdir, n + ".json")) for n in names}
 
 
 def cred_fp(acct):
@@ -577,7 +575,7 @@ def reading(name):
         secs = secs_until(q.get(rk))
         if worst is None or v > worst:
             worst, eases = v, secs
-        if v >= HEADROOM:
+        if v >= SPENT_AT:
             blocked.append(secs)
     # The LAST blocked window to turn over is the one that frees the account, so a
     # blocked window we cannot time leaves the whole account untimeable. Better no
@@ -645,7 +643,7 @@ for n in spares:
     if p is None:
         unknown += 1          # never yet probed, or the reading failed
         continue
-    if p < HEADROOM:
+    if p < SPENT_AT:
         ready.append((p, n, eases))
     else:
         full.append((p, n, frees))
@@ -693,31 +691,6 @@ if not spares:
     tail = ""           # nothing to hand off to; the row is just who is answering
 
 
-# ── Is a launcher supervising THIS session? ──────────────────────────────────
-# The contract the hook checks before it signals (launcher_present,
-# scripts/quota-guard.sh): 32 lowercase hex whose state path is the one that token
-# implies. Anything weaker calls a session supervised that the hook will refuse,
-# which is the silence this row exists to end — #21 sat inert for four days while
-# every surface except `ccd doctor` reported success, and doctor is the command
-# nobody runs BEFORE the thing they installed fails to happen.
-#
-# ONE message, not a remedy: whether a restart or a `ccd setup` is the fix turns on
-# facts this path cannot establish without spawning a process, and confident wrong
-# advice is worse than none.
-tok = os.environ.get("CCD_HANDOFF", "")
-supervised = bool(re.fullmatch(r"[0-9a-f]{32}", tok)) and os.environ.get(
-    "CCD_HANDOFF_STATE") == os.path.join(os.environ.get("CCD_DIR", ""), f"handoff-{tok}.json")
-if spares and not supervised:
-    head += f" {Y}(not supervised){RS}"
-
-
-# ── The escape hatch, above the threshold ────────────────────────────────────
-# The loudest thing on the screen has to be the best qualified. Three gates, the
-# same three the arming path applies before it ends a session (quota_peak in
-# scripts/quota-guard.sh): the reading must be usable, recent, and about a window
-# that still exists. Without them a sample taken before a reset went on reading 96%
-# afterwards, and a swap left the previous account's 99% shouting beside the new
-# account's 3%.
 def have_key():
     """Is there an OpenRouter key to fall back to? Same shapes the hook accepts."""
     if os.environ.get("OPENROUTER_API_KEY", "").strip():
@@ -736,6 +709,39 @@ def have_key():
     return False
 
 
+
+# ── Is a launcher supervising THIS session? ──────────────────────────────────
+# The contract the hook checks before it signals (launcher_present,
+# scripts/quota-guard.sh): 32 lowercase hex whose state path is the one that token
+# implies. Anything weaker calls a session supervised that the hook will refuse,
+# which is the silence this row exists to end — #21 sat inert for four days while
+# every surface except `ccd doctor` reported success, and doctor is the command
+# nobody runs BEFORE the thing they installed fails to happen.
+#
+# Shown only where it is true AND wanted: the user opted into the paid hop, a key
+# is stored, and this session cannot take it because no launcher is watching. An
+# install that never opted in needs no launcher for anything it does — the hop
+# between subscriptions happens inside the session — so it is told nothing. Not
+# gated on spares: with none registered the paid hop is the only one there is.
+#
+# It says what will not happen and the one fix that is always right. "(not
+# supervised)" named a mechanism; nobody knew what it cost them.
+tok = os.environ.get("CCD_HANDOFF", "")
+supervised = bool(re.fullmatch(r"[0-9a-f]{32}", tok)) and os.environ.get(
+    "CCD_HANDOFF_STATE") == os.path.join(os.environ.get("CCD_DIR", ""), f"handoff-{tok}.json")
+paid_hop = os.path.exists(os.path.join(os.environ.get("CCD_DIR", ""), "paid-handoff"))
+if paid_hop and not supervised and have_key():
+    head += (f" {Y}⚠ automatic OpenRouter handoff will not happen here — "
+             f"/exit, then start claude again (ccd doctor){RS}")
+
+
+# ── The escape hatch, above the threshold ────────────────────────────────────
+# The loudest thing on the screen has to be the best qualified. Three gates, the
+# same three the arming path applies before it ends a session (quota_peak in
+# scripts/quota-guard.sh): the reading must be usable, recent, and about a window
+# that still exists. Without them a sample taken before a reset went on reading 96%
+# afterwards, and a swap left the previous account's 99% shouting beside the new
+# account's 3%.
 warn = ""
 try:
     c = (json.load(open(cache_file)).get("claude") or {})
@@ -783,22 +789,16 @@ print("\n".join(x for x in (acct, warn) if x), end="")
 # registered account a spare (#41), and the cache's age is one stat. Deciding it in
 # the shell instead would cost a second python on every render and a second copy of
 # that rule. A future stamp is not freshness, the same call dash_age makes.
-#
-# The launcher's visited set comes off too, the way best_target() takes it off: a
-# spare it will not probe is one the job would measure nothing about, and it returns
-# without writing the cache — so the reading would stay stale and the next render
-# would ask again. The row above still names that spare; this is only about work.
-visited = set(os.environ.get("CCD_BURST_VISITED", "").replace(",", " ").split())
 try:
     TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
 except ValueError:
     TTL = 300
 try:
-    age = time.time() - os.path.getmtime(qfile)
-except OSError:
+    age = time.time() - max(os.path.getmtime(os.path.join(qdir, f)) for f in os.listdir(qdir)
+                            if f.endswith(".json"))
+except (OSError, ValueError):       # no directory, or nothing in it yet
     age = float("inf")
-measurable = [n for n in spares if n not in visited]
-raise SystemExit(3 if measurable and not 0 <= age < TTL else 0)
+raise SystemExit(3 if spares and not 0 <= age < TTL else 0)
 PY
 )
 refresh=$?
@@ -808,7 +808,7 @@ refresh=$?
 # still running by killing its process group, and a kill mid token-exchange loses a
 # refresh token the server has already rotated. Nothing here is waited on.
 if [ "$refresh" -eq 3 ]; then
-  "$SELF_DIR/ccd-account" --no-color keepalive --pick --detach --exclude "${CCD_BURST_VISITED:-}" >/dev/null 2>&1 &
+  "$SELF_DIR/ccd-account" --no-color keepalive --pick --detach >/dev/null 2>&1 &
 fi
 
 if [ -n "$base" ] && [ -n "$row" ]; then

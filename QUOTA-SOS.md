@@ -49,18 +49,24 @@ The ladder becomes:
 account A spent  →  account B has room?  →  B      free
                  →  B spent too?         →  key stored and --auto opted in?
                                             yes →  🍩  OpenRouter (paid)
-                                            no  →  no automatic handoff; wait for
-                                                   the quota, or type `ccd -c` (top)
+                                            no  →  no automatic handoff; ccd stops and says
+                                                   so. Wait for the quota, or type `ccd -c` (top)
 ```
 
-With automatic handoff on (`ccd setup --auto`) this needs nothing typed at all.
-Without it, switch by hand between sessions:
+The first rung needs nothing typed and nothing installed: when the quota reading
+says A is spent, ccd installs B's credential in the session you are in and says so
+in one line. The session carries on — no restart, and the model list and `/status`
+catch up at its next launch. By hand it is the same one command, from inside the
+session:
 
 ```sh
-# in a terminal, with Claude Code closed
-ccd account use B
-claude --resume
+!ccd account use          # or: ccd account use B, from a terminal
 ```
+
+The second rung — OpenRouter — is the one that relaunches, and the one that needs
+`ccd setup --auto` and a stored key. "B spent too" means measured: a spare ccd
+could not read, or a swap that simply failed, is retried three times and then
+ends in a note, never in a bill.
 
 **The one thing that can quietly rot:** a registered account you never use. Its
 refresh token lasts about 8.5 days. ccd refreshes idle accounts once a day to keep
@@ -188,26 +194,32 @@ login only within that process; the login itself stays saved. **Never run
 
 ## Doing all of this automatically
 
-Everything above is the manual round trip. It always works and needs nothing
-installed. If you would rather not type any of it:
+Everything above is the manual round trip to OpenRouter. It always works and needs
+nothing installed. If you would rather not type the way back:
 
 ```sh
 ccd setup --auto
 ```
 
-Keep starting sessions as `claude`. When quota dies the conversation reopens on
-OpenRouter by itself, and when the window resets it returns to the subscription
-the same way. Turn it off with `ccd setup --no-auto`.
+Keep starting sessions as `claude`. When every subscription is spent the
+conversation reopens on OpenRouter by itself, and when the window resets it
+returns to the subscription the same way. Turn it off with `ccd setup --no-auto`.
+
+This is the paid hop only. Moving to another registered subscription is automatic
+with nothing installed: it happens inside the session, so there is no launcher in
+that path at all.
 
 It is deliberately conservative, and each rule exists so a failure leaves you no
 worse off than doing nothing:
 
 - A `rate_limit` error alone never triggers it — the quota reading has to agree,
   so transient throttling is ignored. No reading, no handoff.
-- Nothing is signalled unless the launcher is running to catch it, and nothing is
-  signalled without an OpenRouter key. Ending a session with nowhere to go would
-  be worse than leaving it alone.
-- The turn that failed is not retried. Re-send that prompt after the switch.
+- No session is ever ended unless the launcher is running to catch it and an
+  OpenRouter key is stored. Ending a session with nowhere to go would be worse
+  than leaving it alone. (The hop between subscriptions ends nothing, so neither
+  applies to it.)
+- The turn that failed is not retried on the paid hop. Re-send that prompt after
+  the switch; the free hop wakes it for you instead.
 - If anything is missing — plugin, key, launcher — you land in the ordinary
   manual flow above, not in a broken state.
 

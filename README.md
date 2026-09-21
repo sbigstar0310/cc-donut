@@ -21,11 +21,18 @@
 When your Claude quota runs out, cc-donut moves the conversation to your **other
 Claude subscription**. The conversation, tools, hooks, skills and MCP servers all
 stay where they are, and nothing is billed: it is a subscription you already pay
-for. When the window resets, it moves you back.
+for. It does not move you back on a timer: the next time the account you are on
+runs low, it moves to whichever subscription has room — often the one you
+started on.
 
 Two subscriptions rarely run out at the same time, so switching between them is
-enough for most people. If they all run out, OpenRouter can take over as a paid
-fallback — with your own key, and only once you have said so.
+enough for most people. OpenRouter is the paid last resort, on your own key, and
+cc-donut moves a session there by itself only when all three hold: no
+subscription can take the session (none registered, or every one measured
+spent), you have stored a key, and you opted in with `ccd setup --auto`.
+Otherwise it stops and says so — and a swap that merely *failed* is retried three
+times and then stops too; it never becomes a reason to pay. `ccd -c` goes there
+by hand at any time.
 
 ## Install
 
@@ -60,11 +67,12 @@ ccd account add     # registers the account you are signed in as right now
 claude              # /login as your other account, then /exit
 ccd account add     # register that one too
 ccd account list    # both accounts, with live quota
-ccd setup           # the hop between subscriptions happens by itself
+ccd setup           # statusline and hooks; the hop needs nothing more
 ```
 
-That is the whole setup for two subscriptions. OpenRouter is optional and only
-matters once every subscription is spent.
+That is the whole setup for two subscriptions: the hop between them happens inside
+the running session, so there is no launcher to install and no restart to make.
+OpenRouter is optional and only matters once every subscription is spent.
 
 ## When the quota dies
 
@@ -72,19 +80,20 @@ matters once every subscription is spent.
 BEFORE   stuck mid-task, restart, lose the thread
 
 AUTO     nothing to type at all     the session moves itself to the other
-                                    subscription (ccd setup)
+                                    subscription, in place
 
 MANUAL   !ccd account use           one line, then keep typing
 ```
 
-`!` runs a shell command without leaving Claude Code, so the swap happens in the
-session that just ran out, and that session carries on. You do not have to end
-anything.
+Both move the session you are in. `!` runs a shell command without leaving Claude
+Code, and the automatic one is the same swap done for you when the quota reading
+says the account is spent — no launcher, no relaunch, nothing to end. If the limit
+lands before that reading sees it, ccd swaps and wakes the parked turn itself.
 
-What lags is cosmetic. Claude Code reads the model list, the limits and the usage
-figures once at startup and holds them, so those keep describing the account you
-left until the next start. ccd clears the cached copies the same way `/login`
-does, so nothing carries over further than that.
+What lags is cosmetic. Claude Code reads the model list, Fable access, the limits
+and the `/status` identity once at startup and holds them, so those keep
+describing the account you left until the next start. ccd clears the cached copies
+the same way `/login` does, so nothing carries over further than that.
 
 ---
 
@@ -93,14 +102,16 @@ does, so nothing carries over further than that.
 
 Accounts are tried in registration order, which `--priority` changes. An account
 is offered only if it has quota left in **both** the 5-hour and the 7-day window:
-an account at 99% of its weekly quota would run out again within minutes.
+one window at 100% means the account is spent, whatever the other says. There is
+no reserve below that — a spare at 99% is still somewhere to go, and ccd moves
+your session when the account you are on reaches 100%, not before.
 
 The statusline shows the account you are on, how much of the spare's quota is
 used, and when that quota resets:
 
 ```text
 ● claude:personal │ spare work 20% (2h10m)     # room to switch to, right now
-● claude:personal │ spare work 98% (13m)       # spent, but worth waiting out
+● claude:personal │ spare work 100% (13m)      # spent, but worth waiting out
 ```
 
 `ccd doctor` reports each account's quota and flags any that needs a re-login.
@@ -121,14 +132,19 @@ Your MCP logins (Notion, Slack) are unaffected by a swap. Tokens live in
 </details>
 
 <details>
-<summary><b>Automatic handoff, with no commands at all</b></summary>
+<summary><b>The paid hop: OpenRouter, with no commands at all</b></summary>
+
+The hop between your own subscriptions is not in here — it needs nothing
+installed. This section is only about the last resort, when every subscription is
+spent and the session has to move onto OpenRouter and back.
 
 ```sh
-ccd setup
+ccd setup --auto
 ```
 
-That installs a launcher at `~/.claude/ccd/bin/claude` and asks before adding one
-line to your shell startup file, so your shell finds it first:
+That authorises the billing, installs a launcher at `~/.claude/ccd/bin/claude`,
+and asks before adding one line to your shell startup file, so your shell finds it
+first:
 
 ```sh
 export PATH="$HOME/.claude/ccd/bin:$PATH"
@@ -139,39 +155,52 @@ official installer owns. Say no to the prompt and ccd prints the line for you.
 `--yes` answers it in advance.
 
 Then start sessions as usual with `claude`. The launcher runs the real claude and
-watches its exit code, so when quota runs out the conversation continues on the
-next account by itself, and comes back when the quota resets.
+watches its exit code, so when every subscription is spent the conversation
+continues on OpenRouter by itself, and comes back when the quota resets.
 
 Conditions and limits:
 
-- **All three conditions must hold.** The launcher must be running, a quota
-  reading must confirm the rate-limit error, and there must be somewhere to go.
-  Otherwise ccd does nothing, and no session is ended with nowhere to go.
+- **It pays on proof, never on a guess.** Every registered account — the one
+  you are on included — must have a fresh, successful reading that shows it at
+  100%, with a reset time still in the future (or nothing registered at all).
+  "Spent" means 100% everywhere in ccd: a session moves when its account gets
+  there, a spare is somewhere to go until it does (99% is), and nothing is
+  paid for while any account is short of it. That comes
+  on top of the rate-limit error, the key and this opt-in. A spare that
+  could not be measured, a busy store, a swap that failed — none of those is
+  proof, and each one ends in a note instead of a bill.
+- **The launcher must be running.** If the opt-in is on but the session was not
+  started through it, ccd does not pay and does not pretend: it says so, and the
+  statusline warns ahead of time. No session is ended with nowhere to go.
 - **The in-flight turn is lost.** The switch happens after the failed turn, so
-  re-send that last prompt.
+  re-send that last prompt. (The free hop between subscriptions does not lose it:
+  it swaps in place and wakes the turn.)
 - **Non-interactive runs are not relaunched.** `claude -p ...`, or anything with
   its output redirected, has no terminal to come back to and no prompt to
   re-send. ccd tells you how to continue instead.
 
 ### The free hop and the paid one are separate
 
-A handoff has two possible destinations and they do not cost the same:
+A handoff has two possible destinations, and they do not cost the same or work the
+same way:
 
-- **Another registered subscription.** Free. Nothing is billed, and the session
-  carries on as though nothing happened. This is what the launcher is for.
+- **Another registered subscription.** Free, and it happens inside the session:
+  the credential ccd writes is the one the next request reads, so nothing is
+  relaunched and nothing is lost. No launcher, no PATH line, no restart.
 - **OpenRouter, on your own API key.** Billed, and only ever reached when every
   registered subscription is spent and you have both stored a key and opted in
-  with `ccd setup --auto`.
+  with `ccd setup --auto`. It is also the one hop that needs the launcher —
+  while a session is on OpenRouter its backbone is an environment variable, so
+  leaving it takes a relaunch.
 
-The launcher carries the first one on its own, and `ccd setup` installs it.
-`ccd setup --auto` authorises the second as well. Having a key stored is not enough:
-without that opt-in, a session whose subscriptions are all spent simply ends where
-it is rather than moving onto a paid backbone unattended. `ccd doctor` reports the
-two separately, and `ccd setup --no-auto` withdraws the authorisation along with the
-launcher.
+`ccd setup --auto` is what authorises the paid hop and installs that launcher.
+Having a key stored is not enough: without the opt-in, a session whose
+subscriptions are all spent simply ends where it is rather than moving onto a paid
+backbone unattended. `ccd doctor` reports the two separately, and
+`ccd setup --no-auto` withdraws the authorisation along with the launcher.
 
 The manual procedure still works if a handoff does not fire.
-`ccd setup --no-auto` turns automatic handoff off and `ccd uninstall` removes it. A
+`ccd setup --no-auto` turns the paid hop off and `ccd uninstall` removes it. A
 `~/.claude/ccd/bin/claude` that is not ours, and a PATH line we did not write,
 are always left alone.
 
@@ -226,12 +255,12 @@ calls.
 | --- | --- |
 | `ccd account add` | Register the signed-in account as a spare subscription |
 | `ccd account list` | Registered accounts with live quota |
-| `ccd account use` | Hop to whichever spare has room — the same one a handoff would pick. `!ccd account use` does it from inside a session, which then carries on |
+| `ccd account use` | Hop to whichever spare has room — the same one a handoff would pick. `!ccd account use` does it from inside a session, which then carries on with no restart |
 | `ccd account use <name>` | That account specifically |
 | `ccd account rm <name>` | Remove one |
-| `ccd setup` | Install everything, including the automatic hop between subscriptions |
-| `ccd setup --auto` | Also allow the paid OpenRouter hop when every subscription is spent |
-| `ccd setup --no-auto` | Remove the launcher and its PATH line |
+| `ccd setup` | Install everything the subscription hop needs: statusline, hooks, `ccd` itself |
+| `ccd setup --auto` | Also allow the paid OpenRouter hop, and install the launcher that carries it |
+| `ccd setup --no-auto` | Remove that launcher and its PATH line |
 | `ccd doctor [model]` | Diagnose the whole escape route |
 | `ccd` | Status: accounts, key, slots, routing, procedure |
 | `ccd key` | Store the OpenRouter key |

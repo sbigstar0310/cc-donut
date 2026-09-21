@@ -60,9 +60,12 @@ ccd account list
   lab, or personal one). If yes, walk them through it: `ccd account add` registers
   whoever is signed in now; then they run `claude`, `/login` as the other account,
   and `ccd account add` again. After that, quota exhaustion hops to the spare
-  subscription and only reaches OpenRouter when every account is spent.
-- **One registered:** that alone does nothing. Say so plainly and offer to finish
-  the second one.
+  subscription by itself. OpenRouter is reached automatically only when every
+  registered account is measured spent, a key is stored, AND they opted in with
+  `ccd setup --auto`; otherwise ccd stops and says so, and `ccd -c` goes by hand.
+- **One registered:** there is no spare to hop to, so the free hop cannot happen.
+  The paid hop still can — with one account it is the only hop there is — under
+  the same three conditions. Say so plainly and offer to finish the second one.
 - **Any account shows `needs re-login`:** this is urgent and easy to miss. That
   spare cannot receive a handoff, and the failure is invisible until the moment
   it is needed. It means ccd's stored copy of the refresh token is dead, not the
@@ -144,9 +147,12 @@ prices move and new models ship), do this:
   conversation they were in.
 - **If a second Claude account is registered, OpenRouter is no longer the first
   stop.** Quota exhaustion moves the conversation to the spare subscription —
-  free, still real Claude — and only reaches OpenRouter when every registered
-  account is spent. `ccd account list` shows which account is active and whether
-  a spare has room; the statusline shows the same as `● claude:<name> │ spare …`.
+  free, still real Claude, inside the running session with no restart and nothing
+  to type — and only reaches OpenRouter when every registered account is measured spent, a key is stored, and the user opted in with `ccd setup --auto`.
+  `ccd account list` shows which account is active and whether a spare has room;
+  the statusline shows the same as `● claude:<name> │ spare …`. After a swap the
+  model list, Fable access and `/status` keep naming the previous account until
+  the next launch; the credential and the billing have already moved.
 - A spare account that reports `needs re-login` is the one failure worth raising
   unprompted. It looks healthy in every other view and only surfaces at the
   moment of the handoff, which is the moment the user cannot fix it. Signing in

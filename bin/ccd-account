@@ -28,12 +28,15 @@ Commands:
   ccd account rm <name>
   ccd account use [<name>] [--json]
   ccd account refresh [--all] [--inactive-only] [<name>]
-  ccd account pick [--exclude a,b] [--json]
+  ccd account pick [--json]
+  ccd account swap [--from N] [--window K] (internal: called by the hook)
+  ccd account exhausted          (internal: the only thing that may justify paying)
   ccd account keepalive          (internal: called by the hook, at most daily)
   ccd account current [--json]   (internal: statusline / doctor)
 """
 
 import argparse
+import datetime
 import errno
 import hashlib
 import json
@@ -69,16 +72,33 @@ if os.environ.get("CCD_TOKEN_URL"):
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 USER_AGENT = "ccd"
 
-# An account is a candidate only if EVERY window it reports is below this.
-# Deliberately lower than quota-guard's ARM_THRESHOLD (95): escaping a 95% account
-# onto a 92% one just means hopping again in a few minutes.
-HEADROOM = int(os.environ.get("CCD_HEADROOM", "90"))
+# ONE meaning of "spent", and it is not a knob: the percentage at which a window
+# has nothing left. Three decisions turn on it and they must never disagree —
+# when a session moves (the hook), whether an account is somewhere to move TO
+# (has_headroom), and whether an account counts towards the proof that may
+# authorise paying (_still_spent). A 90% "reserve" used to answer the second and
+# the third at once: a spare at 90% was skipped by the swap AND proved spent, and
+# ccd paid with a tenth of a subscription left. So the number lives in one file,
+# bin/spent-at, read by this program, the hook and the statusline alike; none of
+# them sources another, and none of them can drift. Missing or unreadable is a
+# broken install, and says so loudly rather than guessing.
+with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "spent-at")) as _f:
+    SPENT_AT = int(_f.read())
+
+
+def window_spent(pct):
+    """Is this one window out of room? Readings are whole percentages (_window
+    rounds them), so 99.6 on the wire is 100 here and counts; 99.4 does not."""
+    return isinstance(pct, (int, float)) and not isinstance(pct, bool) and pct >= SPENT_AT
+
+
 CANDIDATE_TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
 KEEPALIVE_INTERVAL = int(os.environ.get("CCD_KEEPALIVE_INTERVAL", "86400"))
 # First retry after a failed keepalive pass, doubling per consecutive failure up
 # to KEEPALIVE_INTERVAL. A flat daily cadence gave a spare ~8 one-shot tries in
 # its token's life; it backs off rather than retrying fast because the failure
 # may itself be the endpoint refusing us.
+KEEPALIVE_BUDGET = int(os.environ.get("CCD_KEEPALIVE_BUDGET", "120"))
 KEEPALIVE_RETRY_MIN = int(os.environ.get("CCD_KEEPALIVE_RETRY_MIN", "900"))
 # Warn once a spare's stored token has gone unrefreshed this long. Deliberately
 # well inside the ~8.5-day refresh token life so there is room to act.
@@ -110,8 +130,29 @@ ACTIVE_AT_FILE = os.path.join(ACCOUNTS_DIR, ".active-at")
 LOCK_FILE = os.path.join(ACCOUNTS_DIR, ".lock")
 REFRESH_LOCK = os.path.join(ACCOUNTS_DIR, ".refresh.lock")    # see cmd_keepalive
 ENDPOINT_FILE = os.path.join(ACCOUNTS_DIR, ".token-endpoint")
-QUOTA_FILE = os.path.join(CCD_DIR, "accounts-quota.json")
+# One reading per account, one file per reading. A shared file made every writer
+# responsible for every row: load all, wait on the network, write all — and an
+# atomic replace keeps such a file from tearing, not from losing the update
+# somebody else made while you waited. With a file each, a prober can only ever
+# publish the account it measured.
+READINGS_DIR = os.path.join(CCD_DIR, "readings")
 KEEPALIVE_MARK = os.path.join(CCD_DIR, "accounts-keepalive")
+# Where automatic swaps have come FROM lately, so one is never sent back to an
+# account it just left as spent. Bounded by time: an entry is a statement about
+# the last half hour, not a permanent verdict, and nothing is evicted while it
+# still describes now (see swap_guard_read).
+# Written BEFORE a credential write that could leave the backends holding
+# different things, and removed once they provably agree again. While it exists
+# nothing may install or bank a credential: the stores disagree about who is
+# signed in, and every copy from one to the other files one account's credential
+# under another's name.
+STORE_SPLIT = os.path.join(CCD_DIR, "store-split")
+# ccd does not repair the store: a credential Claude Code writes is worth more
+# than anything ccd could reconstruct from a snapshot it happens to hold. All ccd
+# owes the user is a true report and a stop that lifts by itself — see
+# split_way_out(), which is careful not to promise more than a sign-in does.
+SWAP_GUARD = os.path.join(CCD_DIR, "swapped-windows")
+SWAP_GUARD_TTL = int(os.environ.get("CCD_SWAP_GUARD_TTL", "1800"))
 # Breadcrumb for the hook. keepalive runs backgrounded with its output discarded,
 # so anything it prints is lost; the hook picks this up on a later tick.
 STALE_FILE = os.path.join(CCD_DIR, "accounts-stale")
@@ -154,6 +195,15 @@ def now():
 
 def ensure_dirs():
     os.makedirs(ACCOUNTS_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(READINGS_DIR, mode=0o700, exist_ok=True)
+    try:        # makedirs leaves an existing directory's mode alone
+        os.chmod(READINGS_DIR, 0o700)
+    except OSError:
+        pass
+    try:        # the shared cache these replaced; a cache, so nothing is migrated
+        os.unlink(os.path.join(CCD_DIR, "accounts-quota.json"))
+    except OSError:
+        pass
     try:
         os.chmod(ACCOUNTS_DIR, 0o700)
     except OSError:
@@ -198,21 +248,39 @@ class LockBusy(Exception):
 class Lock:
     """flock around every mutation of the store or the live blob.
 
+    Reentrant within one process. The rule is "whoever writes a stored credential
+    holds the store lock", and the writers nest — a swap holds it and banks the
+    outgoing account, a probe holds it and rotates a token. flock is per open file
+    description, so a second open here would queue behind the first and deadlock;
+    counting the depth is what lets the rule be stated once, at the bottom, rather
+    than remembered at every call site.
+
     fcntl is absent on some platforms; degrade to no locking rather than refusing
     to run, since the alternative is the feature simply not working there."""
 
-    def __init__(self, path, timeout=LOCK_TIMEOUT, wait=True):
+    _depth = {}
+
+    def __init__(self, path, timeout=LOCK_TIMEOUT, wait=True, fatal=True):
         self.path = path
         self.timeout = timeout
         # wait=False raises LockBusy instead of dying: a background pass that
         # finds another one running has nothing to do and nobody to tell.
         self.wait = wait
+        # fatal=False waits like any other caller and then raises LockBusy rather
+        # than ending the process — for work that is worth a moment's patience and
+        # is not worth anybody's session (a token exchange that has not started).
+        self.fatal = fatal
         self.fd = None
+        self.nested = False
 
     def __enter__(self):
         try:
             import fcntl
         except ImportError:
+            return self
+        if Lock._depth.get(self.path):
+            Lock._depth[self.path] += 1
+            self.nested = True
             return self
         ensure_dirs()
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -220,6 +288,7 @@ class Lock:
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                Lock._depth[self.path] = 1
                 return self
             except OSError as e:
                 if e.errno not in (errno.EAGAIN, errno.EACCES):
@@ -227,13 +296,18 @@ class Lock:
                 if not self.wait or time.time() >= deadline:
                     os.close(self.fd)
                     self.fd = None
-                    if not self.wait:
+                    if not self.wait or not self.fatal:
                         raise LockBusy()
                     die("another ccd account operation is in progress — try again")
                 time.sleep(0.1)
 
     def __exit__(self, *exc):
+        if self.nested:
+            Lock._depth[self.path] -= 1
+            self.nested = False
+            return False
         if self.fd is not None:
+            Lock._depth.pop(self.path, None)
             try:
                 import fcntl
 
@@ -254,6 +328,9 @@ class Lock:
 
 
 def _keychain_read():
+    """The live blob, or None — and None means only "no answer". `security` exits
+    44 out of failed searches as well as empty ones, so nothing here can tell an
+    absent item from an unreachable one, and nothing downstream may pretend to."""
     try:
         p = subprocess.run(
             ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
@@ -338,29 +415,190 @@ def live_read():
     return (blob if blob is not None else {}), sources
 
 
-def live_write(blob, sources):
-    """Write the blob everywhere Claude Code might read it.
+def cred_identity(oauth):
+    """What makes two backends the same credential, or None when they cannot say.
 
-    On macOS a stale ~/.claude/.credentials.json is a real hazard: Claude Code
-    falls back to it when the keychain read fails, so updating only the keychain
-    can silently resurrect the previous account — the worst possible outcome of a
-    swap, since the UI would claim one account while the API served another."""
-    ok = False
+    The ACCESS token: it is what Claude Code sends, and a rotation mints a new
+    access and refresh token together, so equal access tokens mean the same
+    credential. The refresh token is deliberately not used — it is optional in
+    everything ccd accepts, so two unrelated logins that both lack one would
+    compare equal, which is absence of evidence read as agreement."""
+    at = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    return at if isinstance(at, str) and at else None
+
+
+def live_creds():
+    """Return ({backend: its claudeAiOauth, whatever it holds}, [backends that
+    gave no answer]).
+
+    live_read() answers a different question — what to write back — and folds the
+    backends into one preferred blob, which drops the other one's credential out
+    of view. Whether a stored token is safe to SPEND, and whether two stores
+    agree, both need all of them, unfiltered: a credential ccd would never install
+    is still one a session may be carrying.
+
+    ccd does not infer absence. A keychain with no answer is unknown, whatever
+    exit code came back. The one absence taken at its word is the kernel's own
+    ENOENT for the file — open() says it, where os.path.exists() says the same
+    "no" for a permission error — and even that only means the file holds no
+    token to protect. It never counts as a store that agrees."""
+    def oauth_of(blob):
+        o = blob.get("claudeAiOauth") if isinstance(blob, dict) else None
+        return o if isinstance(o, dict) else {}
+
+    held, blind = {}, []
+    if use_keychain():
+        blob = _keychain_read()
+        if blob is None:
+            blind.append("keychain")
+        else:
+            held["keychain"] = oauth_of(blob)
+    try:
+        with open(credentials_file()) as f:
+            held["file"] = oauth_of(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        blind.append("file")
+    return held, blind
+
+
+def store_split():
+    """The stop a credential write left behind, as recorded — None only when there
+    is no record. A cheap read: it says a stop may be standing, not that it still
+    applies.
+
+    Never falsy while the file exists. A record that is empty, corrupt or
+    unreadable is still a stop; reading it as "no record" fails open in exactly
+    the state where nothing is known."""
+    try:
+        with open(STORE_SPLIT) as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        rec = None
+    if isinstance(rec, dict) and rec:
+        return rec
+    return {"detail": "the record of it cannot be read"}
+
+
+def store_split_now():
+    """The stop, re-tested against the stores. Call it holding the store lock.
+
+    It lifts on positive evidence and on nothing else: every store the record
+    names answers, each with a credential that has an identity, and every
+    credential in sight carries the same one. "Cannot see it", "holds nothing" and
+    "holds something unidentifiable" all keep it standing — each was once read as
+    agreement, and each lifted a stop on a store nobody had seen agree. A backend
+    that really is gone for good has an explicit exit instead (split_way_out).
+    A record that names no stores has nothing that could answer, so it stands.
+
+    The lock is what makes the test honest. A writer that has recorded its intent
+    but not yet touched a backend leaves the stores agreeing, and lifting the stop
+    there would throw away exactly the protection the record exists to give."""
+    rec = store_split()
+    if rec is None:
+        return None
+    named = rec.get("stores")
+    if not isinstance(named, list) or not named \
+            or not all(isinstance(n, str) for n in named):
+        return rec
+    held, blind = live_creds()
+    ids = {cred_identity(held.get(n)) for n in named}
+    ids |= {cred_identity(o) for o in held.values()}
+    if blind or None in ids or len(ids) != 1:
+        return rec
+    clear_store_split()
+    return None
+
+
+def mark_store_split(detail, stores):
+    """Record, BEFORE a backend is touched, that this write could leave them
+    disagreeing. Returns False when it could not be written.
+
+    Write-ahead, not best-effort. A state directory that cannot hold the record is
+    a protection that cannot be recorded, and an unrecorded protection is none at
+    all: the next command would bank one account's credential under another's name
+    with nothing left to stop it. So a caller that cannot record its intent does
+    not write the credential either."""
+    try:
+        write_json(STORE_SPLIT,
+                   {"detail": detail, "stores": sorted(stores), "at": now()})
+        return True
+    except Exception:
+        return False
+
+
+def split_way_out():
+    """The two exits. The first is ccd's; the second is the user's, and it is a
+    sentence rather than a command on purpose — ccd cannot know which half of a
+    divided store is the right one, or whether a backend that stopped answering
+    is gone for good, so it says what it does know and leaves the judgement with
+    the person who can check that the login works."""
+    return ("Sign in again with /login; ccd lifts this by itself once every store "
+            "it named answers with the same credential."
+            "\n     If it still stands and you are satisfied the login works, delete "
+            + _tilde(STORE_SPLIT) + ".")
+
+
+def _tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def split_text(rec):
+    return ("the credential stores disagree with each other ("
+            + str(rec.get("detail") or "unknown") + ")."
+            "\n     " + split_way_out())
+
+
+def clear_store_split():
+    try:
+        os.unlink(STORE_SPLIT)
+    except OSError:
+        pass
+
+
+def write_targets(sources):
+    """Every backend a write has to land in: wherever the blob was read from,
+    plus the keychain on a platform that keeps one. The write-ahead record names
+    these, so it has to be the same answer live_write() acts on."""
     targets = set(sources)
     if use_keychain():
         targets.add("keychain")
     else:
         targets.discard("keychain")
         targets.add("file")
+    return sorted(targets)
+
+
+def live_write(blob, sources):
+    """Write the blob everywhere Claude Code might read it.
+
+    Returns (ok, failed, written): ok only when EVERY backend that had to take
+    the write took it, failed naming the ones that refused, and written naming
+    the ones that now hold this blob. A caller undoing a partial write needs that
+    last list — which backends were READABLE is a different question, and
+    answering it instead is how a split store went unrepaired.
+
+    Half a write is not a write. On macOS a stale ~/.claude/.credentials.json is
+    a real hazard: Claude Code falls back to it when the keychain read fails, so
+    one backend holding the new credential and the other the old is a store that
+    disagrees with itself — and the next bank copies the stale half back over the
+    new one, destroying a credential nobody can mint again. Reporting that as
+    success is what let it happen quietly."""
+    targets = write_targets(sources)
+    failed, written = [], []
     if "keychain" in targets:
-        ok = _keychain_write(blob) or ok
+        (written if _keychain_write(blob) else failed).append("keychain")
     if "file" in targets:
         try:
             write_json(credentials_file(), blob, 0o600)
-            ok = True
+            written.append("file")
         except Exception:
-            pass
-    return ok
+            failed.append("file")
+    return (bool(targets) and not failed), failed, written
 
 
 # ── Account store ────────────────────────────────────────────────────────────
@@ -381,8 +619,12 @@ def account_load(name):
 
 
 def account_save(name, obj):
+    """The one place a stored account is written, and therefore the one place the
+    store lock has to be taken. Reading inside a lock only protects against
+    writers that take it."""
     obj.setdefault("storage", "file")
-    write_json(account_path(name), obj, 0o600)
+    with Lock(LOCK_FILE):
+        write_json(account_path(name), obj, 0o600)
 
 
 def account_names():
@@ -561,12 +803,12 @@ def drop_account_scoped_config():
     The credential move is what matters and must never be held hostage to the
     state of somebody else's file.
 
-    Safe next to a running session, and needed there most of all — that session is
-    about to be restarted, and the restart reads this file. Claude Code's own
-    writer re-reads under a lock and applies its change to what it finds on disk,
-    and it watches the file for other processes, so a deletion survives its next
-    write. What it cannot pick up is its own in-memory copy, which is why the
-    caller still tells the user that only a restart makes the swap real."""
+    Safe next to a running session, and needed there most of all — that session
+    goes on running, and its NEXT launch reads this file. Claude Code's own writer
+    re-reads under a lock and applies its change to what it finds on disk, and it
+    watches the file for other processes, so a deletion survives its next write.
+    What it cannot pick up is its own in-memory copy, which is why the caller says
+    plainly which half of the account only moves at the next launch."""
     for path in config_paths():
         cfg = read_json(path)
         if cfg is None:
@@ -652,10 +894,16 @@ def bank_live_oauth():
 
     Rationale, and the residual cases this cannot cover, live in
     docs/multi-account.md §12.0.1 through §12.0.5."""
-    if _bank_target() is None:
+    if not store_split() and _bank_target() is None:
         return                 # cheap pre-check: keeps the lock uncontended
     try:
         with Lock(LOCK_FILE, wait=False):
+            # Under the lock, because a stop can land while we queue for it and
+            # copying between stores that disagree is how the split spreads. It is
+            # also where a healed store lifts its own stop, which is what makes
+            # /login the only thing the user has to do.
+            if store_split_now():
+                return
             target = _bank_target()
             if target is None:
                 return         # the blob moved while we waited
@@ -679,9 +927,28 @@ def bank_live_oauth():
 # ── OAuth ────────────────────────────────────────────────────────────────────
 
 
+# The instant this process's network work must be over, or None. urllib bounds
+# each socket operation rather than the request, so this is what keeps a decision
+# inside the budget the hook that started it actually has: every call is given
+# what is left, and a call with nothing left is not made at all.
+NET_DEADLINE = None
+
+
+def net_left():
+    """Seconds of network budget remaining, or None when unbounded."""
+    if NET_DEADLINE is None:
+        return None
+    return NET_DEADLINE - time.time()
+
+
 def _http_json(url, data=None, headers=None, timeout=HTTP_TIMEOUT):
     """Return (status, parsed_json_or_None). Never raises for HTTP errors —
     the caller needs the status to distinguish 401 (dead) from 503 (retry)."""
+    left = net_left()
+    if left is not None:
+        if left <= 0:
+            return 0, None      # the budget is gone; a request now cannot finish
+        timeout = min(timeout, left)
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", USER_AGENT)
@@ -826,32 +1093,90 @@ def refresh_token_dead(oauth):
 def account_refresh(name, acct):
     """Refresh one stored account in place. Returns (ok, status_string).
 
-    Ordering matters: the rotated refresh token is written to disk BEFORE the new
-    access token is used for anything. Crashing between the two costs one wasted
-    access token; the reverse order costs the whole account."""
-    oauth = acct.get("claudeAiOauth") or {}
-    rt = oauth.get("refreshToken")
-    if not rt:
-        return False, "dead"
-    if refresh_token_dead(oauth):
-        return False, "dead"
-    new_oauth, status = token_refresh(rt)
-    if not new_oauth:
-        return False, ("dead" if status in (400, 401, 403) else "error")
-    merged = dict(oauth)
-    merged.update(new_oauth)
-    # Anthropic does not echo refreshTokenExpiresAt; a successful rotation issues
-    # a fresh ~8.5-day window, so advance it ourselves. Without this the account
-    # would look dead to refresh_token_dead() forever after the original expiry.
-    merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
-    acct["claudeAiOauth"] = merged
-    acct["refreshed_at"] = now()
-    # Two different facts, and conflating them is what let six consecutive failures
-    # pass unreported. refreshed_at says the snapshot on disk is this fresh, which
-    # bank_live_oauth() and swap_to() can write truthfully after a copy. This says
-    # the token exchange itself worked, which only happens here.
-    acct["refresh_ok_at"] = now()
-    account_save(name, acct)
+    The exchange and the write it produces happen INSIDE the store lock, as one
+    step — the shape keepalive_pass already uses. A probe is a read and can wait
+    outside any lock; an exchange is a write that consumes a one-time credential,
+    and one that straddles the lock can land on a record somebody re-registered,
+    or complete with nowhere left to put it. Holding the lock means neither can
+    happen: a lock we cannot take means the exchange never started, and nothing
+    that was never spent can be lost.
+
+    Ordering inside matters too: the rotated refresh token is written to disk
+    BEFORE the new access token is used for anything. Crashing between the two
+    costs one wasted access token; the reverse order costs the whole account."""
+    # Cheap "don't start": no point queueing for a lock to do nothing with it.
+    if active_name() == name:
+        return False, "stale"
+    try:
+        with Lock(LOCK_FILE, fatal=False):
+            # Everything the exchange depends on is established HERE, after the
+            # wait. The pre-check above is about the world we saw; a swap can
+            # finish, or Claude Code can publish a profile, while we queue.
+            #
+            fresh = account_load(name)
+            if fresh is None:
+                # Removed while we waited. The caller's snapshot is not a
+                # registration, and saving from it would bring the account back.
+                return False, "gone"
+            oauth = fresh.get("claudeAiOauth") or {}
+            rt = oauth.get("refreshToken")
+            if not rt:
+                return False, "dead"
+            if refresh_token_dead(oauth):
+                return False, "dead"
+            # The thing an exchange can hurt is a CREDENTIAL, not a name: what
+            # makes it harmful is spending the refresh token a live session is
+            # carrying, and it is harmful whatever that account happens to be
+            # called or whom the pointer names. So compare the token itself.
+            #
+            # This is also the check that cannot be overtaken. A name can become
+            # live between here and the request — Claude Code publishes its
+            # profile without touching any lock — but the only way OUR token
+            # becomes the live one is a swap, and swaps take the lock we hold.
+            #
+            # Every readable backend, not the preferred one: with the keychain on
+            # A and the file on B, comparing one blob drops B out of view and the
+            # exchange spends the token a session is carrying. And a backend that
+            # will not answer is unknown, which refuses — it may hold that token.
+            # Every refresh token, identifiable credential or not.
+            #
+            # And never while a stop stands. The stop may name a backend this run
+            # does not look at, and that backend may be holding this token.
+            if store_split_now():
+                return False, "unsure"
+            held, blind = live_creds()
+            if blind or not held:
+                return False, "unsure"
+            if any(rt == o.get("refreshToken") for o in held.values()):
+                return False, "stale"
+            new_oauth, status = token_refresh(rt)
+            if not new_oauth:
+                return False, ("dead" if status in (400, 401, 403) else "error")
+            merged = dict(oauth)
+            merged.update(new_oauth)
+            # Anthropic does not echo refreshTokenExpiresAt; a successful rotation
+            # issues a fresh ~8.5-day window, so advance it ourselves. Without this
+            # the account would look dead to refresh_token_dead() forever after the
+            # original expiry.
+            merged["refreshTokenExpiresAt"] = int((time.time() + 8 * 86400) * 1000)
+            fresh["claudeAiOauth"] = merged
+            fresh["refreshed_at"] = now()
+            # Two different facts, and conflating them is what let six consecutive
+            # failures pass unreported. refreshed_at says the snapshot on disk is
+            # this fresh, which bank_live_oauth() and swap_to() can write
+            # truthfully after a copy. This says the token exchange itself worked,
+            # which only happens here.
+            fresh["refresh_ok_at"] = now()
+            account_save(name, fresh)
+    except LockBusy:
+        # Somebody else owns the store and kept it. Nothing was spent, so there is
+        # nothing to salvage and nothing to report but "not now".
+        return False, "busy"
+    # The caller measures the credential it is holding, so hand it what was
+    # actually stored rather than what it walked in with.
+    if fresh is not acct:
+        acct.clear()
+        acct.update(fresh)
     return True, "ok"
 
 
@@ -902,18 +1227,68 @@ def _cache_row_valid(rec, acct):
     return True
 
 
-def quota_cache():
-    return read_json(QUOTA_FILE) or {}
+def reading_path(name):
+    return os.path.join(READINGS_DIR, f"{name}.json")
 
 
-def quota_cache_save(cache):
-    write_json(QUOTA_FILE, cache, 0o600)
+def reading_lock(name):
+    return os.path.join(READINGS_DIR, f".{name}.lock")
+
+
+def reading_load(name):
+    return read_json(reading_path(name)) if valid_name(name) else None
+
+
+def reading_save(name, rec):
+    """Publish one account's reading. Nothing here can touch another account's.
+
+    Two probers of the SAME account can still finish out of order. A reading is
+    stamped when its answer arrives, so the later stamp is the later look at the
+    server, and an older one does not replace it. A stamp from the future is a
+    wrong clock, not a newer reading, and does not block.
+
+    "Check, then replace" is one step, under a lock of the account's own. Without
+    it a writer that has passed the check can be descheduled for any length of
+    time before its rename, and then puts an old reading back over a newer one —
+    nothing bounds that pause, so "they describe the same second" was a hope.
+    Only the file work is inside: the network wait that produced `rec` is over
+    before this is called. A lock that cannot be had means the reading is not
+    published, which is always safe: an unpublished reading proves nothing and
+    offers nowhere to go. The lock is a dotfile, so nothing that lists
+    readings/*.json ever sees it."""
+    ensure_dirs()
+    try:
+        with Lock(reading_lock(name), fatal=False):
+            theirs = (reading_load(name) or {}).get("checked_at")
+            if isinstance(theirs, (int, float)) and rec["checked_at"] < theirs <= now():
+                return
+            write_json(reading_path(name), rec, 0o600)
+    except LockBusy:
+        return
+
+
+def reading_drop(name):
+    for p in (reading_path(name), reading_lock(name)):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def reading_fresh(rec, ttl):
+    """Is this reading young enough to stand for now? The ONE freshness rule, for
+    the swap, the cache-only tick and the proof alike. Age is bounded on both
+    sides: a reading from the future is a wrong clock, and after a backward clock
+    step it would otherwise sit there "fresh" — pinning a spent verdict and keeping
+    a usable account from ever being measured again."""
+    ts = (rec or {}).get("checked_at")
+    return isinstance(ts, (int, float)) and not isinstance(ts, bool) and 0 <= now() - ts < ttl
 
 
 def probe_account(name, acct, allow_refresh=True):
     """Read one account's quota, refreshing its token first if needed.
 
-    Returns a record shaped like the accounts-quota.json entries."""
+    Returns a record shaped like the files under readings/."""
     rec = {"checked_at": now(), "status": "error"}
     oauth = acct.get("claudeAiOauth") or {}
 
@@ -971,30 +1346,35 @@ def cache_ttl_for(status, ttl):
     return 60  # stale/error: transient, retry soon but not every tick
 
 
-def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True, cache=None):
-    cache = quota_cache() if cache is None else cache
-    rec = cache.get(name)
-    if isinstance(rec, dict) and isinstance(rec.get("checked_at"), (int, float)):
+def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True):
+    rec = reading_load(name)
+    if isinstance(rec, dict):
         # Identity before age: a row can be fresh and still be about the wrong
         # account or a replaced token. Clocks cannot answer either question —
         # now() is second-granular, so a bank and a probe in the same second are
         # a tie, and probe_account may refresh mid-probe, which would make a
         # verdict look older than the very token it measured.
-        if _cache_row_valid(rec, acct) and (
-            (now() - rec["checked_at"]) < cache_ttl_for(rec.get("status"), ttl)
-        ):
-            return rec, cache
+        if _cache_row_valid(rec, acct) and reading_fresh(
+                rec, cache_ttl_for(rec.get("status"), ttl)):
+            return rec
     rec = probe_account(name, acct, allow_refresh=allow_refresh)
     # Stamped after the probe: it may have refreshed the token, and the verdict
     # belongs to whichever credential it ended up measuring.
     rec["cred"] = _cred_fingerprint(acct)
     rec["uuid"] = acct.get("account_uuid")
-    cache[name] = rec
-    return rec, cache
+    # ...and so is the time: when the answer arrived, not when the question was
+    # asked. That is what makes "the later stamp wins" mean the later look.
+    rec["checked_at"] = now()
+    reading_save(name, rec)
+    return rec
 
 
 def has_headroom(rec):
-    """Every window the account reports must be below HEADROOM.
+    """No window the account reports may be spent (window_spent).
+
+    A destination is any account that is not spent: 99% is a destination. There
+    is no reserve below that — the reserve is what made "not worth hopping to"
+    and "spent enough to pay for" the same answer.
 
     The 7-day window is not optional: an account whose 5h just reset but whose
     weekly is at 99% dies again within minutes, burning a hop and showing the
@@ -1008,7 +1388,7 @@ def has_headroom(rec):
     vals = [v for v in vals if isinstance(v, (int, float))]
     if not vals:
         return False
-    return max(vals) < HEADROOM
+    return not any(window_spent(v) for v in vals)
 
 
 def worst(rec):
@@ -1020,23 +1400,86 @@ def worst(rec):
 # ── The swap ─────────────────────────────────────────────────────────────────
 
 
-def swap_to(name, force=False):
+def swap_guard_read():
+    """Accounts an automatic swap has left recently, as {name: (when, window)}.
+
+    A swap must not be sent back to the account it just left as spent: a cached
+    row claiming room for a spent account would otherwise walk the session back
+    and forth between two of them. Recording where a swap came FROM, rather than
+    refusing to leave, is what keeps that impossible without ever stranding a
+    session: leaving is always allowed, only returning is held off.
+
+    Lines are `<epoch>TAB<account>TAB<window key>`. Anything else is not a record,
+    and anything older than the TTL has stopped describing now."""
+    live = {}
+    try:
+        with open(SWAP_GUARD) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return live
+    cutoff = now() - SWAP_GUARD_TTL
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            when = int(parts[0])
+        except ValueError:
+            continue
+        if when < cutoff or not parts[1]:
+            continue
+        if parts[1] not in live or when > live[parts[1]][0]:
+            live[parts[1]] = (when, parts[2])
+    return live
+
+
+def swap_guard_record(name, window):
+    """Remember that a swap has just left `name`, and drop what has aged out.
+
+    One line per account, so the file cannot grow past the store, and the bound is
+    time alone — a count evicts entries that still describe now, which is how an
+    account a swap had just left became a destination again."""
+    live = swap_guard_read()
+    live[name] = (now(), window or "none")
+    try:
+        write_atomic(SWAP_GUARD,
+                     "".join(f"{w}\t{n}\t{k}\n" for n, (w, k) in sorted(live.items())))
+    except OSError:
+        pass            # the swap happened; losing the note is not worth failing it
+
+
+
+
+def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     """Replace only the claudeAiOauth subtree of the live blob.
 
-    Called by ccd-handoff between sessions — after claude exited and before the
-    relaunch — which is the one moment no process owns the credentials. That is
-    why this needs no coordination with a running Claude Code."""
-    target = account_load(name)
-    if not target:
-        die(f"no such account: {name}")
-    oauth = target.get("claudeAiOauth")
-    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
-        die(
-            f"account '{name}' has no usable credentials — run `claude` and sign "
-            f"in with /login as that account"
-        )
+    Called with a session live and mid-turn: the quota hook swaps in place (#57).
+    No coordination is needed even so — Claude Code reads this store per request
+    and writes it only when it rotates a token, and the write is atomic either
+    way. Measured: a swapped session kept working for 16.9 hours across two
+    refreshes without a restart.
 
-    with Lock(LOCK_FILE):
+    Returns (account, installed credential, replaced credential). The first names
+    what a confirmation should find live; the second names what it must NOT find,
+    which is what lets a legitimate rotation during the settle still confirm.
+
+    The account is loaded INSIDE the lock. Loaded before it, the copy can already
+    have been replaced by the time it is written — every refresh mints a new
+    one-time token, so installing a snapshot hands the session a token the server
+    has retired, which is a dead spare at the worst possible moment."""
+    with Lock(LOCK_FILE, timeout=lock_timeout):
+        split = store_split_now()
+        if split:
+            die(split_text(split))
+        target = account_load(name)
+        if not target:
+            die(f"no such account: {name}")
+        oauth = target.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            die(
+                f"account '{name}' has no usable credentials — run `claude` and "
+                f"sign in with /login as that account"
+            )
         blob, sources = live_read()
         if not blob:
             die("could not read the current Claude credentials")
@@ -1053,7 +1496,11 @@ def swap_to(name, force=False):
         # under a name that does not own them.
         cur = active_name()
         live_oauth = blob.get("claudeAiOauth")
-        if cur and isinstance(live_oauth, dict):
+        # One question for the backup and for the evening below: does the blob
+        # live_read() prefers hold a login at all? Banking one that does not
+        # overwrites a healthy snapshot with something ccd would refuse to install.
+        has_login = bool(cred_identity(live_oauth))
+        if cur and has_login:
             prev = account_load(cur)
             if prev:
                 prev["claudeAiOauth"] = live_oauth
@@ -1067,16 +1514,70 @@ def swap_to(name, force=False):
         # that is the whole reason live_write exists, and a stale
         # ~/.credentials.json beside a good keychain resurrects the old account.
         if cur == name:
-            if not live_write(blob, sources):
+            # No write-ahead record here: every backend is being handed what one
+            # of them already holds, so a partial failure cannot make them
+            # disagree about anything they agreed on before.
+            #
+            # And only a blob that HOLDS a login. live_read() prefers the keychain,
+            # and a keychain left with nothing but mcpOAuth would otherwise be
+            # copied over the login in the file, erasing the only credential.
+            evened, failed = True, []
+            if has_login:
+                evened, failed, _ = live_write(blob, sources)
+            else:
+                warn("the credentials Claude Code is reading hold no login — nothing "
+                     "was backed up or copied. Sign in with /login.")
+            if not evened:
                 # Not fatal: nothing was supposed to change and the credential in
                 # use is still good. But a silent failure here is how a stale
                 # fallback file survives to resurrect the previous account.
-                warn("could not reconcile the credential stores")
+                warn("could not put the credential stores back in step ("
+                     + ", ".join(failed) + ")")
         else:
             new_blob = dict(blob)
             new_blob["claudeAiOauth"] = oauth  # surgical: mcpOAuth and friends survive
-            if not live_write(new_blob, sources):
-                die("failed to write the credential store")
+            targets = write_targets(sources)
+            # Write-ahead. Between the first backend taking the new credential and
+            # the last, the stores disagree; dying in there with nothing recorded
+            # is how the next command files one account's credential under the
+            # other's name. So the intent goes down first, and a state directory
+            # that cannot hold it means no credential is written at all.
+            if not mark_store_split(
+                    f"a swap to {name} has not been seen to land on every store",
+                    targets):
+                die("cannot record what this swap is about to change ("
+                    + STORE_SPLIT + ") — refusing to touch the credential stores "
+                    "without it")
+            installed, failed, written = live_write(new_blob, sources)
+            if not installed:
+                # Some backends took the new credential and some did not: the
+                # stores now disagree about who is signed in, and the next bank
+                # copies one half over the other. Put back what the session is
+                # still holding.
+                note = ", ".join(failed)
+                stuck = list(written)
+                if written:
+                    _, undo_failed, _ = live_write(blob, sources)
+                    # What the ROLLBACK achieved, not what the install attempted: a
+                    # backend that refused the new credential refuses the redundant
+                    # restore too, and it never moved. Recording that as a split
+                    # stops a machine that is perfectly consistent.
+                    stuck = [b for b in written if b in undo_failed]
+                    if stuck:
+                        note += "; could not restore " + ", ".join(stuck)
+                if not stuck:
+                    clear_store_split()
+                    die("failed to write the credential store (" + note + ")")
+                mark_store_split(
+                    f"{', '.join(stuck)} took {name}'s credential, "
+                    f"{', '.join(b for b in targets if b not in stuck)} kept "
+                    f"the one before it", targets)
+                die("failed to write the credential store (" + note + ")"
+                    + "\n     " + split_way_out())
+            # Every write succeeded, and that is the best knowledge there is of
+            # whose credential is live — so ownership moves now, whatever the
+            # verify below finds. Gating the pointer on a READ left B installed
+            # under a pointer saying A, and the next backup filed B under A.
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
@@ -1090,18 +1591,34 @@ def swap_to(name, force=False):
                 os.unlink(os.path.join(CCD_DIR, "quota-cache.json"))
             except OSError:
                 pass
+            # The RECORD is what waits for evidence. Two writes succeeding proves
+            # only that ccd wrote twice: Claude Code shares no lock with ccd, and a
+            # refresh of the outgoing account can land on one backend between
+            # them. So it goes away by the same rule as always — stores SEEN to
+            # agree — and otherwise stands, stopping every bank, swap and exchange
+            # until they are. This narrows that race; it does not close it (#67).
+            # Not fatal: the swap happened, and a caller told otherwise retries
+            # into a store that has already moved.
+            split = store_split_now()
+            if split:
+                warn(f"switched to {name}, but " + split_text(split))
+        # What the next confirmation has to match. Taken here, inside the lock,
+        # from the very dict that was written — not from a later read, which a
+        # rotation could already have moved on.
+        installed = _cred_fingerprint(
+            target if cur != name else {"claudeAiOauth": blob.get("claudeAiOauth")})
+        replaced = _cred_fingerprint({"claudeAiOauth": blob.get("claudeAiOauth")})
 
     if not force:
         others = claude_processes()
         if others:
-            # A live session read its entitlements once, at startup, and holds
-            # them in memory — no file we write reaches them. Saying so is what
-            # keeps the user from reading a working swap as a failed one.
+            # One credential store, so the swap reaches them as well. What that
+            # does and does not move is the same everywhere, and the caller prints
+            # it next — so this line says only what is specific to them.
             noun = "session is" if others == 1 else "sessions are"
-            warn(f"{others} other Claude Code {noun} running. The swap applies to "
-                 "them too; their model list and limits keep describing the "
-                 "previous account until they next start.")
-    return target
+            warn(f"{others} other Claude Code {noun} running — this moves them to "
+                 f"{name} too, from their next token refresh.")
+    return target, installed, replaced
 
 
 def claude_processes():
@@ -1220,17 +1737,15 @@ def cmd_list(args):
             print(f"{C_DIM}No accounts registered. Run `ccd account add`.{C_RESET}")
         return 0
 
-    cache = quota_cache()
     rows = []
     for a in accounts:
         name = a["name"]
         if name == cur:
             # Claude Code owns the live token; never refresh it from here.
-            rec, cache = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=False, cache=cache)
+            rec = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=False)
         else:
-            rec, cache = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=True, cache=cache)
+            rec = quota_for(name, a, ttl=CANDIDATE_TTL, allow_refresh=True)
         rows.append((a, rec))
-    quota_cache_save(cache)
 
     if args.json:
         print(
@@ -1312,9 +1827,7 @@ def cmd_rm(args):
             os.unlink(path)
         except OSError as e:
             die(f"could not remove {path}: {e}")
-        cache = quota_cache()
-        cache.pop(name, None)
-        quota_cache_save(cache)
+        reading_drop(name)
         if active_name() == name:
             try:
                 os.unlink(ACTIVE_FILE)
@@ -1327,9 +1840,7 @@ def cmd_rm(args):
 def cmd_use(args):
     """Switch the active account. With no name, take the best spare as measured
     right now — the one place a person still had to supply a fact ccd measures
-    anyway. `--exclude` is deliberately not passed: it is the launcher's per-burst
-    ladder, not a verdict on an account, and a person asking for the best spare
-    means the best one, whether or not the ladder happened to touch it."""
+    anyway."""
     name = args.name
     if name is None:              # `use ""` stays a bad name, not a request to choose
         a, why = best_target()
@@ -1338,7 +1849,7 @@ def cmd_use(args):
                 if why == "all_exhausted"
                 else "no other account is registered — add one with `ccd account add`")
         name = a["name"]
-    target = swap_to(name, force=args.force)
+    target, _, _ = swap_to(name, force=args.force)
     if args.json:
         print(
             json.dumps(
@@ -1353,6 +1864,159 @@ def cmd_use(args):
     else:
         label = target.get("label") or target.get("subscription_type") or ""
         print(f"{C_GRN}✓{C_RESET} switched to {C_BOLD}{name}{C_RESET} {C_DIM}{label}{C_RESET}")
+        # The half that moves needs no explanation; the half that does not is the
+        # one people read as a failed swap (#12). Say it here, once, rather than
+        # leave it to be discovered from a model list that names the old plan.
+        print(f"{C_DIM}  Running sessions keep working — their requests bill to "
+              f"{name} from the next token refresh. No restart.{C_RESET}")
+        print(f"{C_DIM}  What lags: the model list and limits, Fable access and the "
+              f"/status identity keep describing the previous account until the "
+              f"next launch.{C_RESET}")
+    return 0
+
+
+def cmd_swap(args):
+    """Move this session to a spare. Internal: the quota hook.
+
+    Two phases and two outcomes. Measuring is network work, so it happens with no
+    lock held; installing is a write, so it happens under the store lock with the
+    caller's claim re-checked there — a person running `ccd account use` while we
+    measured must not have their swap overwritten by ours.
+
+    Prints `<account>TAB<installed credential>TAB<the credential it replaced>` and
+    exits 0, or prints one line saying why not and exits non-zero. Nothing about
+    that reason is evidence of anything, and nothing acts on it: whether the paid
+    hop is allowed is a separate question with its own proof (cmd_exhausted)."""
+    names = account_names()
+    if not names:
+        return _swap_no("no accounts registered")
+    deadline = time.time() + max(0.0, args.deadline)
+    try:
+        a, rec = best_target(
+            no_probe=args.no_probe, deadline=deadline,
+            exclude={n: w for n, (_when, w) in swap_guard_read().items()})
+        if a is None:
+            return _swap_no(rec)
+        # One acquisition for the whole install: the claim, the credential and the
+        # record are one change or none of them.
+        left = max(0.5, deadline - time.time())
+        with Lock(LOCK_FILE, timeout=left):
+            cur = active_name()
+            # Re-read the departures here, not from the snapshot the measurement
+            # used: another swap can record one while we measure, and the account
+            # it just left is the one account we must not install.
+            if _guard_holds(a["name"], rec,
+                            {n: w for n, (_w, w) in swap_guard_read().items()}):
+                return _swap_no("another swap had just left that account")
+            # No name for the signed-in login is a supported install, not a
+            # refusal: with one account registered, that account IS the spare
+            # (#41). There is simply nothing to compare the claim against.
+            if args.from_account and cur and args.from_account != cur:
+                return _swap_no("the store moved while this was being decided")
+            _, installed, replaced = swap_to(a["name"], force=True,
+                                             lock_timeout=left)
+            if cur:
+                swap_guard_record(cur, args.window)
+    except SystemExit:
+        # die(): the store lock stayed busy for the whole budget, or the account
+        # lost its credential between the measurement and the install.
+        return _swap_no("could not install the credential")
+    except Exception as e:
+        return _swap_no(f"{type(e).__name__}")
+    print(f"{a['name']}\t{installed}\t{replaced}")
+    return 0
+
+
+def _swap_no(reason):
+    """One line, on stderr, for the caller's breadcrumb. Exit 4 for everything:
+    the only question worth asking after a failed swap is whether every
+    subscription is measurably spent, and no exit code can answer that."""
+    print(reason, file=sys.stderr)
+    return 4
+
+
+def _still_spent(rec):
+    """Does this reading show a window that is out of room AND still open?
+
+    A window that has reset since it was read says nothing about now, however
+    recently it was read — so a window counts only while it is KNOWN to be open:
+    its reset time parses, names its timezone, and is in the future. 99% with no
+    usable reset can have reset a second later while the row stays fresh for
+    minutes; a naive time is a guess about whose clock it was. Neither is proof."""
+    for pct, reset in ((rec.get("five_hour_percent"), rec.get("five_hour_reset")),
+                       (rec.get("seven_day_percent"), rec.get("seven_day_reset"))):
+        if not window_spent(pct):
+            continue
+        try:
+            at = datetime.datetime.fromisoformat(reset.replace("Z", "+00:00"))
+        except (AttributeError, ValueError, TypeError):
+            continue
+        if at.utcoffset() is not None and at.timestamp() > time.time():
+            return True
+    return False
+
+
+def subscriptions_proved_spent():
+    """Is it PROVED that no subscription can take this session? True or False.
+
+    The one question that may authorise spending the user's money, so it is
+    answered from positive evidence and from nothing else:
+
+      - the accounts directory was read — not "listing it failed, so it is empty"
+      - every registered account file in it was read
+      - the credential stores are not under a stop
+      - EVERY registered account — the one the store is on included, no
+        exceptions — has a reading that is about its current identity, SUCCEEDED,
+        is younger than CANDIDATE_TTL (the age at which a swap stops trusting a
+        reading and measures again), and shows a window out of room that is known
+        not to have reset. No account registered at all is also proof, vacuously.
+
+    Nobody is excluded, because "the active account" is not this session's to
+    define: another session can swap the store onto an account with room while
+    this one is at the wall, and a proof that skipped whoever is active would then
+    skip exactly the account that could have taken the session.
+
+    It opens no socket, takes no lock, spends no token and writes nothing: the swap
+    attempt that comes before it has just measured every spare, the wall re-read
+    before THAT has just measured and published the account the store is on
+    (cmd_usage), and this reads what they left behind. So a timeout, a 503, a busy store, an expired deadline or a refused
+    swap cannot become a yes here — each leaves a row that is stale, failed,
+    missing, or shows room, and every one of those is a no.
+"""
+    if store_split() is not None:
+        return False
+    try:
+        entries = os.listdir(ACCOUNTS_DIR)
+    except FileNotFoundError:
+        entries = []        # the kernel's own answer: a store that was never created
+    # ...and any OTHER failure raises, rather than reading as an empty store.
+    names = sorted(e[:-5] for e in entries
+                   if e.endswith(".json") and not e.startswith(".") and valid_name(e[:-5]))
+    accounts = {n: account_load(n) for n in names}
+    if any(a is None for a in accounts.values()):
+        return False
+    for name, acct in accounts.items():
+        rec = reading_load(name)
+        if not _cache_row_valid(rec, acct) or rec.get("status") != "ok":
+            return False
+        if not reading_fresh(rec, CANDIDATE_TTL):
+            return False
+        if not _still_spent(rec):
+            return False
+    return True
+
+
+# The proof, as the hook reads it: this exact word on stdout AND exit 0. Printed in
+# one place, as the last thing cmd_exhausted does — so a die(), a SystemExit, an
+# uncaught exception or a bare non-zero exit is structurally unable to produce it.
+EXHAUSTED_PROOF = "every-subscription-measured-spent"
+
+
+def cmd_exhausted(args):
+    """Internal: the quota hook. See subscriptions_proved_spent()."""
+    if subscriptions_proved_spent() is not True:
+        return 1
+    print(EXHAUSTED_PROOF)
     return 0
 
 
@@ -1376,13 +2040,17 @@ def cmd_refresh(args):
         acct = account_load(name)
         if not acct:
             continue
-        with Lock(LOCK_FILE):
-            ok, why = account_refresh(name, acct)
+        ok, why = account_refresh(name, acct)
         if ok:
             print(f"{C_GRN}✓{C_RESET} {name}")
         else:
             rc = 1
-            hint = "needs re-login" if why == "dead" else "unreachable"
+            hint = {"dead": "needs re-login",
+                    "busy": "the store was busy — try again",
+                    "gone": "no longer registered",
+                    "stale": "signed in here — Claude Code renews it",
+                    "unsure": "cannot see the live credential — not spending it"
+                    }.get(why, "unreachable")
             print(f"{C_RED}✗{C_RESET} {name} — {hint}")
     # A clean sweep of every spare is a repair, and the backoff keepalive computes
     # from the failure count no longer describes anything. Only here: writing this
@@ -1396,49 +2064,86 @@ def cmd_refresh(args):
     return rc
 
 
-def best_target(exclude="", no_probe=False):
+def _window_key(rec):
+    """The reset timestamps a reading names, in the shape the guard records."""
+    return ";".join(
+        f"{label}={rec.get(key)}"
+        for label, key in (("5h", "five_hour_reset"), ("7d", "seven_day_reset"))
+        if isinstance(rec.get(key), str) and rec.get(key)
+    )
+
+
+def _guard_holds(name, rec, exclude):
+    """Is this account still the one a swap just left?
+
+    Only a window both sides can name can say the situation has changed. When the
+    record says `none`, or the candidate's own reading names no window, we cannot
+    tell — and cannot tell is not permission to go back."""
+    recorded = (exclude or {}).get(name)
+    if recorded is None:
+        return False
+    if not recorded or recorded == "none":
+        return True
+    theirs = _window_key(rec)
+    if not theirs:
+        return True
+    # Same windows, or nothing to compare. Half an answer — one window named
+    # where the record names two — cannot say a reset happened, and guessing
+    # that it did is how a loop guard stops guarding.
+    mine = dict(p.split("=", 1) for p in recorded.split(";") if "=" in p)
+    yours = dict(p.split("=", 1) for p in theirs.split(";") if "=" in p)
+    if set(mine) != set(yours):
+        return True
+    return mine == yours
+
+
+def best_target(no_probe=False, exclude=None, deadline=None):
     """(account, reading) for the best place to hand off, or (None, reason).
 
-    One selection rule for every caller — the hook, the launcher, and a person
+    One selection rule for every caller — the hook, the statusline, and a person
     typing `ccd account use` — so they can differ only in what they pass in.
 
-    `exclude` carries the launcher's per-burst visited set (docs §5.2), which is
-    what keeps the ladder finite without hardcoding a hop count."""
-    excluded = {
-        x.strip() for x in (exclude or "").replace(",", " ").split() if x.strip()
-    }
-    cur = active_name()
-    if cur:
-        excluded.add(cur)
+    `exclude` is {name: window} for the accounts a swap has just left
+    (swap_guard_read). A name alone is not enough to keep one out: the record says
+    which windows it was written in, and an account whose own reading now names
+    different resets has had a reset since — a new situation, and a destination
+    again. On a two-account install that difference is the whole escape.
 
-    candidates = [a for a in accounts_all() if a["name"] not in excluded]
+    `deadline` is a wall-clock instant past which no candidate is worth a network
+    probe: this runs inside a hook that is killed on its timeout, and one usable
+    spare behind nine expired ones can spend the whole budget before the swap even
+    starts. Past it the rest are judged on cache alone, which costs nothing and
+    can still say yes. It bounds each request too (NET_DEADLINE), because urllib
+    bounds socket operations rather than requests."""
+    global NET_DEADLINE
+    cur = active_name()
+    candidates = [a for a in accounts_all() if a["name"] != cur]
     if not candidates:
         return None, "no_candidate"
 
-    cache = quota_cache()
     scored = []
-    for a in candidates:
-        if no_probe:
-            # Cached-only mode for latency-sensitive callers (the prompt hook).
-            # Never opens a socket: a stale answer that costs nothing beats a
-            # fresh one that freezes the user's prompt for seconds.
-            rec = cache.get(a["name"])
-            # The identity check earns its place most here: this path hands off
-            # on a cached `ok` without opening a socket, so a row left behind by
-            # a name that now points at another account would spend that
-            # account's quota.
-            if not _cache_row_valid(rec, a) or rec.get("status") != "ok":
-                continue
-            ts = rec.get("checked_at")
-            if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
-                continue
-        else:
-            rec, cache = quota_for(a["name"], a, cache=cache)
-        if has_headroom(rec):
-            scored.append((a.get("priority", 999), worst(rec), a, rec))
-    if not no_probe:
-        quota_cache_save(cache)
-
+    outer, NET_DEADLINE = NET_DEADLINE, deadline
+    try:
+        for a in candidates:
+            if no_probe or (deadline is not None and time.time() >= deadline):
+                # Cached-only mode for latency-sensitive callers (the prompt hook).
+                # Never opens a socket: a stale answer that costs nothing beats a
+                # fresh one that freezes the user's prompt for seconds.
+                rec = reading_load(a["name"])
+                # The identity check earns its place most here: this path hands off
+                # on a cached `ok` without opening a socket, so a row left behind by
+                # a name that now points at another account would spend that
+                # account's quota.
+                if not _cache_row_valid(rec, a) or rec.get("status") != "ok":
+                    continue
+                if not reading_fresh(rec, CANDIDATE_TTL * 2):
+                    continue
+            else:
+                rec = quota_for(a["name"], a)
+            if has_headroom(rec) and not _guard_holds(a["name"], rec, exclude):
+                scored.append((a.get("priority", 999), worst(rec), a, rec))
+    finally:
+        NET_DEADLINE = outer
     if not scored:
         return None, "all_exhausted"
 
@@ -1449,7 +2154,7 @@ def best_target(exclude="", no_probe=False):
 
 def cmd_pick(args):
     """Print where a handoff would go. Exit 0 with a pick, 1 without."""
-    a, rec = best_target(args.exclude, args.no_probe)
+    a, rec = best_target(args.no_probe)
     if a is None:
         if args.json:
             print(json.dumps({"account": None, "reason": rec}))
@@ -1508,11 +2213,20 @@ def cmd_keepalive(args):
     # keeps its own bound (there is nothing to keep alive without a spare to keep).
     if not account_names():
         return 0
+    global NET_DEADLINE
     try:
         with Lock(REFRESH_LOCK, wait=False):
-            stale = keepalive_pass(args.force)
-            if args.pick:
-                best_target(args.exclude, False)
+            # Nothing waits on this pass, but a swap waits on the lock it holds.
+            # An endpoint that answers slowly enough would starve every swap on
+            # the machine; an unfinished pass costs nothing and is retried next
+            # tick.
+            outer, NET_DEADLINE = NET_DEADLINE, time.time() + KEEPALIVE_BUDGET
+            try:
+                stale = keepalive_pass(args.force)
+                if args.pick:
+                    best_target(False, deadline=NET_DEADLINE)
+            finally:
+                NET_DEADLINE = outer
     except LockBusy:
         return 0
     if stale and args.report:
@@ -1665,10 +2379,23 @@ def cmd_usage(args):
     This is what lets the quota hook work with no dashboard installed, and it
     answers for a login nobody registered as an account. The live token belongs
     to Claude Code, so this never refreshes it: an expiring one reports nothing
-    rather than rotating a credential another process owns."""
+    rather than rotating a credential another process owns. There is no refresh
+    path in here at all, which is what lets the wall use it.
+
+    A reading that succeeds is ALSO published as that account's own reading, when
+    the token measured is provably the registered account's: the proof that may
+    authorise paying reads readings/, and what the wall has just seen must be
+    what it sees — not a 99% from thirty seconds ago speaking for an account that
+    has just been measured at 100."""
+    global NET_DEADLINE
+    if args.deadline is not None:
+        NET_DEADLINE = time.time() + max(0.0, args.deadline)
     blob, _ = live_read()
     oauth = blob.get("claudeAiOauth") or {}
     token = oauth.get("accessToken") or ""
+    # Whose credential this is, asked BEFORE the measurement. Asked after, a swap
+    # landing mid-request would put somebody else's name on these numbers.
+    measured = active_name()
     claude = {"available": False, "error": True}
     rc = 1
     if token and not token_expired(oauth):
@@ -1689,8 +2416,24 @@ def cmd_usage(args):
                     "sevenDayReset": sdr,
                 }
                 rc = 0
+                # Identity-bound: only when the token just measured IS the one on
+                # file for the account named. The prologue has banked the live
+                # credential where it could prove ownership; where it could not,
+                # these numbers are about a login ccd cannot name, and are not
+                # filed under anybody's.
+                acct = account_load(measured) if measured else None
+                if acct and _cred_fingerprint(acct) == _cred_fingerprint({"claudeAiOauth": oauth}):
+                    reading_save(measured, {
+                        "status": "ok", "checked_at": now(),
+                        "cred": _cred_fingerprint(acct), "uuid": acct.get("account_uuid"),
+                        "five_hour_percent": fh, "seven_day_percent": sd,
+                        "five_hour_reset": fhr, "seven_day_reset": sdr})
     if args.json:
-        print(json.dumps({"claude": claude}, ensure_ascii=False))
+        # Whose reading this is. A decision taken on it is only about that
+        # account, and between taking one and acting on it another session can
+        # swap — at which point the numbers describe somebody else entirely.
+        print(json.dumps({"claude": claude, "account": measured},
+                         ensure_ascii=False))
     else:
         parts = [
             f"{lab} {claude[k]}%"
@@ -1708,12 +2451,21 @@ def cmd_current(args):
     acct = account_load(cur) if cur else None
     total = len(account_names())
     on_fallback = bool(os.environ.get("CCD_ACTIVE"))
+    # The identity of the credential Claude Code will actually read. A plan is not
+    # an account — two accounts on one plan agree about every plan field there is,
+    # so only the credential itself can confirm that a swap landed.
+    live_oauth = (live_read()[0].get("claudeAiOauth") or {})
     info = {
         "backbone": "openrouter" if on_fallback else "subscription",
         "account": cur,
         "label": (acct or {}).get("label", "") or "",
         "subscription_type": (acct or {}).get("subscription_type"),
         "registered": total,
+        "live": {"cred": _cred_fingerprint({"claudeAiOauth": live_oauth})},
+        # What the store holds for that same account. A confirmation needs both:
+        # the credential it installed, and the one a rotation ccd recorded since
+        # — anything else live is nobody's in particular.
+        "stored_cred": _cred_fingerprint(acct),
     }
     if args.json:
         print(json.dumps(info, ensure_ascii=False))
@@ -1761,7 +2513,6 @@ def main(argv):
     a.set_defaults(fn=cmd_refresh)
 
     a = sub.add_parser("pick", help="choose the best handoff target")
-    a.add_argument("--exclude", default="")
     a.add_argument("--json", action="store_true")
     a.add_argument(
         "--no-probe",
@@ -1770,16 +2521,30 @@ def main(argv):
     )
     a.set_defaults(fn=cmd_pick)
 
+    a = sub.add_parser("swap", help="pick a spare and install it in one transaction (internal)")
+    a.add_argument("--from", dest="from_account", default="",
+                   help="the account the caller measured; refuse if we are elsewhere")
+    a.add_argument("--window", default="", help="the reset windows the reading named")
+    a.add_argument("--no-probe", action="store_true")
+    a.add_argument("--deadline", type=float, default=60.0,
+                   help="seconds this decision may spend, lock wait included")
+    a.set_defaults(fn=cmd_swap)
+
+    a = sub.add_parser("exhausted",
+                       help="is it proved that no subscription can take the session? (internal)")
+    a.set_defaults(fn=cmd_exhausted)
+
     a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
     a.add_argument("--force", action="store_true")
     a.add_argument("--report", action="store_true")
     a.add_argument("--pick", action="store_true", help="then re-measure the spares")
-    a.add_argument("--exclude", default="")
     a.add_argument("--detach", action="store_true", help="run out of the caller's process group")
     a.set_defaults(fn=cmd_keepalive)
 
     a = sub.add_parser("usage", help="live quota for the signed-in login (internal)")
     a.add_argument("--json", action="store_true")
+    a.add_argument("--deadline", type=float, default=None,
+                   help="seconds this measurement may spend")
     a.set_defaults(fn=cmd_usage)
 
     a = sub.add_parser("current", help="active backbone and account (internal)")
@@ -1793,6 +2558,10 @@ def main(argv):
     if not getattr(args, "fn", None):
         p.print_help()
         return 0
+    # A question, asked before anything below can act: no directory made, no
+    # credential banked, no pointer repaired. The proof reads and answers.
+    if args.fn is cmd_exhausted:
+        return cmd_exhausted(args)
     ensure_dirs()
     # Make the store true before anything reads it. Without this every command
     # below reasons about a snapshot that may have gone dead days ago.

@@ -32,7 +32,9 @@ CCD=$([ -x "$HOME/.local/bin/ccd" ] && echo "$HOME/.local/bin/ccd" \
 ## Claude accounts — the spare subscriptions
 
 With two or more registered, quota exhaustion moves the conversation to a spare
-subscription and only reaches OpenRouter when every one is spent.
+subscription — in place, inside the running session — and only reaches OpenRouter
+when every one is measured spent, a key is stored, and the user opted in. Only that last hop needs the launcher `ccd setup --auto`
+installs; the hop between subscriptions needs nothing installed.
 
 | They want | You run |
 |---|---|
@@ -48,14 +50,18 @@ user runs `claude`, signs in with `/login` as the other account, and then you ru
 belongs in the preparation phase — `/ccd` walks the whole preparation checklist
 and is the better skill when nothing is set up yet.
 
-**Switching does not move the session you are in.** `account use` rewrites the
-credential store, and a running Claude Code keeps serving from the tokens it
-already holds until it next refreshes them. Even after that refresh moves the
-billing, the models and limits that session offers are still the ones it started
-with — it read those once, at startup. `ccd account use` says so itself when it
-finds other sessions running. For the switch to carry this conversation, the user
-does `/exit` then `claude --resume` in the same terminal; the swap has already
-cleared what the new session needs to re-read, so one restart is enough.
+**Switching carries the session you are in — no restart.** `account use` rewrites
+the credential store, and Claude Code reads that store per request, so the running
+session keeps going on the new account. `!ccd account use` from inside a session
+is the whole procedure; never send anyone to `/exit` for it. Quota exhaustion does
+the same thing by itself, in place, when a spare has room.
+
+**What a swap does not move.** The credential, the billing and both rate-limit
+windows move immediately. The model list, Fable access and the `/status` identity
+were read once at startup and keep describing the previous account until that
+session is next launched (#12). Say this when someone switches — a model list
+naming the old plan is the one thing people read as a failed swap. Nothing needs
+restarting to fix it; the next launch picks it up.
 
 **An account reporting `needs re-login`** means ccd's stored copy of its refresh
 token is dead, not that the account is. The fix is one step: run `claude` and
@@ -109,16 +115,18 @@ with a bare slug in the sonnet slot.
 `ccd` status does not name the account; that comes from `account list` (or
 `account current`). Do not promise one command for both.
 
-**Turning the automatic handoff on** is `$CCD setup` — the hop between registered
-subscriptions is the default, not a flag. It may need to add one line to a startup
-file so the shim leads `PATH`, and it asks before touching a dotfile, reaching
-`/dev/tty` when stdin is a pipe. Get the user's agreement in the conversation first,
-then run `$CCD setup --yes` so it does not stop on a prompt they cannot see.
-`$CCD setup --no-auto` turns it back off.
+**The hop between registered subscriptions needs nothing switched on.** It happens
+inside the running session, so a plain `$CCD setup` installs no launcher and edits
+no startup file for it — registering a second account is the whole setup.
 
-`--auto` is a different question: it grants consent for the paid OpenRouter hop when
-every subscription is spent. Never add it to fix a PATH line, and never add it
-without asking about the billing.
+`--auto` is the paid question, and it is the only thing that installs a launcher:
+it grants consent for the OpenRouter hop when every subscription is spent (a key
+must be stored too; a swap that merely failed never pays), and
+installs the shim that carries a session there and back. It may need one line in a
+startup file so that shim leads `PATH`, and it asks before touching a dotfile,
+reaching `/dev/tty` when stdin is a pipe. Get the user's agreement about the
+billing in the conversation first, then run `$CCD setup --auto --yes` so it does
+not stop on a prompt they cannot see. `$CCD setup --no-auto` takes both back out.
 
 The switch onto OpenRouter and back is the user's to type, because each command
 replaces itself with `claude`:
@@ -137,8 +145,8 @@ replaces itself with `claude`:
 3. **`/model`** — an in-session slash command.
 
 Everything else on this page you run for them. `setup --auto` is the one command
-that needs their word before you run it, not their hands: agree on the dotfile
-edit in the conversation, then pass `--yes`.
+that needs their word before you run it, not their hands: agree on the billing and
+the dotfile edit in the conversation, then pass `--yes`.
 
 ## Never
 

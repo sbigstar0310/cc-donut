@@ -152,38 +152,54 @@ claude          # 새 터미널에서. /status 로 로그인 계정 확인
 
 ## Stage 5 — 전환 판단 로직 (드라이런, 세션 영향 없음)
 
-"쿼타가 죽으면 B로 갈까, OpenRouter로 갈까"를 실제로 소진시키지 않고 확인한다. 쿼타 캐시를 직접 심으면 된다.
+"쿼타가 죽으면 B로 갈까"(선택)와 "과금해도 된다는 것이 증명됐나"(증명)를 실제로 소진시키지 않고 확인한다. 둘은 **다른 질문**이다 — `pick` 이 아무것도 못 고른 것은 과금의 근거가 아니다. 쿼타 캐시를 직접 심으면 된다.
 
 ```sh
-Q=~/.claude/ccd/accounts-quota.json
-cp $Q $Q.bak 2>/dev/null || true
+Q=~/.claude/ccd/readings                     # 계정마다 파일 하나: $Q/<이름>.json
+rm -rf $Q.bak; cp -R $Q $Q.bak 2>/dev/null || true
 A=$(./bin/ccd-account current)
 B=$(ls ~/.claude/ccd/accounts/*.json | xargs -n1 basename | sed 's/.json//' | grep -v "^$A$" | head -1)
 
-seed() { python3 -c "
-import json,time,sys
-now=int(time.time())
-json.dump({sys.argv[1]:{'status':'ok','checked_at':now,'five_hour_percent':int(sys.argv[3]),'seven_day_percent':int(sys.argv[4])},
-           sys.argv[2]:{'status':'ok','checked_at':now,'five_hour_percent':int(sys.argv[5]),'seven_day_percent':int(sys.argv[6])}},
-          open('$Q','w'))" "$A" "$B" "$@"; }
+# 행에는 신원(uuid, cred)과 **시간대가 있는 미래의 리셋 시각**이 있어야 한다. 신원이 없으면
+# 진짜 코드는 그 행을 버리고 네트워크로 다시 측정하고, 리셋 시각이 없으면 증명이 되지 못한다.
+seed() { python3 - "$Q" "$A" "$B" "$@" <<'PY'
+import datetime, hashlib, json, os, sys, time
+q, names, pct = sys.argv[1], sys.argv[2:4], list(map(int, sys.argv[4:8]))
+ahead = lambda h: (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=h)).isoformat()
+os.makedirs(q, mode=0o700, exist_ok=True)
+for i, n in enumerate(names):
+    a = json.load(open(os.path.expanduser(f"~/.claude/ccd/accounts/{n}.json")))
+    at = (a.get("claudeAiOauth") or {}).get("accessToken") or ""
+    cred = hashlib.sha256(at.encode()).hexdigest()[:16] if at else ""   # = _cred_fingerprint
+    row = {"status": "ok", "checked_at": int(time.time()), "uuid": a.get("account_uuid"), "cred": cred,
+               "five_hour_percent": pct[2*i], "seven_day_percent": pct[2*i+1],
+               "five_hour_reset": ahead(2), "seven_day_reset": ahead(72)}
+    json.dump(row, open(os.path.join(q, n + ".json"), "w"))
+PY
+}
 
-# A 소진, B 여유 → B로 가야 한다
-seed 99 99 10 20 && ./bin/ccd-account pick --json
+# "소진" 은 100% 다. A 소진, B 여유 → B로 가야 한다
+seed 100 100 10 20 && ./bin/ccd-account pick --json
 #   기대: {"account":"<B>", ..., "reason":"headroom"}
 
-# 둘 다 소진 → OpenRouter (rc=1)
-seed 99 99 99 99 && ./bin/ccd-account pick --json; echo "rc=$?"
+# 둘 다 소진 → 선택은 "갈 곳 없음" (rc=1). 이것만으로는 과금하지 않는다.
+seed 100 100 100 100 && ./bin/ccd-account pick --json; echo "rc=$?"
 #   기대: {"account":null,"reason":"all_exhausted"}  rc=1
+# 과금의 근거는 따로 묻는다: 등록된 **모든** 계정(지금 쓰는 계정 포함)이 방금 측정돼 바닥.
+./bin/ccd-account exhausted; echo "rc=$?"
+#   기대: every-subscription-measured-spent  rc=0
+# 한 계정이라도 여유가 있거나, 행이 낡았거나, 리셋 시각이 없으면 증명이 아니다.
+seed 10 20 100 100 && ./bin/ccd-account exhausted; echo "rc=$?"
+#   기대: (출력 없음)  rc=1   — 지금 쓰는 계정 A 에 여유가 있다
 
-# B의 5h는 비었지만 7일이 꽉참 → 가면 안 된다 (몇 분 뒤 또 죽으므로)
-seed 99 99 5 99 && ./bin/ccd-account pick --json; echo "rc=$?"
+# B의 5h는 비었지만 7일이 100% → 가면 안 된다 (창 하나라도 바닥이면 그 계정은 바닥이다)
+seed 100 100 5 100 && ./bin/ccd-account pick --json; echo "rc=$?"
 #   기대: all_exhausted, rc=1
+# B가 99% 면 아직 목적지다. 예비분은 없다.
+seed 100 100 99 99 && ./bin/ccd-account pick --json
+#   기대: {"account":"<B>", ...}
 
-# 런처의 방문 집합이 전달되는 경로
-seed 99 99 10 20 && ./bin/ccd-account pick --exclude "$B" --json; echo "rc=$?"
-#   기대: no_candidate, rc=1
-
-mv $Q.bak $Q 2>/dev/null || rm -f $Q          # 캐시 원복
+rm -rf $Q; mv $Q.bak $Q 2>/dev/null || true    # 측정값 원복
 ```
 
 ---
@@ -210,11 +226,47 @@ echo '{"model":{"id":"claude-opus-5"},"workspace":{"current_dir":"/tmp"}}' | ./b
 
 ---
 
-## Stage 7 — 진짜 end-to-end 핸드오프 (선택, 가장 확실함)
+## Stage 7 — 진짜 end-to-end 계정 스왑 (선택, 가장 확실함)
 
-실제 런처가 세션을 끝내고 → 계정을 갈아끼우고 → **같은 대화를 복원**하는 전 과정.
+세션을 끝내지 않고 **살아 있는 그 세션이** 계정을 갈아끼우는 전 과정. 런처도, 신호도,
+relaunch 도 없다 (#57).
 
-쿼타를 실제로 소진시킬 수 없으므로, 런처가 감시하는 상태 파일을 직접 무장시킨다. 스모크 테스트가 하는 것과 동일한 경로다.
+쿼타를 실제로 소진시킬 수 없으므로, 훅이 읽는 쿼타 캐시를 직접 소진 상태로 만든다.
+스모크 테스트 §29 가 하는 것과 동일한 경로다.
+
+평소처럼 `claude` 로 세션을 하나 띄우고, 아무 대화나 한 번 주고받는다. 그 다음 **같은
+세션 안에서** `!` 를 붙여 실행한다 (한 줄 유지 — `!` 는 `eval` 을 거친다):
+
+```
+!python3 -c "import json,os;p=os.path.expanduser('~/.claude/ccd/quota-cache.json');json.dump({'claude':{'available':True,'error':False,'fiveHourPercent':58,'fiveHourReset':'R1','sevenDayPercent':100,'sevenDayReset':'D1'}},open(p,'w'))" && rm -f ~/.claude/ccd/swapped-windows
+```
+
+그리고 아무 프롬프트나 하나 더 보낸다. 다음 틱에서 훅이 스왑하고 한 줄로 알린다:
+
+```
+[ccd] ✓ 쿼타가 바닥나기 전에 <TARGET> 계정으로 갈아탔습니다 — 무과금, 대화 그대로 이어집니다
+```
+
+세션은 그대로 살아 있다. `./bin/ccd-account current` 로 계정이 바뀌었는지 확인한다.
+`/status` 와 모델 목록은 **다음 실행 전까지 이전 계정을 가리킨다** — 정상이고, 그게
+`ccd account use` 출력이 미리 말해주는 내용이다 (#12).
+
+> 스왑이 **떠나온** 계정은 `swapped-windows` 에 기록되고, 그 기록이 살아 있는 동안
+> (`CCD_SWAP_GUARD_TTL`, 기본 30분) 다음 목적지 후보에서 빠진다. 떠나는 것 자체는 막지
+> 않으므로 소진된 계정에 갇히지 않는다. 기록은 그때의 리셋 창을 같이 들고 있어서, 그
+> 계정의 **자기 측정값**(`readings/<이름>.json` 의 `five_hour_reset`/`seven_day_reset`)이
+> 다른 창을 가리키면 새 상황으로 보고 다시 후보가 된다.
+>
+> 그래서 다시 해보려면 위 명령의 `swapped-windows` 삭제를 반드시 포함한다 — 훅이 읽는
+> `quota-cache.json` 의 `sevenDayReset` 만 바꾸는 것으로는 풀리지 않는다 (기록과 대조하는
+> 것은 후보 계정 자신의 측정값이다).
+
+---
+
+## Stage 7b — 유료 홉 (OpenRouter) end-to-end (선택)
+
+런처가 세션을 끝내고 → OpenRouter 로 relaunch 하고 → **같은 대화를 복원**하는 과정.
+`ccd setup --auto` 로 설치되는 런처와 OpenRouter 키가 있어야 한다.
 
 터미널 하나만 쓴다. 신호는 **세션이 자기 자신에게** 보내므로 다른 프로세스를 맞힐
 길이 없다 — Claude Code 가 `CLAUDE_PID` 를 자식에게 내려주기 때문이다.
@@ -229,10 +281,10 @@ CCD_HANDOFF_TOKEN=00000000000000000000000000000001 ./bin/ccd-handoff
 Claude Code가 뜨면 **아무 대화나 한 번 주고받는다** (복원할 내용이 있어야 하므로).
 
 그 다음, **같은 세션 안에서** 프롬프트에 `!` 를 붙여 실행한다. 세션 ID 도 환경변수로
-들어오므로 따로 옮겨 적을 필요가 없다. `<옮겨갈 계정 이름>` 만 바꾼다:
+들어오므로 따로 옮겨 적을 필요가 없다:
 
 ```
-!python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_account','account':sys.argv[1],'session_id':sys.argv[2],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" <옮겨갈 계정 이름> "$CLAUDE_CODE_SESSION_ID" && ps -p $CLAUDE_PID -o pid=,comm= && kill -HUP $CLAUDE_PID
+!python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_fallback','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$CLAUDE_CODE_SESSION_ID" && ps -p $CLAUDE_PID -o pid=,comm= && kill -HUP $CLAUDE_PID
 ```
 
 `ps` 가 `<pid> claude` 한 줄만 찍고 나서 신호가 간다. 다른 창은 건드릴 수 없다.
@@ -276,10 +328,9 @@ Claude Code가 뜨면 **아무 대화나 한 번 주고받는다** (복원할 �
 
 ```sh
 SID=<터미널1의 session id>
-TARGET=<옮겨갈 계정 이름>
 PID=<터미널1에서 확인한 CLAUDE_PID>
 
-python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_account','account':sys.argv[1],'session_id':sys.argv[2],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$TARGET" "$SID"
+python3 -c "import json,os,sys;p=os.path.expanduser('~/.claude/ccd/handoff-00000000000000000000000000000001.json');json.dump({'armed':True,'token':'0'*31+'1','direction':'to_fallback','session_id':sys.argv[1],'cwd':os.getcwd()},open(p,'w'));os.chmod(p,0o600)" "$SID"
 
 # 보내기 전에 확인 — comm 이 정확히 'claude' 인 프로세스 하나여야 한다
 ps -p "$PID" -o pid=,tty=,comm=
@@ -300,15 +351,15 @@ ps -t "$TTY1" -o pid=,comm= | awk '$2=="claude"{print $1}'
 터미널 1에서 기대하는 동작:
 
 ```
-[ccd] ✓ <TARGET> 계정으로 갈아탑니다 — 구독 그대로, 대화 그대로 이어집니다
+[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다
 
-▶ ✓ 쿼타 소진 — <TARGET> 계정으로 같은 대화를 이어갑니다 (구독, 무과금)
+▶ 🍩 Claude 쿼타 소진 — 같은 대화를 OpenRouter에서 이어갑니다 (유료)
 ```
 
-그리고 **직전 대화가 그대로 복원된 채** 새 세션이 뜬다. `/status`로 계정이 바뀌었는지 확인.
+그리고 **직전 대화가 그대로 복원된 채** 새 세션이 OpenRouter 위에서 뜬다.
 
-터미널 1 이 통째로 죽으면 런처도 같이 끌려가므로 스왑은 **일어나지 않는다.** 그때는
-`./bin/ccd-account current` 가 그대로일 뿐 저장소는 멀쩡하니, 다시 하면 된다.
+터미널 1 이 통째로 죽으면 런처도 같이 끌려가므로 relaunch 는 **일어나지 않는다.** 그때는
+상태 파일만 남으니 지우고 다시 하면 된다.
 
 ---
 
@@ -321,11 +372,11 @@ ps -t "$TTY1" -o pid=,comm= | awk '$2=="claude"{print $1}'
 # 백업 파일 제거 (refresh token 평문)
 rm -P ~/claude-creds-backup.json
 
-# 쿼타 캐시
-rm -f ~/.claude/ccd/accounts-quota.json
+# 측정값
+rm -rf ~/.claude/ccd/readings
 ```
 
-`ccd setup --auto`는 이 문서에서 한 번도 실행하지 않았으므로 PATH와 shim은 건드려지지 않았다. 실제로 자동 핸드오프까지 켜보려면 그때 실행하고, 되돌릴 때는 `ccd setup --no-auto`.
+`ccd setup --auto`는 Stage 7b 를 하지 않는 한 실행되지 않으므로 PATH와 shim은 건드려지지 않는다. 계정 간 스왑(Stage 7)에는 필요 없다. 되돌릴 때는 `ccd setup --no-auto`.
 
 ---
 
@@ -335,6 +386,6 @@ rm -f ~/.claude/ccd/accounts-quota.json
 | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `add`가 이름을 자동으로 못 지음     | `python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['oauthAccount'].keys())"` — `accountUuid`/`emailAddress`가 있는지 |
 | `/login` 후에도 `current`가 안 바뀜 | 같은 명령으로 `profileFetchedAt` 확인. 스왑 시각(`~/.claude/ccd/accounts/.active-at`)보다 커야 identity가 채택된다                                        |
-| `pick`이 계속 `all_exhausted`       | `cat ~/.claude/ccd/accounts-quota.json` — `status`가 `dead`면 재로그인 필요, `error`면 네트워크                                                           |
+| `pick`이 계속 `all_exhausted`       | `cat ~/.claude/ccd/readings/*.json` — `status`가 `dead`면 재로그인 필요, `error`면 네트워크                                                           |
 | 스왑 후 MCP 로그아웃                | surgical merge 실패. Stage 4의 python 스니펫 출력을 남길 것                                                                                               |
 | 계정이 `needs re-login`             | `claude` → `/login` 만 하면 끝. 다음 `ccd account` 명령이 라이브 토큰을 그 계정 파일로 복사한다(§12.0 배킹). `add --force` 는 필요 없다                   |
