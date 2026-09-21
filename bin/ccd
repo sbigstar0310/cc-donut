@@ -1204,7 +1204,7 @@ CCD_CLAUDE_SHIM
       # on PATH. Ask before editing a startup file: running setup is consent to
       # install the feature, not blanket consent to rewrite the user's dotfiles.
       if shim_leads_path; then
-        printf '✓ already first on PATH — `claude` can hand off to OpenRouter when every subscription is spent\n'
+        printf '✓ already first on PATH — a `ccd -c` run started from `claude` can return by itself\n'
       else
         local rc reply="" do_edit=0
         if rc=$(rc_file) && ! path_line_present "$rc"; then

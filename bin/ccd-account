@@ -451,7 +451,7 @@ def store_split():
     return {"detail": "the record of it cannot be read"}
 
 
-def store_split_now(expect=None):
+def store_split_now():
     """The stop, re-tested against the stores. Call it holding the store lock.
 
     It lifts on positive evidence and on nothing else: every store the record
@@ -461,9 +461,6 @@ def store_split_now(expect=None):
     agreement, and each lifted a stop on a store nobody had seen agree. A backend
     that really is gone for good has an explicit exit instead (split_way_out).
     A record that names no stores has nothing that could answer, so it stands.
-
-    `expect` adds one condition for the caller that has just written: the one
-    identity in sight must be the one it installed.
 
     The lock is what makes the test honest. A writer that has recorded its intent
     but not yet touched a backend leaves the stores agreeing, and lifting the stop
@@ -478,7 +475,7 @@ def store_split_now(expect=None):
     held, blind = live_creds()
     ids = {cred_identity(held.get(n)) for n in named}
     ids |= {cred_identity(o) for o in held.values()}
-    if blind or None in ids or len(ids) != 1 or (expect and ids != {expect}):
+    if blind or None in ids or len(ids) != 1:
         return rec
     clear_store_split()
     return None
@@ -518,10 +515,10 @@ def _tilde(path):
     return "~" + path[len(home):] if path.startswith(home + os.sep) else path
 
 
-def die_split(rec):
-    die("the credential stores disagree with each other ("
-        + str(rec.get("detail") or "unknown") + ")."
-        "\n     " + split_way_out())
+def split_text(rec):
+    return ("the credential stores disagree with each other ("
+            + str(rec.get("detail") or "unknown") + ")."
+            "\n     " + split_way_out())
 
 
 def clear_store_split():
@@ -1386,7 +1383,7 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     with Lock(LOCK_FILE, timeout=lock_timeout):
         split = store_split_now()
         if split:
-            die_split(split)
+            die(split_text(split))
         target = account_load(name)
         if not target:
             die(f"no such account: {name}")
@@ -1459,7 +1456,7 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
             # other's name. So the intent goes down first, and a state directory
             # that cannot hold it means no credential is written at all.
             if not mark_store_split(
-                    f"a swap to {name} was interrupted before every store agreed",
+                    f"a swap to {name} has not been seen to land on every store",
                     targets):
                 die("cannot record what this swap is about to change ("
                     + STORE_SPLIT + ") — refusing to touch the credential stores "
@@ -1490,17 +1487,10 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
                     f"the one before it", targets)
                 die("failed to write the credential store (" + note + ")"
                     + "\n     " + split_way_out())
-            # Both writes succeeding proves only that ccd wrote twice. Claude Code
-            # shares no lock with ccd, and a refresh of the outgoing account can
-            # land on one backend between them — so the record goes away by the
-            # same rule as always, on stores SEEN to agree, and on the credential
-            # just installed. This narrows that race; it does not close it.
-            split = store_split_now(cred_identity(oauth))
-            if split:
-                detail = (f"every store took {name}'s credential, but they are "
-                          f"not all seen holding it now")
-                mark_store_split(detail, targets)
-                die_split({"detail": detail})
+            # Every write succeeded, and that is the best knowledge there is of
+            # whose credential is live — so ownership moves now, whatever the
+            # verify below finds. Gating the pointer on a READ left B installed
+            # under a pointer saying A, and the next backup filed B under A.
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.
@@ -1514,6 +1504,17 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
                 os.unlink(os.path.join(CCD_DIR, "quota-cache.json"))
             except OSError:
                 pass
+            # The RECORD is what waits for evidence. Two writes succeeding proves
+            # only that ccd wrote twice: Claude Code shares no lock with ccd, and a
+            # refresh of the outgoing account can land on one backend between
+            # them. So it goes away by the same rule as always — stores SEEN to
+            # agree — and otherwise stands, stopping every bank, swap and exchange
+            # until they are. This narrows that race; it does not close it (#67).
+            # Not fatal: the swap happened, and a caller told otherwise retries
+            # into a store that has already moved.
+            split = store_split_now()
+            if split:
+                warn(f"switched to {name}, but " + split_text(split))
         # What the next confirmation has to match. Taken here, inside the lock,
         # from the very dict that was written — not from a later read, which a
         # rotation could already have moved on.

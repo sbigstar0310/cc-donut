@@ -5760,6 +5760,55 @@ rm -f "$SWD/providers/keys.env" "$SWD/swap-note"
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 paid_optin_off
 
+# ── stdout is the protocol; stderr is not ───────────────────────────────────
+# A swap can succeed and still have something to say — the cached account config
+# it could not drop, for one. Folding that into the result made the warning the
+# account name and left no fingerprint, so the parked turn was never woken.
+mkdir -p "$FAKE/warnroot/bin"
+cat > "$FAKE/warnroot/bin/ccd-account" <<'WEOF'
+#!/bin/sh
+for a in "$@"; do
+  [ "$a" = swap ] && echo "ccd account: warning: could not drop the cached account config" >&2
+done
+exec "$CCD_REAL_ACCOUNT" "$@"
+WEOF
+chmod +x "$FAKE/warnroot/bin/ccd-account"
+export CCD_REAL_ACCOUNT="$ACCT"
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+sw_fixture 58 96
+rc=$(SW_ROOT="$FAKE/warnroot" sw_stopfail sess-w1)
+{ [ "$rc" = "2" ] && grep -q 'switched this session to spare,' "$FAKE/.sw-err"; } \
+  && ok "a swap that warned still wakes the turn, naming the account it moved to" \
+  || bad "warning read as the result" "rc=$rc: $(tr '\n' ' ' < "$FAKE/.sw-err" | head -c 160)"
+sw_fixture 58 96
+out=$(SW_ROOT="$FAKE/warnroot" sw_prompt UserPromptSubmit sess-w2)
+case "$out" in
+  *warning*) bad "warning read as the result" "the tick announced: ${out:0:160}" ;;
+  *spare*) ok "...and the tick before the wall announces the account, not the warning" ;;
+  *) bad "warning read as the result" "nothing announced: ${out:0:160}" ;;
+esac
+
+# A swap refused by a standing stop has a remedy, and 120 characters of stderr do
+# not reach it. One fixed line that points at doctor, which carries all of it.
+sw_fixture 58 96
+printf '{"detail":"keychain took b, file kept a","stores":["file","keychain"]}' > "$SWD/store-split"
+rm -f "$SWD/swap-note"
+sw_stopfail sess-w3 >/dev/null
+grep -q 'stores disagree.*ccd doctor' "$SWD/swap-note" 2>/dev/null \
+  && ok "a backstop stopped by disagreeing stores sends the user to ccd doctor" \
+  || bad "remedy cut off" "note: $(head -c 200 "$SWD/swap-note" 2>/dev/null)"
+rm -f "$SWD/swap-note"
+# The same tick that writes the note may be the one that shows it, so look at both.
+out=$(sw_prompt UserPromptSubmit sess-w4)
+# "ccd doctor" alone proves nothing here — the quota warning says it too.
+{ case "$out" in *"stores disagree"*"ccd doctor"*) true ;; *) false ;; esac \
+  || grep -q 'stores disagree.*ccd doctor' "$SWD/swap-note" 2>/dev/null; } \
+  && ok "...and so does the tick before the wall, which used to say nothing" \
+  || bad "remedy cut off" "the proactive path said: ${out:0:120} / left: $(head -c 80 "$SWD/swap-note" 2>/dev/null)"
+rm -f "$SWD/store-split" "$SWD/swap-note"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
 # ── Three attempts, then stop ───────────────────────────────────────────────
 # An operational failure is worth retrying briefly — a store that moved, a lock
 # someone else held — and worth nothing after that.
@@ -6864,14 +6913,12 @@ m.active_name = lambda: "a"
 m.account_load = lambda n: only_target(n) or ({"name": "a", **A} if n == "a" else None)
 m.account_save = lambda n, o: None
 m.drop_account_scoped_config = lambda: None
-try:
-    m.swap_to("target", force=True)
-except SystemExit:
-    pass
-else:
-    raise AssertionError("the swap reported success over stores that disagree")
+m.swap_to("target", force=True)
+assert os.path.exists(m.STORE_SPLIT), "two successful writes cleared the stop on stores that disagree"
 rec = json.load(open(m.STORE_SPLIT))
-assert moved == [], f"the pointer moved onto a store that is divided: {moved!r}"
+# Ownership follows the writes, as it always did: both succeeded, and that is the
+# best knowledge there is of whose credential is live. Only the RECORD waits.
+assert moved == ["target"], f"the pointer did not follow the install: {moved!r}"
 assert "interrupted" not in rec["detail"], "the record still tells the write-ahead story: " + rec["detail"]
 ' "$ROOT/bin/ccd-account" "$(split_home foreign)" 2> "$FAKE/.foreign-err" \
   && ok "two successful writes do not clear the stop when the stores are seen to disagree" \
@@ -6880,35 +6927,51 @@ grep -q 'ccd/store-split' "$FAKE/.foreign-err" \
   && ok "...and the refusal names the record, as every other one does" \
   || bad "no way out" "got: $(tr '\n' ' ' < "$FAKE/.foreign-err" | head -c 160)"
 
-# ...and agreeing is not enough: they have to agree on what was just installed. On
-# a one-store machine a foreign write cannot divide anything, but it can replace
-# the credential before the pointer moves — and a pointer moved then files the
-# outgoing account's fresh token under the incoming account's name.
+# The verify decides about the RECORD and about nothing else. When it also gated
+# the pointer, one failed read left B installed under a pointer still saying A —
+# and once reads recovered, the next command lifted the stop and the retry banked
+# live B into A. No foreign writer needed; the hook's own retry did it. So: real
+# files, real account_save, and the whole sequence.
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
-A = {"claudeAiOauth": {"accessToken": "AT-a", "refreshToken": "RT-a"}}
+A = {"accessToken": "AT-a", "refreshToken": "RT-a"}
+B = {"accessToken": "AT-b", "refreshToken": "RT-b"}
 m.use_keychain = lambda: False
-m.write_json(m.credentials_file(), A)
-real_live_write = m.live_write
-def overtaken(blob, sources):
+m.account_save("a", {"name": "a", "claudeAiOauth": A})
+m.account_save("b", {"name": "b", "claudeAiOauth": B})
+m.active_set("a", stamp=False)
+m.write_json(m.credentials_file(), {"claudeAiOauth": A})
+creds, real_open, real_live_write = m.credentials_file(), open, m.live_write
+state = {"blind": False}
+def flaky(p, *a, **k):
+    if state["blind"] and str(p) == creds:
+        raise PermissionError(13, "Permission denied", creds)
+    return real_open(p, *a, **k)
+m.open = flaky
+def then_blind(blob, sources):
     got = real_live_write(blob, sources)
-    m.write_json(m.credentials_file(), {"claudeAiOauth": {"accessToken": "AT-a2", "refreshToken": "RT-a2"}})
+    state["blind"] = True             # every write landed; the read after it does not
     return got
-m.live_write = overtaken
-moved = []
-m.active_set = lambda n, stamp=True: moved.append(n)
-m.active_name = lambda: "a"
-m.account_load = lambda n: only_target(n) or ({"name": "a", **A} if n == "a" else None)
-m.account_save = lambda n, o: None
-m.drop_account_scoped_config = lambda: None
+m.live_write = then_blind
+said = []
+m.warn = lambda msg: said.append(msg)
 try:
-    m.swap_to("target", force=True)
+    installed = m.swap_to("b", force=True)[1]
 except SystemExit:
-    pass
-assert moved == [], f"the pointer moved though the store no longer holds what was installed: {moved!r}"
-assert os.path.exists(m.STORE_SPLIT), "the record was cleared on a credential ccd did not install"
-' "$ROOT/bin/ccd-account" "$(split_home overtaken)" 2>/dev/null \
-  && ok "stores that agree on something ccd did not install do not complete the swap" \
-  || bad "pointer moved onto a foreign credential" "agreement alone cleared the record"
+    installed = None                  # judged last: what it corrupts comes first
+assert os.path.exists(m.STORE_SPLIT), "an unverified install cleared its own record"
+state["blind"] = False                # reads recover
+m.live_write = real_live_write
+m.bank_live_oauth()                   # what every next command starts with
+m.swap_to("b", force=True)            # and the retry the hook would make
+stored = json.load(real_open(m.account_path("a")))["claudeAiOauth"]
+assert stored["accessToken"] == "AT-a", "the outgoing account now holds: " + json.dumps(stored)
+assert m._pointer_name() == "b", "the pointer says " + repr(m._pointer_name())
+assert not os.path.exists(m.STORE_SPLIT), "the stop outlived stores that agree"
+assert installed, "a swap that happened was reported as one that did not"
+assert said and "store-split" in " ".join(said), f"the standing stop went unmentioned: {said!r}"
+' "$ROOT/bin/ccd-account" "$(split_home sequence)" \
+  && ok "a verify that cannot see leaves the pointer right, and the retry banks nothing into the wrong account" \
+  || bad "outgoing snapshot corrupted" "a transient read failure ended with one account filed under another"
 
 # A record ccd cannot make sense of is still a record. Each of these used to fail
 # open: no stores named meant nothing had to answer, and an empty one read as

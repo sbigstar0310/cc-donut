@@ -219,33 +219,22 @@ pick_account():
 
 ### 5.2 루프 방지 — 횟수가 아니라 방문 집합으로
 
-> **#57 개정.** 아래의 "계정 사다리" 는 없어졌다. 계정 간 이동이 relaunch 를 쓰지 않으니
-> 런처가 도는 목적지 공간은 `{fallback, subscription}` 둘뿐이고, 훅으로 방문 집합을
-> 넘기던 `CCD_BURST_VISITED` 도 읽는 쪽과 함께 전부 제거됐다 (`ccd-account pick` 의
-> `--exclude` 포함). 남은 규칙은 아래 두 줄이다.
+> **#57 개정.** 계정 사다리도, 런처의 `visited` 방문 집합도, 훅으로 그걸 넘기던
+> `CCD_BURST_VISITED` 도 전부 없어졌다 (`ccd-account pick` 의 `--exclude` 포함). 런처가
+> 다루는 방향이 `to_subscription` 하나뿐이라 방문 집합이 막을 루프가 남아 있지 않다.
 
-- **burst** = 사이에 의미 있는 작업(`HOP_RESET_SECONDS` 이상 지속된 세션)이 없이 연달아 일어난 relaunch 묶음
-- relaunch 할 때마다 목적지를 `visited` 에 넣는다. 한 burst 안에서 같은 목적지를 두 번
-  들어가는 것은 정의상 루프이므로 그 자리에서 멈춘다
-- 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 `visited` 를 통째로 비운다 (`hops=0` 과 같은 자리)
+지금 남은 장치는 둘이다.
 
-목적지를 기록하지 않는 방향(`to_subscription`)이 스스로를 계속 재무장하는 경우를 위해
-숫자 백스톱을 하나 남겨 둔다: 연속 3홉. 계정 수에서 파생시키던 상한은 사다리와 함께
-없어졌고, 멀티 계정 이전의 상수와 같은 값으로 돌아왔다 (§13.4).
-
-burst 안에서 갈 곳이 전부 소진되면 — 즉 `fallback` 이 이미 `visited` 에 있으면 — 멈추고
-기존 안내를 낸다:
-
-```
-ccd: 갈 수 있는 백본을 모두 시도했습니다 — 중단합니다.
-     이어서 하려면: claude --resume <sid>
-```
-
-`HOP_RESET_SECONDS=60` 은 그대로 둔다. 이건 시간 임계값이지 사다리 길이에 대한 가정이 아니다.
+- **세션 안 스왑 쪽**: 방금 떠나온 계정은 그 창이 리셋될 때까지 목적지에서 뺀다
+  (`swapped-windows`, TTL 로 만료). 떠나는 것 자체는 한 번도 막지 않는다.
+- **런처 쪽**: 스스로를 계속 재무장하는 복귀를 막는 숫자 백스톱 하나 — 연속 3홉이면
+  멈추고 `claude --resume <sid>` 를 안내한다. 세션이 `HOP_RESET_SECONDS`(60초) 이상
+  살아남으면 카운터를 0 으로 되돌린다. 하루에 쿼타가 죽었다 살아나기를 반복하는 것은
+  정상이고 루프가 아니다 (§13.4).
 
 ## 6. 크레덴셜 스왑
 
-### 6.1 타이밍 — 경합이 없다는 것을 실측으로 확인했다
+### 6.1 타이밍 — 세션 안에서 바꿔도 된다는 것을 실측으로 확인했다
 
 cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운다. 그래서 Claude Code 자신의
 토큰 refresh 와 경합한다고 여겨졌고, ccd 0.4.0 은 그 경합을 피하려고 스왑을 세션 경계로
@@ -256,8 +245,14 @@ cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운�
 사용자 트랜스크립트에서 스왑된 세션이 한 프로세스, 한 세션 id 로 **16.9시간** 동안
 1,159번 성공했고, 그 사이 access token 이 최소 두 번 갱신됐다. 재시작은 없었다.
 
-그래서 스왑은 세션 안에서 일어난다. 세션을 끝내는 유일한 홉은 OpenRouter 로 나가는 길과
-거기서 돌아오는 길이다 — 그동안 백본은 프로세스의 환경 변수라서, 파일을 아무리 고쳐도
+**경합이 없다는 뜻은 아니다.** Claude Code 는 ccd 의 락을 모르기 때문에, 떠나는 계정의
+토큰 refresh 가 ccd 의 두 백엔드 쓰기 사이에 끼어들 수 있다. 그래서 설치 뒤에도
+`store-split` 기록은 백엔드들이 일치하는 것이 **보일 때만** 지운다 (§6.2 5a). 이건 창을
+좁힐 뿐 닫지는 못한다. 닫으려면 Claude Code 쪽 writer 와의 조율이 필요하고, #67 로
+추적한다.
+
+그래서 스왑은 세션 안에서 일어난다. 세션을 끝내는 홉은 사용자가 `ccd -c` 로 직접 나가는 OpenRouter 행과
+거기서 (런처가 있으면 자동으로) 돌아오는 길뿐이다 — 그동안 백본은 프로세스의 환경 변수라서, 파일을 아무리 고쳐도
 그 세션에는 닿지 않는다.
 
 다른 터미널에서 돌고 있는 세션도 같은 저장소를 읽으므로 함께 옮겨간다. 즉시 깨지지 않고,
@@ -295,8 +290,8 @@ swap(--from cur, --window key):
                       Linux: tmp 파일 → chmod 600 → os.replace
   5a. 쓰기 전에 의도를 `store-split` 에 먼저 기록한다 (기록 못 하면 쓰지 않는다). 모든
       백엔드가 받아야 성공이고, 일부만 받으면 되돌린다. 되돌리지도 못하면 기록이 남아
-      이후의 스왑·배킹·토큰 교환을 전부 멈춘다. 쓰기가 모두 성공해도, 기록은 백엔드들이
-      방금 설치한 자격증명으로 **일치하는 것이 보일 때만** 지운다.
+      이후의 스왑·배킹·토큰 교환을 전부 멈춘다. 쓰기가 모두 성공하면 포인터는 바로
+      옮기고(소유권은 쓰기를 따른다), 기록만 백엔드들이 **일치하는 것이 보일 때** 지운다.
   6. .active 갱신
   7. 설치한 자격증명의 지문을 돌려준다 (확인이 대조할 유일한 신원)
   8. 락 해제
@@ -409,12 +404,12 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 - 프롬프트·툴 틱: `peak >= ARM_THRESHOLD` 이고 여유 있는 계정이 있으면 **그 자리에서** `ccd-account use <name> --force` (#57 전에는 `StopFailure` 에서 `to_account` 로 무장했다)
 - `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 갈 계정이 없으면 멈추고 `swap-note` 를 남긴다 (깨우지 않는다 — 같은 벽에 다시 부딪힌다)
 - keep-alive: 하루 1회 `ccd-account refresh --all --inactive-only` 를 백그라운드로
-- `SessionEnd` 안내 문구는 `to_fallback` / `to_subscription` 두 가지
+- `SessionEnd` 안내 문구는 `to_subscription` 하나 (나가는 방향은 자동이 아니다)
 
 ### `bin/ccd-handoff`
 
-- `hops` 카운터 옆에 §5.2 의 `visited` 집합을 둔다. 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 둘 다 비운다
-- `case "$dir"` 은 `to_fallback` / `to_subscription` 두 분기. #57 에서 `to_account` 분기와 `hf account`, 계정 수에서 파생하던 상한, `CCD_BURST_VISITED` export 가 전부 삭제됐다
+- `hops` 카운터 하나. 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 0 으로 되돌린다 (`visited` 집합은 #57 에서 삭제)
+- `case "$dir"` 은 `to_subscription` 한 분기. #57 에서 `to_fallback`·`to_account` 분기와 `hf account`, 계정 수에서 파생하던 상한, `CCD_BURST_VISITED` export 가 전부 삭제됐다
 - `to_subscription` (OpenRouter → 구독 복귀) 은 **손대지 않는다.** §13.1 참조
 
 ### `bin/ccd-statusline`
@@ -466,7 +461,7 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 - 리셋 타임스탬프가 없는 판독에서도 기록이 남는가 (구멍 없음)
 - 기록이 TTL 을 넘기면 다시 목적지가 되는가 (개수가 아니라 시간으로 만료)
 - 떠나는 것 자체는 **한 번도 막지 않는가** — 소진된 계정에 갇히는 실패가 불가능해야 한다
-- 런처 쪽 `visited`: `to_fallback` 을 한 burst 에 두 번 시도하면 멈추는가, `HOP_RESET_SECONDS` 뒤에는 다시 가는가
+- 런처 쪽 백스톱: 연속 3홉에서 멈추는가, `HOP_RESET_SECONDS` 뒤에는 카운터가 되돌아가는가
 
 ## 12. 알려진 한계 / 미해결 질문
 

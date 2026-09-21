@@ -578,7 +578,7 @@ has_accounts() {
 SWAP_RESULT=""
 SWAP_REASON=""
 swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=budget
-  local wkey="$1" from="$2" budget="$3" ab out i end left
+  local wkey="$1" from="$2" budget="$3" ab out err i end left
   shift 3
   SWAP_RESULT=""
   SWAP_REASON=""
@@ -593,14 +593,22 @@ swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=bud
   for i in 1 2 3; do
     left=$(( end - $(date +%s) ))
     [ "$left" -gt 0 ] || break
+    # stdout is the result and stderr is commentary. Folded together, a swap
+    # that succeeded AND warned handed back its warning as the account name.
+    err="$CCD_DIR/.swap-err.$$"
     if out=$("$ab" --no-color swap --from "$from" --window "$wkey" \
-                   --deadline "$left" "$@" 2>&1) && [ -n "$out" ]; then
+                   --deadline "$left" "$@" 2>"$err") && [ -n "$out" ]; then
+      rm -f "$err"
       SWAP_RESULT="$out"
       return 0
     fi
-    SWAP_REASON=$(printf '%s' "$out" | tr '\n' ' ' | head -c 120)
+    SWAP_REASON=$(tr '\n' ' ' < "$err" 2>/dev/null | head -c 120)
+    rm -f "$err"
     sleep 0.2
   done
+  # A standing stop has a remedy, and it does not fit in a reason. doctor has it.
+  [ -e "$CCD_DIR/store-split" ] \
+    && SWAP_REASON="the credential stores disagree with each other — run: ccd doctor"
   return 1
 }
 
@@ -1016,7 +1024,8 @@ if has_accounts; then
     ''|*[!0-9]*) : ;;
     *) if [ "$peak" -ge "$ARM_THRESHOLD" ] \
           && from=$(reading_account "$racct") \
-          && swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe \
+          && { swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe \
+               || { [ -e "$CCD_DIR/store-split" ] && swap_note "[ccd] The Claude quota is nearly gone and ccd cannot move this session: $SWAP_REASON"; false; }; } \
           && moved=${SWAP_RESULT%%	*} && [ -n "$moved" ]; then
          rm -f "$SWAP_NOTE" 2>/dev/null || true
          MOVED="$moved" EVENT="$EVENT" python3 -c '
