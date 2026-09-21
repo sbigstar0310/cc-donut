@@ -28,7 +28,7 @@ if have=$(docker image inspect "$IMAGE" --format '{{.Architecture}}' 2>/dev/null
   elif [ "$have" != "$want" ] && [ "${CCD_DOCKER_EMULATE:-}" != 1 ]; then
     cat >&2 <<EOF
 docker.sh: $IMAGE is cached as $have, but this Docker runs $want.
-  It would run under emulation, which breaks the signal and timing tests.
+  It would fail to start or run under emulation, which breaks the signal and timing tests.
   Fix: docker pull --platform linux/$want $IMAGE
   Or run it emulated on purpose: CCD_DOCKER_EMULATE=1 $0 $IMAGE
 EOF
