@@ -323,4 +323,8 @@ test/docker.sh alpine:3.20    # musl/BusyBox에서도
 돌리세요. GNU/BSD 차이(예: `stat`)로 인해 macOS에서는 문제가 없던 코드가 Linux에서는
 실패할 수 있습니다. CI는 push마다 셋 다 실행합니다.
 
+`test/docker.sh`는 캐시된 이미지가 다른 CPU용이면 실행하지 않고, 바꿔 받을 `docker pull`
+명령을 알려 줍니다(`docker pull --platform` 한 번이면 그런 이미지가 남습니다). 에뮬레이션은
+시그널·타이밍 테스트를 조용히 깨뜨립니다. 그래도 돌리려면 `CCD_DOCKER_EMULATE=1`을 붙이세요.
+
 </details>

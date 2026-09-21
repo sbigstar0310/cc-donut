@@ -335,4 +335,9 @@ No network, no real key, no writes outside the temp HOME. Run the container test
 before releasing: GNU/BSD differences (`stat`, for one) go unnoticed on macOS and
 fail for Linux users. CI runs all three on every push.
 
+`test/docker.sh` refuses a cached image built for another CPU (one `docker pull
+--platform` is enough to leave one behind) and prints the pull that replaces it;
+emulation quietly breaks the signal and timing tests. `CCD_DOCKER_EMULATE=1` runs
+it anyway.
+
 </details>
