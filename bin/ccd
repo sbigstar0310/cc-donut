@@ -625,8 +625,8 @@ if not spares:
     print(f"      {DIM}Only one account registered — sign in to another "
           f"(/login) and run `ccd account add`.{RS}")
 elif not any(a.get("headroom") for a in spares):
-    print(f"      {DIM}No spare has room right now; a handoff would go to "
-          f"OpenRouter.{RS}")
+    print(f"      {DIM}No spare has room right now; when the quota runs out ccd will "
+          f"stop and say so. `ccd -c` is the paid way on, and it is yours to type.{RS}")
 # The store holds refresh tokens good for days. Loose permissions matter.
 p = os.environ["ACCT_DIR"]
 try:

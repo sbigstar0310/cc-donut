@@ -577,6 +577,9 @@ has_accounts() {
 # says "reason unknown", which is the one thing a note must never say.
 SWAP_RESULT=""
 SWAP_REASON=""
+# A standing stop has a remedy, and it fits in neither a reason nor a wake line.
+# doctor carries all of it, so every path that meets the stop says this and only this.
+SPLIT_ADVICE="the credential stores disagree with each other — run: ccd doctor"
 swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=budget
   local wkey="$1" from="$2" budget="$3" ab out err i end left
   shift 3
@@ -590,6 +593,14 @@ swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=bud
   # three times the wait the caller agreed to, and on a prompt tick the caller is
   # a person watching a cursor.
   end=$(( $(date +%s) + budget ))
+  # The same kill the reading's tmp file is guarded against (see the probe above):
+  # it lands between the redirect below and the rm after it. No other trap is live
+  # here — the probe clears its own — so these replace nothing, and are cleared on
+  # every way out. The handlers exit for the reason given there.
+  trap 'rm -f "$CCD_DIR/.swap-err.$$"' EXIT
+  trap 'rm -f "$CCD_DIR/.swap-err.$$"; exit 130' INT
+  trap 'rm -f "$CCD_DIR/.swap-err.$$"; exit 143' TERM
+  find "$CCD_DIR" -maxdepth 1 -name '.swap-err.*' -mmin +60 -delete 2>/dev/null || true
   for i in 1 2 3; do
     left=$(( end - $(date +%s) ))
     [ "$left" -gt 0 ] || break
@@ -599,6 +610,7 @@ swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=bud
     if out=$("$ab" --no-color swap --from "$from" --window "$wkey" \
                    --deadline "$left" "$@" 2>"$err") && [ -n "$out" ]; then
       rm -f "$err"
+      trap - EXIT INT TERM
       SWAP_RESULT="$out"
       return 0
     fi
@@ -606,9 +618,8 @@ swap_to_spare() {  # $1=window key  $2=the account the reading was about  $3=bud
     rm -f "$err"
     sleep 0.2
   done
-  # A standing stop has a remedy, and it does not fit in a reason. doctor has it.
-  [ -e "$CCD_DIR/store-split" ] \
-    && SWAP_REASON="the credential stores disagree with each other — run: ccd doctor"
+  trap - EXIT INT TERM
+  [ -e "$CCD_DIR/store-split" ] && SWAP_REASON="$SPLIT_ADVICE"
   return 1
 }
 
@@ -625,6 +636,15 @@ with os.fdopen(fd, "w") as f:
 os.chmod(tmp, 0o600)
 os.replace(tmp, p)
 PY
+}
+
+# A swap can succeed and still leave the stop standing: the writes landed, the
+# stores were not seen to agree. That is not a failure and must not become a
+# retry — but it is the one thing worth saying, so it replaces whatever note the
+# caller would have left. False when there is no stop, so the caller carries on.
+split_advisory() {  # $1=the account the session is on now
+  [ -e "$CCD_DIR/store-split" ] || return 1
+  swap_note "[ccd] ccd switched this session to $1, but $SPLIT_ADVICE"
 }
 
 # Which account is a reading about? The reading says so when ccd took it; a
@@ -705,12 +725,13 @@ if [ "$EVENT" = "StopFailure" ]; then
 $SWAP_RESULT
 EOF
              if swap_landed "$account" "$cred"; then
-               rm -f "$SWAP_NOTE" 2>/dev/null || true
+               split_advisory "$account" || rm -f "$SWAP_NOTE" 2>/dev/null || true
                printf '%s\n' "[ccd] Your claude.ai usage limit was reached and ccd switched this session to $account, which has quota. Continue the task you were working on when the limit was reached; do not repeat work that is already complete." >&2
                exit 2
              fi
              # The credential moved but cannot be proved live. Waking into that is
              # a second 429; say so where the next prompt will read it.
+             split_advisory "$account" || \
              swap_note "[ccd] The Claude quota ran out and ccd switched this session to $account, but could not confirm that account's credential went live. Nothing was billed. Carry on — \`ccd account list\` shows which account is active."
              exit 0
            fi
@@ -1027,7 +1048,7 @@ if has_accounts; then
           && { swap_to_spare "$wkey" "$from" "$SWAP_TICK_BUDGET" --no-probe \
                || { [ -e "$CCD_DIR/store-split" ] && swap_note "[ccd] The Claude quota is nearly gone and ccd cannot move this session: $SWAP_REASON"; false; }; } \
           && moved=${SWAP_RESULT%%	*} && [ -n "$moved" ]; then
-         rm -f "$SWAP_NOTE" 2>/dev/null || true
+         split_advisory "$moved" || rm -f "$SWAP_NOTE" 2>/dev/null || true
          MOVED="$moved" EVENT="$EVENT" python3 -c '
 import json, os
 name = os.environ["MOVED"]

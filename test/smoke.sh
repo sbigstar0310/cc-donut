@@ -5809,6 +5809,78 @@ out=$(sw_prompt UserPromptSubmit sess-w4)
 rm -f "$SWD/store-split" "$SWD/swap-note"
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
+# ── A swap that happened, over stores not yet seen to agree ─────────────────
+# The swap is a success and stays one — it wakes, it announces — but the stop it
+# left standing has a remedy, and the hook threw the only mention of it away.
+mkdir -p "$FAKE/splitroot/bin"
+cat > "$FAKE/splitroot/bin/ccd-account" <<'SEOF'
+#!/bin/sh
+# The real swap, followed by what a verify that could not see leaves behind. With
+# SPLIT_UNCONFIRMED set, the confirmation read AFTER the swap finds nothing to
+# confirm either — only after: the same command feeds the decision to swap at all.
+case " $* " in
+  *" current --json "*)
+    [ -n "${SPLIT_UNCONFIRMED:-}" ] && [ -e "$HOME/.split-swapped" ] && { echo '{}'; exit 0; } ;;
+esac
+for a in "$@"; do
+  if [ "$a" = swap ]; then
+    "$CCD_REAL_ACCOUNT" "$@"; rc=$?
+    [ "$rc" -eq 0 ] && { printf '{"detail":"x","stores":["file","keychain"]}' > "$HOME/.claude/ccd/store-split"
+                         : > "$HOME/.split-swapped"; }
+    exit "$rc"
+  fi
+done
+exec "$CCD_REAL_ACCOUNT" "$@"
+SEOF
+chmod +x "$FAKE/splitroot/bin/ccd-account"
+export CCD_REAL_ACCOUNT="$ACCT"
+"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+sleep 0.3
+for shape in wakes unconfirmed tick; do
+  # Before the fixture, not after: the stop the last shape left standing would
+  # refuse the fixture's own `use`, and this shape would start on the wrong account.
+  rm -f "$SWD/swap-note" "$SWD/store-split" "$FAKE/.split-swapped"
+  sw_fixture 58 96
+  case "$shape" in
+    wakes)       rc=$(SW_ROOT="$FAKE/splitroot" sw_stopfail sess-s1); want=2 ;;
+    unconfirmed) rc=$(SPLIT_UNCONFIRMED=1 SW_ROOT="$FAKE/splitroot" sw_stopfail sess-s2); want=0 ;;
+    tick)        out=$(SW_ROOT="$FAKE/splitroot" sw_prompt UserPromptSubmit sess-s3)
+                 case "$out" in *"spare 계정으로 갈아탔습니다"*) rc=0 ;; *) rc=1 ;; esac; want=0 ;;
+  esac
+  { [ "$rc" = "$want" ] && grep -q 'AT-spare' "$CREDS" \
+      && grep -q 'spare.*stores disagree.*ccd doctor' "$SWD/swap-note" 2>/dev/null; } \
+    && ok "a swap over a standing stop still succeeds ($shape), and says where the remedy is" \
+    || bad "advisory lost ($shape)" "rc=$rc want=$want, note: $(head -c 140 "$SWD/swap-note" 2>/dev/null)"
+done
+rm -f "$SWD/store-split" "$SWD/swap-note"
+
+# A hook killed mid-swap must not strand its stderr capture. bash defers a trap
+# until the child returns, so the fake swap is short; without a trap the TERM
+# kills the hook on the spot and the file stays for ever.
+mkdir -p "$FAKE/slowroot/bin"
+cat > "$FAKE/slowroot/bin/ccd-account" <<'LEOF'
+#!/bin/sh
+for a in "$@"; do [ "$a" = swap ] && { : > "$HOME/.swap-started"; sleep 2; echo "too slow" >&2; exit 4; }; done
+exec "$CCD_REAL_ACCOUNT" "$@"
+LEOF
+chmod +x "$FAKE/slowroot/bin/ccd-account"
+sw_fixture 58 96
+rm -f "$FAKE/.swap-started" "$SWD"/.swap-err.*
+printf '{"session_id":"sess-k1","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"rate_limit"}' > "$FAKE/.k1-in"
+# exec, so that $! is the hook itself: a signal sent to a wrapping subshell kills
+# the wrapper and proves nothing about the script inside it.
+( exec env CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID CLAUDE_PLUGIN_ROOT="$FAKE/slowroot" \
+    "$ROOT/scripts/quota-guard.sh" StopFailure < "$FAKE/.k1-in" >/dev/null 2>&1 ) & HKPID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -e "$FAKE/.swap-started" ] && break; sleep 0.25; done
+started=$(ls "$SWD"/.swap-err.* 2>/dev/null | wc -l | tr -d ' ')
+kill -TERM "$HKPID" 2>/dev/null; wait "$HKPID" 2>/dev/null
+left=$(ls "$SWD"/.swap-err.* 2>/dev/null | wc -l | tr -d ' ')
+{ [ "${started:-0}" -ge 1 ] && [ "${left:-1}" -eq 0 ]; } \
+  && ok "a hook killed mid-swap takes its stderr capture with it" \
+  || bad "stranded capture" "in flight: $started, left behind: $left"
+rm -f "$SWD"/.swap-err.* "$FAKE/.swap-started"
+kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+
 # ── Three attempts, then stop ───────────────────────────────────────────────
 # An operational failure is worth retrying briefly — a store that moved, a lock
 # someone else held — and worth nothing after that.

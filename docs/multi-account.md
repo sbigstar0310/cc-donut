@@ -14,7 +14,7 @@
 >
 > **2026-09-17 (#57) 개정.** 계정 간 스왑은 이제 **세션 안에서** 일어난다. 세션을
 > 끝내고 relaunch 하던 `to_account` 방향과, 그걸 위해 있던 계정 사다리 / 방문 집합
-> export 는 전부 제거됐다. 런처(`ccd-handoff`)에 남은 것은 유료 OpenRouter 홉과 거기서
+> export 는 전부 제거됐다. 런처(`ccd-handoff`)에 남은 것은 (2차 개정 이후) OpenRouter 에서 구독으로
 > 돌아오는 길뿐이고, 그 런처는 `ccd setup --auto` 만 설치한다. 아래 §1·§2·§4.3·§5·§5.2·
 > §6.1 은 그 내용으로 갱신했다.
 
@@ -33,15 +33,16 @@
 - 로드 밸런싱. ccd는 **소진 시 탈출** 도구다. "덜 쓴 계정으로 미리 분산"은 cswap/clauth의 영역이고, ccd가 흉내내면 정체성이 흐려진다. 전환은 오직 소진 시점에만 일어난다.
 - ~~세션 중 라이브 스왑~~. **0.4.0 의 비목표였으나 #57 에서 뒤집혔다.** 계정 간 스왑은
   이제 살아 있는 세션 안에서 일어난다. Claude Code 는 크레덴셜 저장소를 요청마다 읽고
-  토큰을 회전시킬 때만 쓰며, 양쪽 쓰기가 원자적이라 경합이 없다 — 실측으로 스왑된 세션이
-  토큰 갱신 두 번을 넘겨 16.9시간 동안 재시작 없이 계속 돌았다 (§6.1).
+  토큰을 회전시킬 때만 쓴다. 실측으로 스왑된 세션이 토큰 갱신 두 번을 넘겨 16.9시간 동안
+  재시작 없이 계속 돌았다. 경합이 없다는 뜻은 아니다 — Claude Code 의 쓰기와 ccd 의 쓰기
+  사이의 창은 좁혔을 뿐 닫지 못했고, #67 로 추적한다 (§6.1).
 - 계정 공유 지원. 한 사람이 소유한 여러 구독을 대상으로 한다 (§9).
 
 ## 2. 현재 구조 (변경 대상)
 
 | 파일 | 역할 |
 |---|---|
-| `bin/ccd-handoff` | `ccd setup --auto` 가 설치하는 런처. 실제 claude를 돌리고 exit 129를 잡아 **유료 OpenRouter 백본으로 relaunch** 하고 되돌리는 루프. 계정 간 이동은 여기를 지나지 않는다 |
+| `bin/ccd-handoff` | `ccd setup --auto` 가 설치하는 런처. 실제 claude를 돌리고, `ccd -c` 로 시작된 OpenRouter 세션이 exit 129 로 끝나면 **구독으로 되돌려 relaunch** 한다. OpenRouter 로 나가는 것은 사용자가 `ccd -c` 를 직접 치는 것이고, 계정 간 이동은 여기를 지나지 않는다 |
 | `scripts/quota-guard.sh` | 훅 (`UserPromptSubmit`/`PostToolUse`/`StopFailure`/`SessionEnd`). 소진·회복을 판단하고 handoff 상태를 쓴 뒤 claude에 SIGHUP |
 | `bin/ccd` | OpenRouter 백본 런처 (`ANTHROPIC_BASE_URL` 등을 세팅하고 claude exec) |
 | `bin/ccd-statusline` | 상태 표시 |
@@ -134,7 +135,7 @@ User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 
 주의: Anthropic이 토큰 교환을 `https://platform.claude.com/v1/oauth/token` 으로 옮기는 중이라는 보고가 있다. **두 엔드포인트를 순차 시도**하고, 성공한 쪽을 캐시한다.
 
-이건 공개 문서가 없는 비공식 표면이다. 깨질 수 있다 — 하지만 깨져도 치명적이지 않다: refresh 실패는 "해당 계정 skip" 으로 강등되고, 기존 OpenRouter 폴백이 그대로 살아 있다 (§8).
+이건 공개 문서가 없는 비공식 표면이다. 깨질 수 있다 — 하지만 깨져도 치명적이지 않다: refresh 실패는 "해당 계정 skip" 으로 강등되고, 갈 계정이 없으면 ccd 는 멈추고 알린다. OpenRouter 는 `ccd -c` 로 직접 가는 길로 그대로 남아 있다 (§8).
 
 ## 4. 상태 파일 스키마
 
