@@ -238,7 +238,7 @@ relaunch 도 없다 (#57).
 세션 안에서** `!` 를 붙여 실행한다 (한 줄 유지 — `!` 는 `eval` 을 거친다):
 
 ```
-!python3 -c "import json,os;p=os.path.expanduser('~/.claude/ccd/quota-cache.json');json.dump({'claude':{'available':True,'error':False,'fiveHourPercent':58,'fiveHourReset':'R1','sevenDayPercent':96,'sevenDayReset':'D1'}},open(p,'w'))" && rm -f ~/.claude/ccd/swapped-windows
+!python3 -c "import json,os;p=os.path.expanduser('~/.claude/ccd/quota-cache.json');json.dump({'claude':{'available':True,'error':False,'fiveHourPercent':58,'fiveHourReset':'R1','sevenDayPercent':100,'sevenDayReset':'D1'}},open(p,'w'))" && rm -f ~/.claude/ccd/swapped-windows
 ```
 
 그리고 아무 프롬프트나 하나 더 보낸다. 다음 틱에서 훅이 스왑하고 한 줄로 알린다:

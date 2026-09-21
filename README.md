@@ -102,14 +102,16 @@ the same way `/login` does, so nothing carries over further than that.
 
 Accounts are tried in registration order, which `--priority` changes. An account
 is offered only if it has quota left in **both** the 5-hour and the 7-day window:
-an account at 99% of its weekly quota would run out again within minutes.
+one window at 100% means the account is spent, whatever the other says. There is
+no reserve below that — a spare at 99% is still somewhere to go, and ccd moves
+your session when the account you are on reaches 100%, not before.
 
 The statusline shows the account you are on, how much of the spare's quota is
 used, and when that quota resets:
 
 ```text
 ● claude:personal │ spare work 20% (2h10m)     # room to switch to, right now
-● claude:personal │ spare work 98% (13m)       # spent, but worth waiting out
+● claude:personal │ spare work 100% (13m)      # spent, but worth waiting out
 ```
 
 `ccd doctor` reports each account's quota and flags any that needs a re-login.

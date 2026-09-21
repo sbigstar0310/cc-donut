@@ -196,6 +196,10 @@ def now():
 def ensure_dirs():
     os.makedirs(ACCOUNTS_DIR, mode=0o700, exist_ok=True)
     os.makedirs(READINGS_DIR, mode=0o700, exist_ok=True)
+    try:        # makedirs leaves an existing directory's mode alone
+        os.chmod(READINGS_DIR, 0o700)
+    except OSError:
+        pass
     try:        # the shared cache these replaced; a cache, so nothing is migrated
         os.unlink(os.path.join(CCD_DIR, "accounts-quota.json"))
     except OSError:
@@ -1227,6 +1231,10 @@ def reading_path(name):
     return os.path.join(READINGS_DIR, f"{name}.json")
 
 
+def reading_lock(name):
+    return os.path.join(READINGS_DIR, f".{name}.lock")
+
+
 def reading_load(name):
     return read_json(reading_path(name)) if valid_name(name) else None
 
@@ -1235,24 +1243,46 @@ def reading_save(name, rec):
     """Publish one account's reading. Nothing here can touch another account's.
 
     Two probers of the SAME account can still finish out of order. A reading is
-    stamped when its answer arrives (quota_for), so the later stamp is the later
-    look at the server, and an older one does not replace it. The check and the
-    rename are not one step, and need not be: the two readings that could slip
-    through are a rename apart and describe the same second. A stamp from the
-    future is a wrong clock, not a newer reading, and does not block."""
-    on_file = reading_load(name)
-    theirs = (on_file or {}).get("checked_at")
-    if isinstance(theirs, (int, float)) and rec["checked_at"] < theirs <= now():
+    stamped when its answer arrives, so the later stamp is the later look at the
+    server, and an older one does not replace it. A stamp from the future is a
+    wrong clock, not a newer reading, and does not block.
+
+    "Check, then replace" is one step, under a lock of the account's own. Without
+    it a writer that has passed the check can be descheduled for any length of
+    time before its rename, and then puts an old reading back over a newer one —
+    nothing bounds that pause, so "they describe the same second" was a hope.
+    Only the file work is inside: the network wait that produced `rec` is over
+    before this is called. A lock that cannot be had means the reading is not
+    published, which is always safe: an unpublished reading proves nothing and
+    offers nowhere to go. The lock is a dotfile, so nothing that lists
+    readings/*.json ever sees it."""
+    ensure_dirs()
+    try:
+        with Lock(reading_lock(name), fatal=False):
+            theirs = (reading_load(name) or {}).get("checked_at")
+            if isinstance(theirs, (int, float)) and rec["checked_at"] < theirs <= now():
+                return
+            write_json(reading_path(name), rec, 0o600)
+    except LockBusy:
         return
-    os.makedirs(READINGS_DIR, mode=0o700, exist_ok=True)
-    write_json(reading_path(name), rec, 0o600)
 
 
 def reading_drop(name):
-    try:
-        os.unlink(reading_path(name))
-    except OSError:
-        pass
+    for p in (reading_path(name), reading_lock(name)):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def reading_fresh(rec, ttl):
+    """Is this reading young enough to stand for now? The ONE freshness rule, for
+    the swap, the cache-only tick and the proof alike. Age is bounded on both
+    sides: a reading from the future is a wrong clock, and after a backward clock
+    step it would otherwise sit there "fresh" — pinning a spent verdict and keeping
+    a usable account from ever being measured again."""
+    ts = (rec or {}).get("checked_at")
+    return isinstance(ts, (int, float)) and not isinstance(ts, bool) and 0 <= now() - ts < ttl
 
 
 def probe_account(name, acct, allow_refresh=True):
@@ -1318,15 +1348,14 @@ def cache_ttl_for(status, ttl):
 
 def quota_for(name, acct, ttl=CANDIDATE_TTL, allow_refresh=True):
     rec = reading_load(name)
-    if isinstance(rec, dict) and isinstance(rec.get("checked_at"), (int, float)):
+    if isinstance(rec, dict):
         # Identity before age: a row can be fresh and still be about the wrong
         # account or a replaced token. Clocks cannot answer either question —
         # now() is second-granular, so a bank and a probe in the same second are
         # a tie, and probe_account may refresh mid-probe, which would make a
         # verdict look older than the very token it measured.
-        if _cache_row_valid(rec, acct) and (
-            (now() - rec["checked_at"]) < cache_ttl_for(rec.get("status"), ttl)
-        ):
+        if _cache_row_valid(rec, acct) and reading_fresh(
+                rec, cache_ttl_for(rec.get("status"), ttl)):
             return rec
     rec = probe_account(name, acct, allow_refresh=allow_refresh)
     # Stamped after the probe: it may have refreshed the token, and the verdict
@@ -1867,8 +1896,6 @@ def cmd_swap(args):
             no_probe=args.no_probe, deadline=deadline,
             exclude={n: w for n, (_when, w) in swap_guard_read().items()})
         if a is None:
-            if not args.no_probe:
-                measure_active(deadline)
             return _swap_no(rec)
         # One acquisition for the whole install: the claim, the credential and the
         # record are one change or none of them.
@@ -1898,36 +1925,6 @@ def cmd_swap(args):
         return _swap_no(f"{type(e).__name__}")
     print(f"{a['name']}\t{installed}\t{replaced}")
     return 0
-
-
-def measure_active(deadline):
-    """Leave a current reading of the account the store is on. Best effort.
-
-    Nothing else on the backstop path measures it — best_target() looks only at
-    where a session could GO — and the proof that may authorise paying needs every
-    registered account's reading, this one included. It lives here, in the probing
-    swap that found nowhere to go, so that `exhausted` can stay a pure read; the
-    cache-only tick never calls it.
-
-    Never refreshed, and that is load-bearing, not belt and braces: `cur` is who
-    was active when we looked, and another session can swap the store before the
-    probe runs. account_refresh() refuses the ACTIVE account — and by then this
-    one no longer is, so with refreshing allowed an expired token here would be
-    exchanged, from a path that must never spend one. Claude Code owns the live
-    token. The prologue has just banked
-    the live credential into this account, so its access token is as current as
-    ccd can know; if it is not, the probe fails, the row says so, and a failed
-    row is not proof."""
-    global NET_DEADLINE
-    cur = active_name()
-    acct = account_load(cur) if cur else None
-    if not acct:
-        return
-    outer, NET_DEADLINE = NET_DEADLINE, deadline
-    try:
-        quota_for(cur, acct, allow_refresh=False)
-    finally:
-        NET_DEADLINE = outer
 
 
 def _swap_no(reason):
@@ -1980,9 +1977,9 @@ def subscriptions_proved_spent():
     skip exactly the account that could have taken the session.
 
     It opens no socket, takes no lock, spends no token and writes nothing: the swap
-    attempt that comes before it has just measured every spare, and the active
-    account too when it found nowhere to go (measure_active), and this reads what
-    that left behind. So a timeout, a 503, a busy store, an expired deadline or a refused
+    attempt that comes before it has just measured every spare, the wall re-read
+    before THAT has just measured and published the account the store is on
+    (cmd_usage), and this reads what they left behind. So a timeout, a 503, a busy store, an expired deadline or a refused
     swap cannot become a yes here — each leaves a row that is stale, failed,
     missing, or shows room, and every one of those is a no.
 """
@@ -2002,8 +1999,7 @@ def subscriptions_proved_spent():
         rec = reading_load(name)
         if not _cache_row_valid(rec, acct) or rec.get("status") != "ok":
             return False
-        ts = rec.get("checked_at")
-        if not isinstance(ts, (int, float)) or not (0 <= now() - ts < CANDIDATE_TTL):
+        if not reading_fresh(rec, CANDIDATE_TTL):
             return False
         if not _still_spent(rec):
             return False
@@ -2140,8 +2136,7 @@ def best_target(no_probe=False, exclude=None, deadline=None):
                 # account's quota.
                 if not _cache_row_valid(rec, a) or rec.get("status") != "ok":
                     continue
-                ts = rec.get("checked_at")
-                if not isinstance(ts, (int, float)) or (now() - ts) > CANDIDATE_TTL * 2:
+                if not reading_fresh(rec, CANDIDATE_TTL * 2):
                     continue
             else:
                 rec = quota_for(a["name"], a)
@@ -2384,7 +2379,17 @@ def cmd_usage(args):
     This is what lets the quota hook work with no dashboard installed, and it
     answers for a login nobody registered as an account. The live token belongs
     to Claude Code, so this never refreshes it: an expiring one reports nothing
-    rather than rotating a credential another process owns."""
+    rather than rotating a credential another process owns. There is no refresh
+    path in here at all, which is what lets the wall use it.
+
+    A reading that succeeds is ALSO published as that account's own reading, when
+    the token measured is provably the registered account's: the proof that may
+    authorise paying reads readings/, and what the wall has just seen must be
+    what it sees — not a 99% from thirty seconds ago speaking for an account that
+    has just been measured at 100."""
+    global NET_DEADLINE
+    if args.deadline is not None:
+        NET_DEADLINE = time.time() + max(0.0, args.deadline)
     blob, _ = live_read()
     oauth = blob.get("claudeAiOauth") or {}
     token = oauth.get("accessToken") or ""
@@ -2411,6 +2416,18 @@ def cmd_usage(args):
                     "sevenDayReset": sdr,
                 }
                 rc = 0
+                # Identity-bound: only when the token just measured IS the one on
+                # file for the account named. The prologue has banked the live
+                # credential where it could prove ownership; where it could not,
+                # these numbers are about a login ccd cannot name, and are not
+                # filed under anybody's.
+                acct = account_load(measured) if measured else None
+                if acct and _cred_fingerprint(acct) == _cred_fingerprint({"claudeAiOauth": oauth}):
+                    reading_save(measured, {
+                        "status": "ok", "checked_at": now(),
+                        "cred": _cred_fingerprint(acct), "uuid": acct.get("account_uuid"),
+                        "five_hour_percent": fh, "seven_day_percent": sd,
+                        "five_hour_reset": fhr, "seven_day_reset": sdr})
     if args.json:
         # Whose reading this is. A decision taken on it is only about that
         # account, and between taking one and acting on it another session can
@@ -2526,6 +2543,8 @@ def main(argv):
 
     a = sub.add_parser("usage", help="live quota for the signed-in login (internal)")
     a.add_argument("--json", action="store_true")
+    a.add_argument("--deadline", type=float, default=None,
+                   help="seconds this measurement may spend")
     a.set_defaults(fn=cmd_usage)
 
     a = sub.add_parser("current", help="active backbone and account (internal)")

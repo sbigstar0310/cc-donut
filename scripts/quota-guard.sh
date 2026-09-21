@@ -214,7 +214,7 @@ raise SystemExit(0 if any(
 PY
 }
 
-usage_probe() {  # $1=destination file
+usage_probe() {  # $1=destination file  [$2=seconds the whole measurement may take]
   local ab leased=0
   # The backoff and the lease both protect the prompt path, where this hook fires
   # several times a minute. StopFailure is the opposite: it fires once, on the
@@ -257,19 +257,32 @@ usage_probe() {  # $1=destination file
   # A win keeps the lease and keeps the backoff marker. Both are cleared by the
   # caller, once the reading is validated and installed: until then this probe
   # has produced nothing a sibling could use.
-  if CCD_HTTP_TIMEOUT="${CCD_PROBE_TIMEOUT:-5}" "$ab" --no-color usage --json > "$1" 2>/dev/null; then
+  if CCD_HTTP_TIMEOUT="${CCD_PROBE_TIMEOUT:-5}" "$ab" --no-color usage --json ${2:+--deadline "$2"} > "$1" 2>/dev/null; then
     return 0
   fi
   probe_release
   return 1
 }
 
-# A turn that died on rate_limit is the one moment the cached reading is known to
-# be behind: it can be ten minutes old and say 96 while the wall says 100. Spent
-# is 100 now, not 95, so a reading that lags no longer corroborates by accident —
-# it has to be taken again, here, before anything below reads it.
-if [ "$(file_age "$CACHE")" -gt "$TTL" ] \
-   || { [ "$EVENT" = "StopFailure" ] && [ "$HOOK_ERROR" = "rate_limit" ]; }; then
+# AT THE WALL, ONLY A MEASUREMENT THAT JUST SUCCEEDED THERE COUNTS. A turn that
+# died on rate_limit is the one moment the cached reading is known to be behind —
+# ten minutes old and saying 96 while the wall says 100, or saying 100 about a
+# window that has since reset. So the reading is taken again, here, and everything
+# the backstop does below is decided on THAT: $WALL_READ is set only when this
+# invocation measured, validated and published. When the re-read fails the last
+# good reading stays on file for the row to show, and has no authority: nothing
+# fires — no swap, no payment, no wake.
+#
+# It is ccd's own measurement and never the dashboard's. ccd-account knows WHOSE
+# token it measured, so the result is also filed as that account's reading and the
+# proof sees what the wall saw; and it takes a deadline, where the dashboard is
+# somebody else's process with no bound at all. That deadline is the backstop's
+# one budget: it starts here, and the swap below gets what the re-read left.
+WALL=""; WALL_READ=""
+[ "$EVENT" = "StopFailure" ] && [ "$HOOK_ERROR" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ] && WALL=1
+WALL_END=$(( $(date +%s) + SWAP_PICK_BUDGET ))
+wall_left() { echo $(( WALL_END - $(date +%s) )); }
+if [ -n "$WALL" ] || [ "$(file_age "$CACHE")" -gt "$TTL" ]; then
   script=$(ls -d "$HOME/.claude"/plugins/cache/claude-dashboard/claude-dashboard/*/dist/check-usage.js 2>/dev/null | sort -V | tail -1)
   node_bin=$(find_node) || node_bin=""
   # This hook fires on both UserPromptSubmit and PostToolUse, so instances run
@@ -298,7 +311,10 @@ if [ "$(file_age "$CACHE")" -gt "$TTL" ] \
   # measure itself perfectly well, which is the exact failure this change exists
   # to remove. So each producer is judged on what it produced.
   got=0
-  if [ -n "$script" ] && [ -n "$node_bin" ] \
+  if [ -n "$WALL" ]; then
+    left=$(wall_left)
+    [ "$left" -gt 0 ] && usage_probe "$tmp" "$left" && usable_reading "$tmp" && got=1
+  elif [ -n "$script" ] && [ -n "$node_bin" ] \
      && "$node_bin" "$script" --json > "$tmp" 2>/dev/null && usable_reading "$tmp"; then
     got=1
   elif usage_probe "$tmp" && usable_reading "$tmp"; then
@@ -308,7 +324,20 @@ if [ "$(file_age "$CACHE")" -gt "$TTL" ] \
     # Only a reading that actually landed may clear the markers. Publication can
     # fail (a full or read-only $HOME), and clearing them on the way past would
     # advertise a fresh reading that is not there.
+    # One rounding rule for both producers, applied where the reading is published.
+    # The dashboard hands over floats and ccd-account rounds its own; truncating
+    # here made 99.6 "99" to the hook and "100" to ccd-account — one account, two
+    # answers to whether it is spent.
+    python3 - "$tmp" 2>/dev/null <<'PY' || true
+import json, sys
+d = json.load(open(sys.argv[1])); c = d.get("claude") or {}
+for k in ("fiveHourPercent", "sevenDayPercent"):
+    if isinstance(c.get(k), float):
+        c[k] = int(round(c[k]))          # the expression _window uses in ccd-account
+json.dump(d, open(sys.argv[1], "w"))
+PY
     if mv "$tmp" "$CACHE" 2>/dev/null; then
+      [ -n "$WALL" ] && WALL_READ=1
       rm -f "$CCD_DIR/refresh-failed" "$PROBE_BACKOFF"
     else
       rm -f "$tmp"
@@ -775,7 +804,9 @@ if [ "$EVENT" = "StopFailure" ]; then
   # Corroborate: the error says rate_limit AND the dashboard agrees we are spent.
   # Either alone is not enough — a rate_limit can be transient, and a high
   # reading alone does not mean the request actually failed.
-  if [ "$HOOK_ERROR" = "rate_limit" ] && [ -z "${CCD_ACTIVE:-}" ]; then
+  # $WALL_READ, not merely "rate_limit": a re-read that failed leaves nothing here
+  # with the authority to move a session, bill for one, or wake one.
+  if [ -n "$WALL_READ" ]; then
     read_peak
     case "$peak" in
       ''|*[!0-9]*) : ;;   # no trustworthy reading → stay disarmed
@@ -792,7 +823,7 @@ if [ "$EVENT" = "StopFailure" ]; then
            # "Stop hook blocking error" wording the user would otherwise read.
            # stderr is what carries the account's name into that wake.
            from=$(reading_account "$racct")
-           if swap_to_spare "$wkey" "$from" "$SWAP_PICK_BUDGET"; then
+           if swap_to_spare "$wkey" "$from" "$(wall_left)"; then
              IFS=$'\t' read -r account cred _rest <<EOF
 $SWAP_RESULT
 EOF
@@ -840,6 +871,27 @@ EOF
            # have been the answer: with nothing registered there was never
            # anything to move to, and a note every time the quota runs out is noise.
            has_accounts && swap_note "[ccd] The Claude quota ran out and ccd could not move this session to another subscription (${SWAP_REASON:-reason unknown}). Nothing was billed and nothing was ended. \`ccd account list\` shows what each spare looks like, and \`ccd -c\` moves this conversation onto OpenRouter at your own cost if you want it."
+         else
+           # The turn died on rate_limit and the account the store is on HAS ROOM, by
+           # the measurement just taken. The tick installed a spare a second ago and
+           # the request still went out on the old credential (pickup is 1-11s);
+           # another session moved the store; the throttle was transient. Nothing
+           # to swap, nothing to pay for — and a parked turn nobody will come back
+           # to. Wake it ONCE so it retries. No record of who swapped or when: the
+           # measurement is the whole premise. Bounded per session so it cannot
+           # loop — one wake per backoff interval, the same "how long before trying
+           # that again" the probe uses. And after the same settle the swap path
+           # waits, so the retry does not go out on the credential that just failed.
+           stamp="$CCD_DIR/wake-$SESSION_ID"
+           if valid_session_id "$SESSION_ID" \
+              && [ "$(file_age "$stamp")" -gt "$PROBE_BACKOFF_TTL" ] && { : > "$stamp"; } 2>/dev/null; then
+             find "$CCD_DIR" -maxdepth 1 -name 'wake-*' -mmin +60 -delete 2>/dev/null || true
+             [ "${SWAP_SETTLE:-0}" -gt 0 ] 2>/dev/null && sleep "$SWAP_SETTLE"
+             rm -f "$SWAP_NOTE" 2>/dev/null || true
+             printf '%s\n' "[ccd] That request was rate-limited, but the Claude account this session is on has quota (${peak}% used), so ccd is retrying the turn. Nothing was switched and nothing was billed. Continue the task you were working on; do not repeat work that is already complete." >&2
+             exit 2
+           fi
+           swap_note "[ccd] A request was rate-limited although the Claude account this session is on has quota (${peak}% used). ccd already retried a turn for that in the last few minutes and will not loop on it. Nothing was billed. Send the prompt again when you are ready — \`ccd account list\` shows every account."
          fi ;;
     esac
   fi
@@ -1154,7 +1206,7 @@ if has_accounts; then
 import json, os
 name = os.environ["MOVED"]
 print(json.dumps({
-    "systemMessage": f"[ccd] ✓ 쿼타가 바닥나기 전에 {name} 계정으로 갈아탔습니다 "
+    "systemMessage": f"[ccd] ✓ 쿼타가 바닥나서 {name} 계정으로 갈아탔습니다 "
                      "— 무과금, 대화 그대로 이어집니다",
     "hookSpecificOutput": {
         "hookEventName": os.environ["EVENT"],
@@ -1277,6 +1329,8 @@ if max(vals) >= 95:
         "(2) If OPENROUTER_API_KEY in ~/.claude/ccd/providers/keys.env is empty, set it while quota remains and "
         "validate with `ccd doctor`; setup is impossible after exhaustion. "
         "(3) See ~/.claude/ccd/QUOTA-SOS.md for details."
+        " None of this is needed for the free hop: at 100% ccd moves this session to another registered "
+        "subscription by itself. `ccd -c` is the manual, paid route for a user who would rather not wait for that."
     )
 print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": msg}}, ensure_ascii=False))
 EOF

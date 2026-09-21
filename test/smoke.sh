@@ -107,6 +107,133 @@ curl_reject() {
   chmod +x "$FAKE/fakebin/curl"
 }
 curl_reject
+# A stand-in for the Anthropic usage endpoint. ccd-account reaches it with urllib
+# rather than curl, so the double goes in as a sitecustomize module on PYTHONPATH.
+# It is inert unless CCD_FAKE_USAGE names a staged response, which is what keeps
+# it out of the way of every other python3 in this suite and keeps production
+# free of any test-only branch.
+mkdir -p "$FAKE/pysite"
+cat > "$FAKE/pysite/sitecustomize.py" <<'SCEOF'
+import json, os
+_stage = os.environ.get("CCD_FAKE_USAGE")
+if _stage:
+    import urllib.error, urllib.request
+
+    def _urlopen(req, timeout=None, *a, **k):
+        # Count attempts, not successes: the backoff assertion needs to see the
+        # call that failed. The timeout each call was given rides along: a budget
+        # that never reaches the socket is a budget that bounds nothing.
+        log = os.environ.get("CCD_FAKE_USAGE_LOG")
+        if log:
+            with open(log, "a") as f:
+                f.write(f"call\t{timeout}\n")
+        with open(_stage) as f:
+            staged = json.load(f)
+        # One answer for everybody is not enough any more: the wall re-reads the
+        # live account and then the swap probes a spare, in the same run. An answer
+        # staged for a bearer token wins over the default one.
+        _auth = ""
+        try:
+            _auth = (req.get_header("Authorization") or "").replace("Bearer ", "")
+        except Exception:
+            pass
+        staged = dict(staged, **(staged.get("by_token") or {}).get(_auth, {}))
+        # A slow endpoint, and one that honours the caller's bound the way a
+        # socket would: past it the call fails rather than running on.
+        delay = staged.get("delay") or 0
+        if delay:
+            import time as _t
+            if timeout is not None and delay > timeout:
+                _t.sleep(timeout)
+                raise urllib.error.URLError("timed out")
+            _t.sleep(delay)
+        url = getattr(req, "full_url", "") or str(req)
+        if "/token" in url and staged.get("token_body") is not None:
+            status = staged.get("token_status", 200)
+            body = json.dumps(staged["token_body"]).encode()
+            if status != 200:
+                raise urllib.error.HTTPError(url, status, "staged", {}, None)
+
+            class _T:
+                def __init__(self):
+                    self.status = status
+
+                def read(self):
+                    return body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *e):
+                    return False
+
+            return _T()
+        status = staged.get("status", 200)
+        body = json.dumps(staged.get("body", {})).encode()
+        if status != 200:
+            raise urllib.error.HTTPError(
+                getattr(req, "full_url", ""), status, "staged", {}, None)
+
+        class _R:
+            def __init__(self):
+                self.status = status
+
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                return False
+
+        return _R()
+
+    urllib.request.urlopen = _urlopen
+SCEOF
+stage_usage() { # $1=5h utilization  $2=7d utilization  [$3=http status] [$4=delay s] [$5=rotated access token]
+  python3 - "$STAGE" "$1" "$2" "${3:-200}" "${4:-0}" "${5:-}" <<'SUEOF'
+import datetime, json, sys
+out, fh, sd, status, delay, rotated = sys.argv[1:7]
+fh, sd, status, delay = int(fh), int(sd), int(status), float(delay)
+now = datetime.datetime.now(datetime.timezone.utc)
+ahead = lambda h: (now + datetime.timedelta(hours=h)).isoformat()
+staged = {"status": status, "delay": delay,
+          "body": {"five_hour": {"utilization": fh, "resets_at": ahead(2)},
+                   "seven_day": {"utilization": sd, "resets_at": ahead(72)}}}
+if rotated:
+    # A token exchange answers on the same double; a rotation is the one thing
+    # that must be seen to happen under a lock rather than beside one.
+    staged["token_body"] = {"access_token": rotated, "refresh_token": "RT-" + rotated,
+                            "expires_in": 3600}
+with open(out, "w") as f:
+    json.dump(staged, f)
+SUEOF
+}
+stage_token() { # $1=access token  $2=5h  $3=7d  [$4=http status] — an answer for ONE bearer token
+  python3 - "$STAGE" "$1" "$2" "$3" "${4:-200}" <<'STEOF'
+import datetime, json, os, sys
+out, tok, fh, sd, status = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+now = datetime.datetime.now(datetime.timezone.utc)
+ahead = lambda h: (now + datetime.timedelta(hours=h)).isoformat()
+d = json.load(open(out)) if os.path.exists(out) else {"status": 500, "body": {}}
+d.setdefault("by_token", {})[tok] = {"status": status, "body": {
+    "five_hour": {"utilization": fh, "resets_at": ahead(2)}, "seven_day": {"utilization": sd, "resets_at": ahead(72)}}}
+json.dump(d, open(out, "w"))
+STEOF
+}
+# What a hook run AT THE WALL needs. It re-reads the account through ccd-account, so
+# it needs the real tool and the stand-in endpoint; without them the re-read fails,
+# nothing fires, and a case about anything else would pass for that reason alone.
+STAGE="$FAKE/.stage-usage.json"
+WALLENV=(PYTHONPATH="$FAKE/pysite" CCD_FAKE_USAGE="$STAGE")
+# ...and somebody signed in, because the wall measures the LIVE login. Sections that
+# are about accounts write their own; this is for the ones that never needed one.
+wall_login() { # [$1=home]
+  local h="${1:-$FAKE}"; mkdir -p "$h/.claude"
+  [ -f "$h/.claude/.credentials.json" ] || printf '{"claudeAiOauth":{"accessToken":"AT-wall","refreshToken":"RT-wall","expiresAt":%s}}\n' \
+    "$(( ($(date +%s) + 99999) * 1000 ))" > "$h/.claude/.credentials.json"
+}
 stub_usage() { # $1=5h $2=7d
   printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" > "$FAKE/.stub-usage.json"
 }
@@ -181,6 +308,19 @@ SHELL=/bin/zsh "$ROOT/bin/ccd" setup --yes >/dev/null 2>&1 \
   && ok "setup is idempotent" || bad "setup idempotent"
 "$ROOT/bin/ccd" uninstall --purge >/dev/null 2>&1
 [ -d "$FAKE/.claude/ccd" ] && bad "purge removes state" || ok "uninstall --purge removes state"
+
+# Both producers of the live reading round the same way, where the reading is
+# published. The dashboard hands over floats and the hook used to truncate them, so
+# 99.6 was 99 to the hook and 100 to ccd-account: one account, two answers to "is it
+# spent". (Its own HOME: nothing else in the suite should see this reading.)
+RND="$FAKE/rounding"; rm -rf "$RND"; mkdir -p "$RND/.claude/ccd" "$RND/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist"
+: > "$RND/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist/check-usage.js"
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":58.2,"fiveHourReset":"R1","sevenDayPercent":99.6,"sevenDayReset":"D1"}}\n' > "$RND/.stub-usage.json"
+HOME="$RND" CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit </dev/null >/dev/null 2>&1
+got=$(python3 -c 'import json,sys;c=json.load(open(sys.argv[1]))["claude"];print(repr(c["fiveHourPercent"]), repr(c["sevenDayPercent"]))' "$RND/.claude/ccd/quota-cache.json" 2>/dev/null)
+[ "$got" = "58 100" ] && ok "a dashboard reading of 99.6 is published as 100, as ccd's own producer would" \
+  || bad "two rounding rules" "published: ${got:-nothing}"
+rm -rf "$RND"
 
 head_ "7. key handling (piped path, no network dependency)"
 "$ROOT/bin/ccd" >/dev/null 2>&1
@@ -672,6 +812,7 @@ esac
 curl_reject
 
 head_ "16. automatic handoff: arming predicate + hook stdin"
+wall_login
 mkdir -p "$FAKE/.claude/ccd/providers"
 hf_reset() { rm -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json"; }
 # Did a signalled stand-in exit within the ceiling? A single sleep turns "was it
@@ -692,12 +833,11 @@ import json,os,sys
 p='$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json'
 print(json.load(open(p)).get(sys.argv[1],'') if os.path.exists(p) else '')" "$1" 2>/dev/null; }
 # Quota cache the hook reads to corroborate a rate_limit error.
-# The reading is staged in the cache AND behind it. A turn that dies on rate_limit
-# takes the reading again rather than trust one that may be ten minutes old, so a
-# fixture that staged only the cache would have its wall re-measured away by
-# whatever the stand-in dashboard happened to say last.
+# The reading is staged in the cache AND at the endpoint the wall re-reads. A turn
+# that dies on rate_limit decides on a measurement taken then and there, so a case
+# that staged only the cache would have its wall re-measured away.
 quota() { printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" \
-            | tee "$FAKE/.stub-usage.json" > "$FAKE/.claude/ccd/quota-cache.json"; }
+            > "$FAKE/.claude/ccd/quota-cache.json"; stage_usage "$1" "$2"; }
 # StopFailure payload as Claude Code delivers it.
 stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"%s"}' "$1" "$2"; }
 
@@ -733,7 +873,7 @@ set +m 2>/dev/null
 sleep 0.3
 # Signalling is section 17's subject; here we only care what gets armed, so aim
 # CLAUDE_PID at a live stand-in and let it be killed.
-fire_stopfail() { CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
+fire_stopfail() { CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
 arm_run() { stopfail "$1" "$2" | fire_stopfail; }
 
 # rate_limit ALONE is not enough — it can be transient throttling. The dashboard
@@ -801,7 +941,7 @@ arm_run sess-c overloaded
 
 # No reading ANYWHERE: a turn that dies on rate_limit takes the reading again, so the
 # stand-in dashboard has to be silent too, or this proves nothing about a missing one.
-hf_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json" "$FAKE/.stub-usage.json"
+hf_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json"; stage_usage 58 100 500
 arm_run sess-d rate_limit
 [ -z "$(hf_get armed)" ] && ok "no quota reading does not arm (fails closed)" \
   || bad "must not arm without corroboration" "armed=$(hf_get armed)"
@@ -857,7 +997,7 @@ quota 58 100
 "$FAKE/sigbin/claude" 8 & TARGET=$!
 sleep 0.3
 hf_reset
-stopfail sess-e rate_limit | CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-e rate_limit | CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 sleep 0.4
 if kill -0 "$TARGET" 2>/dev/null; then ok "no CCD_HANDOFF → session is never signalled"
 else bad "interlock breached" "target died without a relaunch loop"; fi
@@ -869,7 +1009,7 @@ set +m 2>/dev/null
 "$FAKE/sigbin/claude" 8 2>/dev/null & TARGET=$!
 sleep 0.3
 hf_reset
-stopfail sess-f rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-f rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 if died_within "$TARGET" 5; then ok "CCD_HANDOFF=1 → SIGHUP delivered to the claude process"
 else bad "handoff signal" "target survived CCD_HANDOFF=1"; fi
 kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
@@ -879,7 +1019,7 @@ kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
 "$FAKE/sigbin/claude" 8 & TARGET=$!
 sleep 0.3
 hf_reset
-stopfail sess-g rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-g rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 sleep 0.4
 if kill -0 "$TARGET" 2>/dev/null; then ok "missing OpenRouter key → no signal (fails closed)"
 else bad "signalled without a key" "target died with no fallback available"; fi
@@ -2173,14 +2313,14 @@ printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
 paid_optin_on
 quota 58 100
 hf_reset
-stopfail sess-h rate_limit | CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-h rate_limit | CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
   && ok "an unsupervised session never leaves armed state behind" \
   || bad "stale armed handoff" "written without CCD_HANDOFF"
 
 : > "$keyfile"
 hf_reset
-stopfail sess-i rate_limit | CCD_HANDOFF=1 CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-i rate_limit | CCD_HANDOFF=1 CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
   && ok "no key → nothing is armed either" \
   || bad "armed without a key" "would end the session with nowhere to go"
@@ -2292,11 +2432,18 @@ sleep 0.3
 # CCD_DIR moves with HOME, so a HOME whose ccd directory is missing makes the
 # state write fail while the contract still matches — no production knob needed.
 BROKEN="$FAKE/broken-home"
-mkdir -p "$BROKEN/.claude"     # deliberately no ccd/ subdirectory
-cp -R "$FAKE/.claude/ccd" "$BROKEN/.claude/ccd-backup" 2>/dev/null || true
+# Everything a paid hop needs IS here — login, key, opt-in, nothing registered — so
+# the hook gets as far as recording the order, and that is the step that fails: a
+# directory sits where the state file goes, which stops root too. (It used to have
+# no ccd/ at all, which also meant no opt-in and no key: nothing was ever going to
+# be signalled, and the case passed for that reason.)
+rm -rf "$BROKEN"; mkdir -p "$BROKEN/.claude/ccd/providers" "$BROKEN/.claude/ccd/handoff-00000000000000000000000000000002.json"
+: > "$BROKEN/.claude/ccd/paid-handoff"
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$BROKEN/.claude/ccd/providers/keys.env"
+wall_login "$BROKEN"
 stopfail sess-w rate_limit | HOME="$BROKEN" CCD_HANDOFF=00000000000000000000000000000002 \
   CCD_HANDOFF_STATE="$BROKEN/.claude/ccd/handoff-00000000000000000000000000000002.json" \
-  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 sleep 0.5
 if kill -0 "$TARGET" 2>/dev/null; then ok "a failed state write means no signal"
 else bad "signalled without state" "the session would never come back"; fi
@@ -3977,6 +4124,12 @@ d["claudeAiOauth"]["expiresAt"] = int((time.time() + 8 * 3600) * 1000)
 json.dump(d, open(p, "w"))
 LIVEPY
   rm -rf "$RQD"
+  # Its OWN live reading. `use --force` a few cases up deletes the cache, so this run
+  # used to go and fetch one — from a stand-in that a later edit of mine had left
+  # saying 100% — and then moved the session to the spare it had just warmed,
+  # whenever the background pick won the race (Linux always, macOS never).
+  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
+    > "$FAKE/.claude/ccd/quota-cache.json"
   printf '{"session_id":"sess-warm","cwd":"/tmp"}' \
     | CCD_USAGE_URL="http://127.0.0.1:$(cat "$FAKE/.uport")/usage" \
       CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
@@ -4797,81 +4950,6 @@ rm -rf "$FAKE/.claude/plugins/cache/claude-dashboard" \
        "$FAKE/.claude/plugins/data/claude-dashboard-claude-dashboard" \
        "$FAKE/.claude/ccd/.dashboard-row" "$FAKE/.claude/ccd/.dashboard-row.lock"
 
-# A stand-in for the Anthropic usage endpoint. ccd-account reaches it with urllib
-# rather than curl, so the double goes in as a sitecustomize module on PYTHONPATH.
-# It is inert unless CCD_FAKE_USAGE names a staged response, which is what keeps
-# it out of the way of every other python3 in this suite and keeps production
-# free of any test-only branch.
-mkdir -p "$FAKE/pysite"
-cat > "$FAKE/pysite/sitecustomize.py" <<'SCEOF'
-import json, os
-_stage = os.environ.get("CCD_FAKE_USAGE")
-if _stage:
-    import urllib.error, urllib.request
-
-    def _urlopen(req, timeout=None, *a, **k):
-        # Count attempts, not successes: the backoff assertion needs to see the
-        # call that failed. The timeout each call was given rides along: a budget
-        # that never reaches the socket is a budget that bounds nothing.
-        log = os.environ.get("CCD_FAKE_USAGE_LOG")
-        if log:
-            with open(log, "a") as f:
-                f.write(f"call\t{timeout}\n")
-        with open(_stage) as f:
-            staged = json.load(f)
-        # A slow endpoint, and one that honours the caller's bound the way a
-        # socket would: past it the call fails rather than running on.
-        delay = staged.get("delay") or 0
-        if delay:
-            import time as _t
-            if timeout is not None and delay > timeout:
-                _t.sleep(timeout)
-                raise urllib.error.URLError("timed out")
-            _t.sleep(delay)
-        url = getattr(req, "full_url", "") or str(req)
-        if "/token" in url and staged.get("token_body") is not None:
-            status = staged.get("token_status", 200)
-            body = json.dumps(staged["token_body"]).encode()
-            if status != 200:
-                raise urllib.error.HTTPError(url, status, "staged", {}, None)
-
-            class _T:
-                def __init__(self):
-                    self.status = status
-
-                def read(self):
-                    return body
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *e):
-                    return False
-
-            return _T()
-        status = staged.get("status", 200)
-        body = json.dumps(staged.get("body", {})).encode()
-        if status != 200:
-            raise urllib.error.HTTPError(
-                getattr(req, "full_url", ""), status, "staged", {}, None)
-
-        class _R:
-            def __init__(self):
-                self.status = status
-
-            def read(self):
-                return body
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *e):
-                return False
-
-        return _R()
-
-    urllib.request.urlopen = _urlopen
-SCEOF
 export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
 export CCD_FAKE_USAGE="$FAKE/.stage-usage.json"
 export CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
@@ -4880,25 +4958,6 @@ export CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
 # window that already turned over, and every positive assertion here starts
 # failing on a calendar date rather than on a code change. Expired timestamps
 # belong only in the reset-crossing test, which builds its own.
-stage_usage() { # $1=5h utilization  $2=7d utilization  [$3=http status] [$4=delay s] [$5=rotated access token]
-  python3 - "$CCD_FAKE_USAGE" "$1" "$2" "${3:-200}" "${4:-0}" "${5:-}" <<'SUEOF'
-import datetime, json, sys
-out, fh, sd, status, delay, rotated = sys.argv[1:7]
-fh, sd, status, delay = int(fh), int(sd), int(status), float(delay)
-now = datetime.datetime.now(datetime.timezone.utc)
-ahead = lambda h: (now + datetime.timedelta(hours=h)).isoformat()
-staged = {"status": status, "delay": delay,
-          "body": {"five_hour": {"utilization": fh, "resets_at": ahead(2)},
-                   "seven_day": {"utilization": sd, "resets_at": ahead(72)}}}
-if rotated:
-    # A token exchange answers on the same double; a rotation is the one thing
-    # that must be seen to happen under a lock rather than beside one.
-    staged["token_body"] = {"access_token": rotated, "refresh_token": "RT-" + rotated,
-                            "expires_in": 3600}
-with open(out, "w") as f:
-    json.dump(staged, f)
-SUEOF
-}
 # The hook as the plugin runs it, with the dashboard gone.
 nd_hook() { CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" "$@"; }
 # Move the file into the past rather than the clock into the future: production
@@ -4972,7 +5031,7 @@ nd_arm() { # $1=session id ; leaves the hook's exit code in $ND_RC
     | CCD_HANDOFF=00000000000000000000000000000002 \
       CCD_HANDOFF_STATE="$CCDD/handoff-00000000000000000000000000000002.json" \
       CLAUDE_PID=$NDPID CCD_STANDIN_PID=$NDPID CLAUDE_PLUGIN_ROOT="$ROOT" \
-      CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+      CCD_SWAP_SETTLE=0 env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
   ND_RC=$?
   sleep 0.3
   kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
@@ -5087,12 +5146,28 @@ stage_usage 58 100 500            # and every refresh since has failed
 nd_arm sess-nd4
 [ -z "$(hf_get armed)" ] && ok "a reading too old to describe now does not arm" \
   || bad "armed on a stale reading" "armed=$(hf_get armed)"
-# The bound has to be an upper one, not a rejection of everything: a reading from
-# four minutes ago is what a working install always has.
+# ...and so does a YOUNG one, when the re-read at the wall fails. The last good
+# reading stays on file for the row to show; it has no authority here. Letting it
+# corroborate is how a quota that had since reset, plus one transient rate_limit,
+# plus one 429 on the re-read, added up to a paid hop.
 hf_reset; quota 58 100
 nd_age "$CCDD/quota-cache.json" 240
+stage_usage 58 100 429
 nd_arm sess-nd5
-[ "$(hf_get armed)" = "True" ] && ok "...while a recent one still does" \
+[ -z "$(hf_get armed)" ] && ok "a re-read that fails at the wall fires nothing, whatever the cache still says" \
+  || bad "armed on a failed re-read" "armed=$(hf_get armed)"
+# Codex's case exactly: nothing registered, a cached 100% whose reset is unknown.
+hf_reset
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":100,"sevenDayPercent":40}}\n' > "$CCDD/quota-cache.json"
+stage_usage 58 100 429
+nd_arm sess-nd5b
+[ -z "$(hf_get armed)" ] && ok "...including a cached 100% with no reset time and nobody registered" \
+  || bad "armed on a failed re-read" "armed=$(hf_get armed)"
+# A re-read that SUCCEEDS is what a working install has, and it is what arms.
+hf_reset; quota 58 40
+stage_usage 58 100
+nd_arm sess-nd5c
+[ "$(hf_get armed)" = "True" ] && ok "...while a re-read that succeeds and says spent still arms" \
   || bad "rejected a fresh reading" "armed=$(hf_get armed)"
 
 # A reading can be young and still describe a window that no longer exists. Four
@@ -5113,8 +5188,9 @@ hf_reset
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":100,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
   "$future" "$future" > "$CCDD/quota-cache.json"
 nd_age "$CCDD/quota-cache.json" 240
+stage_usage 100 40
 nd_arm sess-nd7
-[ "$(hf_get armed)" = "True" ] && ok "...while one whose window is still open does" \
+[ "$(hf_get armed)" = "True" ] && ok "...while one whose window is still open, re-read at the wall, does" \
   || bad "rejected a live window" "armed=$(hf_get armed)"
 
 # ── One probe, not one per hook ─────────────────────────────────────────────
@@ -5373,7 +5449,15 @@ paid_optin_off
 # The plugin root is passed explicitly. Without it the hook resolves ccd-account
 # through the plugin cache, where an older copy is staged — and the section would
 # test that copy instead of the tree.
-sw_hook() { CLAUDE_PLUGIN_ROOT="${SW_ROOT:-$ROOT}" CCD_SWAP_SETTLE="${SW_SETTLE:-0}" "$ROOT/scripts/quota-guard.sh" "$@"; }
+# A run at the wall re-reads the account, so it always gets the stand-in endpoint;
+# a tick gets whatever the section exported, as before.
+sw_hook() {
+  if [ "${1:-}" = StopFailure ]; then
+    CLAUDE_PLUGIN_ROOT="${SW_ROOT:-$ROOT}" CCD_SWAP_SETTLE="${SW_SETTLE:-0}" env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" "$@"
+  else
+    CLAUDE_PLUGIN_ROOT="${SW_ROOT:-$ROOT}" CCD_SWAP_SETTLE="${SW_SETTLE:-0}" "$ROOT/scripts/quota-guard.sh" "$@"
+  fi
+}
 # Its own store, every time. Two accounts, the signed-in one spent and the other
 # with room, plus the reading that corroborates it. Seeded per case rather than
 # inherited: a case that ran on the previous one's leftovers would have nothing to
@@ -6071,48 +6155,44 @@ sw_stopfail sess-p2 >/dev/null
 # subscription with room. Codex's interleaving, as it happens:
 pay_case 10 20                          # B (spare) has room
 "$ACCT" --no-color use spare --force >/dev/null 2>&1   # ...and another session moved the store onto it
-quota 58 100                             # this session's own reading still says: spent
-hf_reset; rm -f "$SWD/swap-note"
+quota 58 100                             # this session's cached reading still says: spent
+stage_usage 10 20                        # ...but the wall measures the account the store is on NOW
+hf_reset; rm -f "$SWD/swap-note" "$SWD"/wake-*
 sw_stopfail sess-p2b >/dev/null
-unpaid "the store moved onto an account with room while this session hit the wall" nonote
+[ -z "$(hf_get direction)" ] \
+  && ok "no paid hop: the store moved onto an account with room while this session hit the wall" \
+  || bad "paid without proof: the store moved" "armed $(hf_get direction)"
+rm -f "$SWD"/wake-*
 
-# The active account is measured on the way, because nothing else on this path
-# does it: with one account registered its reading is the whole proof.
+# The wall's re-read IS the active account's measurement, so with one account
+# registered it is the whole proof — and it never touches the token Claude Code owns.
 pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
 age_row spent; stage_usage 100 100
 : > "$CCD_FAKE_USAGE_LOG"
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2c >/dev/null
 { [ "$(hf_get direction)" = "to_fallback" ] && [ -s "$CCD_FAKE_USAGE_LOG" ]; } \
-  && ok "one registered account, measured spent on the spot, is proof" \
+  && ok "one registered account, measured spent at the wall, is proof" \
   || bad "paid proof" "direction=$(hf_get direction), measured $(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ') times"
-# ccd's copy of the active account's token can be out of date: Claude Code rotates
-# the live one on its own clock, and that token is the SESSION'S — ccd never renews
-# it, here or anywhere. So an expired copy is simply not a measurement, which makes
-# it not proof. (That no exchange happens is enforced twice: this probe asks for
-# none, and account_refresh refuses the active account whoever asks.)
 pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
-age_row spent
-python3 - "$ADIR/spent.json" <<'PY'
+stage_usage 5 5 503
+CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2d >/dev/null
+unpaid "the re-read at the wall failed, with a fresh 100% reading on file for every account" nonote
+[ ! -f "$SWD/swap-note" ] && ok "...and nothing else fires either: no swap, no wake, no note" \
+  || bad "acted on a failed re-read" "left a note: $(note_text | head -c 100)"
+# The live token is the SESSION'S. An expired one is simply not measured — there is
+# no refresh path in the wall's measurement at all — and an unmeasured wall fires nothing.
+pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
+python3 - "$CREDS" <<'PY'
 import json, sys, time
 d = json.load(open(sys.argv[1])); d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
 json.dump(d, open(sys.argv[1], "w"))
 PY
-stage_usage 100 100 200 0 AT-spent-rotated
-: > "$CCD_FAKE_USAGE_LOG"
+stage_usage 100 100 200 0 AT-spent-rotated               # an exchange WOULD rotate, and would show
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2e >/dev/null
-unpaid "the active account's stored token has expired, so it could not be measured"
-ptok() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$1"; }
-# The endpoint is staged to ROTATE on an exchange, so one would show: the stored
-# token would now read AT-spent-rotated. (Usage calls are expected here — a turn
-# that died at the wall re-reads the live account — so they are not what is counted.)
-[ "$(ptok "$ADIR/spent.json")" = "AT-spent" ] \
+unpaid "the live token has expired, so the wall could not be measured" nonote
+{ grep -q '"AT-spent"' "$CREDS" && ! grep -q 'rotated' "$ADIR/spent.json" "$CREDS"; } \
   && ok "...and nothing is exchanged to find out: that token belongs to the running session" \
-  || bad "spent the live token" "the stored token is now $(ptok "$ADIR/spent.json")"
-
-pay_case 100 100; "$ACCT" --no-color rm spare >/dev/null 2>&1
-age_row spent; stage_usage 5 5 503
-CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2d >/dev/null
-unpaid "the one registered account could not be measured"
+  || bad "spent the live token" "a token was rotated from the wall's measurement"
 
 # ONE meaning of "spent", and it is 100%. The 90% reserve used to decide two things
 # at once — "not worth hopping to" and "spent enough to pay" — so a spare at 90%
@@ -6221,7 +6301,9 @@ tmp = sys.argv[1] + ".bg"
 json.dump(row, open(tmp, "w")); os.replace(tmp, sys.argv[1])
 PY
 ) & BGP=$!
-CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color swap --from spent --window none --deadline 30 >/dev/null 2>&1
+# The measurement in flight is the wall's own: three seconds on the wire for the
+# active account, while a background prober records the spare.
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color usage --json --deadline 30 >/dev/null 2>&1
 wait "$BGP" 2>/dev/null
 spare_row() { python3 -c 'import json,sys
 try: r = json.load(open(sys.argv[1]))
@@ -6230,9 +6312,45 @@ print(str(r.get("status")) + ":" + str(r.get("five_hour_percent")))' "$RQD/spare
 [ "$(spare_row)" = "ok:10" ] \
   && ok "a measurement in flight does not write back over another account's newer reading" \
   || bad "lost update" "the spare's reading is now $(spare_row)"
+stage_token AT-spare 10 20
 CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color swap --from spent --window none --deadline 30 >/dev/null 2>&1
 grep -q 'AT-spare' "$CREDS" && ok "...so the next attempt finds the spare and moves there" \
   || bad "lost update" "the healthy spare was never reached"
+# ...and "check, then replace" has to be ONE step. Writer A passes the check with
+# 99%@T and is descheduled before its rename; writer B publishes 100%@T+10; A
+# resumes and puts 99% back. Nothing bounds that pause, so it is closed with a lock
+# per account — two processes, because the lock is reentrant inside one.
+cat > "$FAKE/.lockrace.py" <<'PY'
+import importlib.machinery, importlib.util, sys, time
+loader = importlib.machinery.SourceFileLoader("ccdrace", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(m)
+who, t = sys.argv[2], int(sys.argv[3])
+if who == "A":
+    real = m.write_json
+    def slow(p, obj, mode=0o600):
+        if str(p).endswith("race2.json"):
+            time.sleep(2.0)             # past the check, not yet renamed
+        return real(p, obj, mode)
+    m.write_json = slow
+    m.reading_save("race2", {"status": "ok", "checked_at": t, "five_hour_percent": 99})
+else:
+    time.sleep(0.7)                     # A is inside its pause by now
+    m.reading_save("race2", {"status": "ok", "checked_at": t + 10, "five_hour_percent": 100})
+PY
+rm -f "$RQD/race2.json"; mkdir -p "$RQD"
+T0=$(date +%s)
+PYTHONDONTWRITEBYTECODE=1 HOME="$FAKE" python3 "$FAKE/.lockrace.py" "$ROOT/bin/ccd-account" A "$T0" & RA=$!
+PYTHONDONTWRITEBYTECODE=1 HOME="$FAKE" python3 "$FAKE/.lockrace.py" "$ROOT/bin/ccd-account" B "$T0" & RB=$!
+wait "$RA" "$RB" 2>/dev/null
+got=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("five_hour_percent"))' "$RQD/race2.json" 2>/dev/null)
+[ "$got" = "100" ] \
+  && ok "a writer paused between its check and its rename cannot put an older reading back" \
+  || bad "lost update" "the account's reading ended at ${got:-nothing}% — the older writer won"
+ls "$RQD" | grep -v '\.json$' | grep -q . \
+  && { ls -A "$RQD" | grep -q '^\.' || bad "lock in the way" "a non-dot file sits beside the readings: $(ls "$RQD" | tr '\n' ' ')"; } || true
+rm -f "$RQD/race2.json" "$RQD"/.race2.* "$FAKE/.lockrace.py"
+
 # Two probers of the SAME account can finish out of order. The later look wins.
 PYTHONDONTWRITEBYTECODE=1 HOME="$FAKE" python3 - "$ROOT/bin/ccd-account" <<'PY' \
   && ok "an older measurement of an account never replaces a newer one" \
@@ -6260,8 +6378,82 @@ m.reading_drop("stamp")
 import os, stat
 assert stat.S_IMODE(os.stat(m.reading_path("race")).st_mode) == 0o600
 assert stat.S_IMODE(os.stat(m.READINGS_DIR).st_mode) == 0o700
+# One freshness rule for every reader: a reading from the FUTURE is a wrong clock,
+# not a fresh reading. After a backward clock step it would otherwise pin a spent
+# verdict in place and keep a usable account from being measured again.
+probed = []
+m.probe_account = lambda n, a, allow_refresh=True: (probed.append(n), {"status": "ok", "checked_at": t, "five_hour_percent": 1})[1]
+acct = {"claudeAiOauth": {"accessToken": "AT-fut"}}
+m.write_json(m.reading_path("fut"), {"status": "ok", "checked_at": t + 9999, "cred": m._cred_fingerprint(acct), "five_hour_percent": 100}, 0o600)
+m.quota_for("fut", acct)
+assert probed == ["fut"], "a future-dated reading was served as fresh instead of being re-measured"
+m.reading_drop("fut")
+# ...and a readings directory that already existed with loose permissions is put right.
+os.chmod(m.READINGS_DIR, 0o755)
+m.reading_save("perm", {"status": "ok", "checked_at": t})
+assert stat.S_IMODE(os.stat(m.READINGS_DIR).st_mode) == 0o700, oct(stat.S_IMODE(os.stat(m.READINGS_DIR).st_mode))
+m.reading_drop("perm")
 m.reading_drop("race")
+assert not [f for f in os.listdir(m.READINGS_DIR) if "race" in f or "perm" in f or "fut" in f], os.listdir(m.READINGS_DIR)
 PY
+
+# What the wall just measured is what the proof sees. The re-read used to land only
+# in the hook's own cache, so an account reading taken 30 seconds earlier at 99%
+# went on speaking for an account the wall had just measured at 100 — and the turn
+# stayed parked with every condition for paying met.
+pay_case 100 100
+RQT=$(rq_gather)
+python3 - "$RQT" <<'PY'
+import json, sys, time
+q = json.load(open(sys.argv[1]))
+q["spent"].update({"five_hour_percent": 99, "seven_day_percent": 99, "checked_at": int(time.time()) - 30})
+json.dump(q, open(sys.argv[1], "w"))
+PY
+rq_scatter "$RQT"
+stage_usage 100 100
+CCD_HTTP_TIMEOUT=5 sw_stopfail sess-w1 >/dev/null
+[ "$(hf_get direction)" = "to_fallback" ] \
+  && ok "the wall's own measurement of the active account is the one the proof reads" \
+  || bad "wall reading lost" "direction=$(hf_get direction), spent's reading: $(head -c 140 "$RQD/spent.json" 2>/dev/null)"
+
+# ...but only under a name ccd can PROVE. The pointer says `spent`; the login in the
+# store is somebody ccd never registered (a /login it has had no chance to bank, and
+# no profile to bank it by). Those numbers are about a stranger, and filing them as
+# spent's reading would let a stranger's quota speak in the proof for spent's.
+pay_case 100 100
+rm -f "$RQD/spent.json"
+write_creds stranger
+stage_usage 100 100
+CCD_HTTP_TIMEOUT=5 "$ACCT" --no-color usage --json >/dev/null 2>&1
+[ ! -e "$RQD/spent.json" ] \
+  && ok "...and a measurement of a login ccd cannot tie to the account is filed under nobody's name" \
+  || bad "reading filed under the wrong account" "spent's reading now says: $(head -c 120 "$RQD/spent.json")"
+
+# A turn can die on rate_limit while the account the store is ON has room: the tick
+# installed a spare a second ago and the request still went out on the old
+# credential; another session moved the store; the throttle was transient. There is
+# nothing to swap and nothing to pay for — and a turn left parked. It is woken, once.
+pay_case 10 20
+"$ACCT" --no-color use spare --force >/dev/null 2>&1      # the store is on the healthy account
+stage_usage 10 20                                        # ...and the wall measures exactly that
+rm -f "$SWD"/wake-* "$SWD/swap-note"; hf_reset
+rc=$(CCD_HTTP_TIMEOUT=5 sw_stopfail sess-k1)
+{ [ "$rc" = "2" ] && [ -z "$(hf_get direction)" ] && grep -q 'AT-spare' "$CREDS"; } \
+  && ok "a turn that died on rate_limit beside an account with room is woken to retry" \
+  || bad "left parked" "rc=$rc, direction=$(hf_get direction)"
+case "$(cat "$FAKE/.sw-err")" in
+  *"switched this session to"*) bad "wake message" "claimed a swap that did not happen: $(head -c 140 "$FAKE/.sw-err")" ;;
+  *"has quota"*|*"has room"*) ok "...in words that are true: the account has quota and the turn is retried, no swap claimed" ;;
+  *) bad "wake message" "got: $(head -c 140 "$FAKE/.sw-err")" ;;
+esac
+rc=$(CCD_HTTP_TIMEOUT=5 sw_stopfail sess-k1)
+{ [ "$rc" != "2" ] && [ -f "$SWD/swap-note" ]; } \
+  && ok "...once: a second failure inside the interval wakes nothing and leaves a note instead" \
+  || bad "wake loop" "rc=$rc on the second failure, note: $(note_text | head -c 100)"
+rc=$(CCD_HTTP_TIMEOUT=5 sw_stopfail sess-k2)
+[ "$rc" = "2" ] && ok "...and the bound is per session, not a gag on every other one" \
+  || bad "wake bound" "a different session was refused its one retry (rc=$rc)"
+rm -f "$SWD"/wake-* "$SWD/swap-note"
 
 # The user's three conditions, one missing at a time.
 pay_case 100 100; rm -f "$SWD/providers/keys.env"
@@ -6277,7 +6469,7 @@ esac
 pay_case 100 100
 printf '{"session_id":"sess-p5","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"rate_limit"}' \
   | env -u CCD_HANDOFF -u CCD_HANDOFF_STATE CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID \
-      CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+      CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 unpaid "no launcher supervising the session"
 case "$(note_text)" in
   *"launcher"*"claude"*) ok "...and the note says the opt-in is on but this session cannot take it, and what fixes that" ;;
@@ -6298,11 +6490,11 @@ CCD_SWAP_PICK_BUDGET=3 sw_stopfail sess-p7 >/dev/null
 kill -9 "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
 unpaid "a store lock that timed out"
 
-pay_case 100 100; age_spare_row; stage_usage 5 5 503
+pay_case 100 100; age_spare_row; stage_usage 100 100; stage_token AT-spare 5 5 503
 CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p8 >/dev/null; unpaid "a spare that answered 503"
 
 pay_case 100 100; age_spare_row
-CCD_SWAP_PICK_BUDGET=0 sw_stopfail sess-p9 >/dev/null; unpaid "a deadline that expired before anything was measured"
+CCD_SWAP_PICK_BUDGET=0 sw_stopfail sess-p9 >/dev/null; unpaid "a deadline that expired before anything was measured" nonote
 
 pay_case 100 100
 RQT=$(rq_gather)
@@ -6312,6 +6504,7 @@ q = json.load(open(sys.argv[1])); q["spare"] = {"status": "unknown", "checked_at
 json.dump(q, open(sys.argv[1], "w"))
 PY
 rq_scatter "$RQT"
+stage_token AT-spare 5 5 500            # ...and it cannot be measured now either
 sw_stopfail sess-p10 >/dev/null; unpaid "a spare whose reading is not a measurement"
 
 pay_case 100 100
@@ -6609,7 +6802,7 @@ printf '{"session_id":"sess-k1","cwd":"/tmp/w","hook_event_name":"StopFailure","
 # exec, so that $! is the hook itself: a signal sent to a wrapping subshell kills
 # the wrapper and proves nothing about the script inside it.
 ( exec env CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID CLAUDE_PLUGIN_ROOT="$FAKE/slowroot" \
-    "$ROOT/scripts/quota-guard.sh" StopFailure < "$FAKE/.k1-in" >/dev/null 2>&1 ) & HKPID=$!
+    env "${WALLENV[@]}" "$ROOT/scripts/quota-guard.sh" StopFailure < "$FAKE/.k1-in" >/dev/null 2>&1 ) & HKPID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -e "$FAKE/.swap-started" ] && break; sleep 0.25; done
 started=$(ls "$SWD"/.swap-err.* 2>/dev/null | wc -l | tr -d ' ')
 kill -TERM "$HKPID" 2>/dev/null; wait "$HKPID" 2>/dev/null
@@ -6911,7 +7104,10 @@ sleep 0.3
 sw_fixture 58 100 100 100
 rm -f "$SWD/swap-note"
 mkdir -p "$SWD/swap-note.tmp"          # the one name a careless writer would take
-SW_ROOT="$FAKE/countroot" sw_stopfail sess-n5 >/dev/null
+# The stand-in forwards everything but `swap` to the real tool, and says where that
+# is through this variable — which an earlier section unsets on its way out. Without
+# it the wall's re-read goes nowhere, nothing fires, and there is no note to parse.
+CCD_REAL_ACCOUNT="$ACCT" SW_ROOT="$FAKE/countroot" sw_stopfail sess-n5 >/dev/null
 rmdir "$SWD/swap-note.tmp" 2>/dev/null
 python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$SWD/swap-note" 2>/dev/null \
   && ok "the note is published through a name of its own, so it always parses" \
@@ -7844,30 +8040,6 @@ assert not os.path.exists(m.STORE_SPLIT), "a clean single-store install left its
 ' "$ROOT/bin/ccd-account" "$(split_home nobank2)" \
   && ok "...nor banked on the way out to another account, and a one-store install still clears its record" \
   || bad "snapshot overwritten" "a swap away banked a credential-free blob"
-
-# measure_active() never refreshes, and that is load-bearing. It captures who is
-# active, and another session can swap the store before the probe runs: by then the
-# captured account is a SPARE, account_refresh() no longer refuses it, and an
-# expired token there would be exchanged — from the one path that must never spend
-# a token. (I called the refreshing variant an equivalent mutant. It is not.)
-PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
-A = {"accessToken": "AT-a", "refreshToken": "RT-a", "expiresAt": int((time.time() - 60) * 1000)}
-B = {"accessToken": "AT-b", "refreshToken": "RT-b", "expiresAt": int((time.time() + 99999) * 1000)}
-m.use_keychain = lambda: False
-m.account_save("a", {"name": "a", "claudeAiOauth": A})
-m.account_save("b", {"name": "b", "claudeAiOauth": B})
-m.write_json(m.credentials_file(), {"claudeAiOauth": B})   # the store is on B by the time A is probed
-seen = iter(["a"])                                          # ...but A is who was active when we looked
-m.active_name = lambda: next(seen, "b")
-exchanged, asked = [], []
-m.token_refresh = lambda rt: (exchanged.append(rt), (None, 500))[1]
-m.usage_fetch = lambda at: (asked.append(at), (401, None))[1]
-m.measure_active(time.time() + 30)
-assert exchanged == [], f"a token was exchanged from the measuring path: {exchanged!r}"
-assert m.reading_load("a")["status"] != "ok", "an expired token produced a measurement"
-' "$ROOT/bin/ccd-account" "$(split_home measureonly)" \
-  && ok "measuring the active account never exchanges a token, even once the store has moved on" \
-  || bad "spent a token while measuring" "the active-account measurement refreshed an account that had stopped being active"
 
 # ...and while the stop stands, nothing else may touch the credential stores. The
 # record names both backends; this suite can only see the file one, so it cannot
