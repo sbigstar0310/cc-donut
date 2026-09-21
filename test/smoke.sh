@@ -6428,9 +6428,9 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
 m.ensure_dirs()
-REAL_PROBE = m._keychain_probe           # kept for the one case that tests it
-m._keychain_read = lambda: None          # never the developer key, on any path
-m._keychain_probe = lambda: (None, "absent")
+def kc(fn):                               # never the developer key, on any path
+    m._keychain_read = fn
+kc(lambda: None)
 OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
 TARGET = {"name": "target", "claudeAiOauth":
           {"accessToken": "AT-target", "refreshToken": "RT-target"}}
@@ -6536,7 +6536,7 @@ assert touched == [], f"a credential backend was written anyway: {touched!r}"
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 held = {"kc": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
 m.use_keychain = lambda: True
-m._keychain_probe = lambda: ({"claudeAiOauth": held["kc"]}, "ok")
+kc(lambda: {"claudeAiOauth": held["kc"]})
 m.write_json(m.credentials_file(),
              {"claudeAiOauth": {"accessToken": "AT-new", "refreshToken": "RT-new"}})
 m.write_json(m.STORE_SPLIT, {"detail": "keychain kept the old credential",
@@ -6578,8 +6578,7 @@ assert saved == [], f"banked across a store that started disagreeing while it wa
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 spent = []
 m.use_keychain = lambda: True
-m._keychain_probe = lambda: ({"claudeAiOauth": {"accessToken": "AT-a",
-                                                "refreshToken": "RT-a"}}, "ok")
+kc(lambda: {"claudeAiOauth": {"accessToken": "AT-a", "refreshToken": "RT-a"}})
 m.write_json(m.credentials_file(),
              {"claudeAiOauth": {"accessToken": "AT-b", "refreshToken": "RT-b"}})
 m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
@@ -6600,7 +6599,7 @@ assert okd is False and st == "stale", f"got {okd!r}/{st!r}"
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 spent = []
 m.use_keychain = lambda: True
-m._keychain_probe = lambda: (None, "blind")   # the keychain will not answer
+kc(lambda: None)                        # the keychain will not answer
 m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
 m.active_name = lambda: None
 far = int((time.time() + 8 * 86400) * 1000)
@@ -6620,41 +6619,20 @@ assert okd is False, f"got {okd!r}/{st!r}"
 # next swap a live blob belonging to the other account.
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 m.use_keychain = lambda: True
-kc = {"blob": {"claudeAiOauth": {"accessToken": "AT-b"}}}          # B, no refresh token
-m._keychain_probe = lambda: (kc["blob"], "ok")
-m._keychain_read = lambda: kc["blob"]
+kcb = {"blob": {"claudeAiOauth": {"accessToken": "AT-b"}}}         # B, no refresh token
+kc(lambda: kcb["blob"])
 m.write_json(m.credentials_file(), {"claudeAiOauth": {"accessToken": "AT-a"}})
 m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a",
                              "stores": ["file", "keychain"]})
 assert m.store_split_now() is not None, \
     "two different logins compared equal because neither had a refresh token"
 # ...and a store where nothing can be identified at all is not an agreeing store.
-kc["blob"] = {"claudeAiOauth": {}}
+kcb["blob"] = {"claudeAiOauth": {}}
 m.write_json(m.credentials_file(), {"claudeAiOauth": {}})
 assert m.store_split_now() is not None, "a store with no identity anywhere lifted the stop"
 ' "$ROOT/bin/ccd-account" "$(split_home noident)" \
   && ok "two credentials that cannot be told apart are not the same credential" \
   || bad "absence read as agreement" "the stop lifted on a store that is still divided"
-
-# "Not in the keychain" is an answer; every other failure is not. Nothing else in
-# this suite exercises that branch, because every other case stubs the probe.
-PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
-import types
-class Ran:
-    def __init__(self, rc, out=""):
-        self.returncode, self.stdout, self.stderr = rc, out, ""
-def answering(rc, out=""):
-    m.subprocess = types.SimpleNamespace(run=lambda *a, **k: Ran(rc, out))
-answering(44)
-assert REAL_PROBE() == (None, "absent"), "no such item was read as a refusal to answer"
-answering(1)
-assert REAL_PROBE() == (None, "blind"), "a failed keychain read was read as an absence"
-answering(0, json.dumps({"claudeAiOauth": {"accessToken": "AT-k"}}))
-blob, state = REAL_PROBE()
-assert state == "ok" and blob["claudeAiOauth"]["accessToken"] == "AT-k", (state, blob)
-' "$ROOT/bin/ccd-account" "$(split_home probe)" \
-  && ok "the keychain saying nothing is there is not the same as saying nothing" \
-  || bad "probe conflates" "absent and unreadable came back the same"
 
 # Codex's scenario end to end: the install takes the keychain and the rollback
 # cannot put it back, so keychain=B, file=A, pointer=A — every credential carrying
@@ -6679,8 +6657,7 @@ def kwrite(blob):
         return True
     return False                      # refuses the rollback
 m._keychain_write = kwrite
-m._keychain_probe = lambda: (back["keychain"], "ok")
-m._keychain_read = lambda: back["keychain"]
+kc(lambda: back["keychain"])
 m.live_read = lambda: (json.loads(json.dumps(back["keychain"])), ["keychain", "file"])
 m.write_json(m.credentials_file(), {"claudeAiOauth": {"accessToken": "AT-a"}})
 real_write = m.write_json
@@ -6708,34 +6685,143 @@ assert store["a"]["claudeAiOauth"]["accessToken"] == "AT-a", \
   && ok "a retry over a divided store neither swaps nor rewrites the outgoing account" \
   || bad "retry corrupts the store" "the second swap moved something it should not have"
 
-# A backend that is no longer there is not holding a stale credential. Signing in
-# again on macOS writes the keychain and leaves no file, and a stop that outlived
-# that would never lift for anybody.
-PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
-m.use_keychain = lambda: True
-m._keychain_probe = lambda: ({"claudeAiOauth": {"accessToken": "AT-new",
-                                                "refreshToken": "RT-new"}}, "ok")
-m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a",
-                             "stores": ["file", "keychain"]})
-assert not os.path.exists(m.credentials_file()), "fixture left a file behind"
-assert m.store_split_now() is None, "a store with one healthy backend and no other stayed stopped"
-' "$ROOT/bin/ccd-account" "$(split_home gone)" \
-  && ok "a named backend that no longer exists satisfies the record" \
-  || bad "no exit" "signing in again left the stop standing for ever"
+# ccd does not infer absence. The stop lifts only when every store the record names
+# ANSWERS, with a credential, and they all carry the same identity. Each of the
+# three below once counted as "that backend is gone", and each was a way to lift
+# the stop on a store nobody had actually seen agree.
+HEALTHY='{"claudeAiOauth": {"accessToken": "AT-new", "refreshToken": "RT-new"}}'
+RECORD='m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a", "stores": ["file", "keychain"]})'
 
-# ...and neither does a file that is not part of the Claude login at all. It holds
-# no claudeAiOauth, so it cannot be the other half of anything.
+# A file that is not there. It may have been removed for good — and the user has
+# an explicit exit for that — but ccd cannot tell that from a file it cannot reach.
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 m.use_keychain = lambda: True
-m._keychain_probe = lambda: ({"claudeAiOauth": {"accessToken": "AT-new",
-                                                "refreshToken": "RT-new"}}, "ok")
-m.write_json(m.credentials_file(), {"mcpOAuth": {"notion|abc": {"accessToken": "MCP"}}})
-m.write_json(m.STORE_SPLIT, {"detail": "keychain took b, file kept a",
-                             "stores": ["file", "keychain"]})
-assert m.store_split_now() is None, "a file holding no Claude login was counted as a half"
-' "$ROOT/bin/ccd-account" "$(split_home unrelated)" \
-  && ok "a backend holding no Claude login is not one of the halves" \
-  || bad "no exit" "an unrelated credentials file blocked the way out for ever"
+kc(lambda: json.loads(sys.argv[3]))
+exec(sys.argv[4])
+assert m.store_split_now() is not None, "a missing file was read as a store that agrees"
+' "$ROOT/bin/ccd-account" "$(split_home nofile)" "$HEALTHY" "$RECORD" \
+  && ok "a named store that does not answer keeps the stop, even when the file is simply missing" \
+  || bad "absence inferred" "a store that did not answer was counted as agreeing"
+
+# A file that is there and cannot be reached. os.path.exists() answers False for a
+# permission error as readily as for a missing file, which is how an unreadable
+# credential was classed as no credential at all.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+kc(lambda: json.loads(sys.argv[3]))
+exec(sys.argv[4])
+creds = m.credentials_file()
+real_open, real_exists = open, os.path.exists
+def denied(p, *a, **k):
+    if str(p) == creds:
+        raise PermissionError(13, "Permission denied", creds)
+    return real_open(p, *a, **k)
+m.open = denied
+m.os.path.exists = lambda p: False if str(p) == creds else real_exists(p)
+assert m.store_split_now() is not None, "a file ccd was refused was read as a file that is gone"
+' "$ROOT/bin/ccd-account" "$(split_home denied)" "$HEALTHY" "$RECORD" \
+  && ok "a credentials file ccd is refused is unknown, not absent" \
+  || bad "absence inferred" "a permission error lifted the stop"
+
+# A keychain that says it found nothing. `security` exits 44 out of failed searches
+# too, so it cannot prove the item is absent.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+kc(lambda: None)
+m.write_json(m.credentials_file(), json.loads(sys.argv[3]))
+exec(sys.argv[4])
+assert m.store_split_now() is not None, "a keychain that found nothing was read as an empty one"
+' "$ROOT/bin/ccd-account" "$(split_home kc44)" "$HEALTHY" "$RECORD" \
+  && ok "a keychain search that comes back empty does not prove the keychain is" \
+  || bad "absence inferred" "exit 44 lifted the stop"
+
+# A keychain holding no Claude login at all. Lifting the stop here is what let the
+# same-account branch copy that blob over the healthy file login and erase it.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+kc(lambda: {"mcpOAuth": {"notion|abc": {"accessToken": "MCP"}}})
+m.write_json(m.credentials_file(), json.loads(sys.argv[3]))
+exec(sys.argv[4])
+assert m.store_split_now() is not None, "a store holding no login was read as one that agrees"
+' "$ROOT/bin/ccd-account" "$(split_home nologin)" "$HEALTHY" "$RECORD" \
+  && ok "a named store holding no Claude login keeps the stop" \
+  || bad "absence inferred" "a credential-free backend lifted the stop"
+
+# ...and that branch does not need a lifted stop to do the damage: with no record
+# at all it still copies whatever live_read() prefers over every backend. A blob
+# with no login in it is not something to even the stores WITH.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+wrote = []
+m.use_keychain = lambda: True
+m.live_read = lambda: ({"mcpOAuth": {"notion|abc": {"accessToken": "MCP"}}}, ["keychain", "file"])
+m.live_write = lambda blob, sources: (wrote.append(blob), (True, [], []))[1]
+m.active_name = lambda: "target"
+m.account_load = only_target
+m.account_save = lambda n, o: None
+try:
+    m.swap_to("target", force=True)
+except SystemExit:
+    pass
+assert wrote == [], "a blob holding no login was copied over every backend: " + json.dumps(wrote)
+' "$ROOT/bin/ccd-account" "$(split_home sameacct)" \
+  && ok "evening the stores never copies a blob that holds no login" \
+  || bad "login erased" "the same-account branch overwrote the stores with a credential-free blob"
+
+# The gate that protects a live token looks at every refresh token any backend
+# holds — identifiable or not. A blob with a refresh token and no access token is
+# nothing ccd would install, and it is still something a session may be carrying.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+spent = []
+m.use_keychain = lambda: True
+kc(lambda: json.loads(sys.argv[3]))
+m.write_json(m.credentials_file(), {"claudeAiOauth": {"refreshToken": "RT-b"}})
+m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
+m.active_name = lambda: None
+far = int((time.time() + 8 * 86400) * 1000)
+m.account_load = lambda n: {"name": "b", "claudeAiOauth":
+                            {"accessToken": "AT-b", "refreshToken": "RT-b",
+                             "refreshTokenExpiresAt": far}}
+okd, st = m.account_refresh("b", {})
+assert spent == [], f"spent a token a backend is holding: {spent!r}"
+' "$ROOT/bin/ccd-account" "$(split_home unidentified)" "$HEALTHY" \
+  && ok "a refresh token is protected even in a credential ccd cannot identify" \
+  || bad "spent a live token" "a backend with no access token was dropped from the gate"
+
+# For the gate the two kinds of silence are NOT the same as an empty store: a
+# backend that gave no answer may be holding the very token about to be spent,
+# however healthy the other one looks.
+GATE='
+spent = []
+m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
+m.active_name = lambda: None
+far = int((time.time() + 8 * 86400) * 1000)
+m.account_load = lambda n: {"name": "b", "claudeAiOauth":
+                            {"accessToken": "AT-b", "refreshToken": "RT-b",
+                             "refreshTokenExpiresAt": far}}
+okd, st = m.account_refresh("b", {})
+assert spent == [] and okd is False, f"exchanged with a backend unaccounted for: {spent!r} {st!r}"
+'
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+kc(lambda: json.loads(sys.argv[3]))
+creds = m.credentials_file()
+real_open = open
+def denied(p, *a, **k):
+    if str(p) == creds:
+        raise PermissionError(13, "Permission denied", creds)
+    return real_open(p, *a, **k)
+m.open = denied
+'"$GATE" "$ROOT/bin/ccd-account" "$(split_home gatedenied)" "$HEALTHY" \
+  && ok "a credentials file ccd is refused stops the exchange, healthy keychain or not" \
+  || bad "spent a token blind" "an unreadable file was treated as holding nothing"
+
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: True
+kc(lambda: None)
+m.write_json(m.credentials_file(), json.loads(sys.argv[3]))
+'"$GATE" "$ROOT/bin/ccd-account" "$(split_home gatesilent)" "$HEALTHY" \
+  && ok "a keychain that gives no answer stops the exchange, healthy file or not" \
+  || bad "spent a token blind" "a silent keychain was treated as an empty one"
 
 # ...and while the stop stands, nothing else may touch the credential stores. The
 # record names both backends; this suite can only see the file one, so it cannot
@@ -6757,17 +6843,21 @@ esac
 case "$out" in
   *"writes every credential store"*)
     bad "overclaims" "ccd promises Claude Code writes both stores; it writes one and falls back" ;;
-  *".credentials.json"*)
-    ok "...and names the stale fallback file for the case /login cannot clear" ;;
+  *"stale"*|*"other half"*)
+    bad "overclaims" "ccd says which half is stale; it does not know" ;;
+  *".claude/ccd/store-split"*)
+    ok "...and names the record to delete once the user is satisfied the login works" ;;
   *) bad "no second exit" "nothing says what to do when signing in does not lift it" ;;
 esac
 case "$out" in
   *reconcile*) bad "still offering a repair" "ccd offered to rebuild the store itself" ;;
   *) ok "...and never offers to rebuild the store itself" ;;
 esac
-out=$(HOME="$FAKE" CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')
+out=$(HOME="$FAKE" CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g' \
+      | sed -n '/Credential stores/,/^$/p')
 case "$out" in
-  *"disagree"*"/login"*) ok "...and doctor says it, where somebody would go looking" ;;
+  *"stale"*|*"other half"*) bad "doctor overclaims" "doctor says which half is stale; ccd does not know" ;;
+  *"disagree"*"/login"*"ccd/store-split"*) ok "...and doctor says it, exit included, where somebody would go looking" ;;
   *) bad "doctor blind" "doctor never sends the user to /login over the split store" ;;
 esac
 "$ACCT" --no-color reconcile split_a >/dev/null 2>&1 \
