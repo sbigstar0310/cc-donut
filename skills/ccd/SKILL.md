@@ -60,9 +60,12 @@ ccd account list
   lab, or personal one). If yes, walk them through it: `ccd account add` registers
   whoever is signed in now; then they run `claude`, `/login` as the other account,
   and `ccd account add` again. After that, quota exhaustion hops to the spare
-  subscription and only reaches OpenRouter when every account is spent.
-- **One registered:** that alone does nothing. Say so plainly and offer to finish
-  the second one.
+  subscription by itself. OpenRouter is reached automatically only when every
+  registered account is measured spent, a key is stored, AND they opted in with
+  `ccd setup --auto`; otherwise ccd stops and says so, and `ccd -c` goes by hand.
+- **One registered:** there is no spare to hop to, so the free hop cannot happen.
+  The paid hop still can — with one account it is the only hop there is — under
+  the same three conditions. Say so plainly and offer to finish the second one.
 - **Any account shows `needs re-login`:** this is urgent and easy to miss. That
   spare cannot receive a handoff, and the failure is invisible until the moment
   it is needed. It means ccd's stored copy of the refresh token is dead, not the

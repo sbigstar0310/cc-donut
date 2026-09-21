@@ -1815,6 +1815,8 @@ def cmd_swap(args):
             no_probe=args.no_probe, deadline=deadline,
             exclude={n: w for n, (_when, w) in swap_guard_read().items()})
         if a is None:
+            if not args.no_probe:
+                measure_active(deadline)
             return _swap_no(rec)
         # One acquisition for the whole install: the claim, the credential and the
         # record are one change or none of them.
@@ -1846,6 +1848,32 @@ def cmd_swap(args):
     return 0
 
 
+def measure_active(deadline):
+    """Leave a current reading of the account the store is on. Best effort.
+
+    Nothing else on the backstop path measures it — best_target() looks only at
+    where a session could GO — and the proof that may authorise paying needs every
+    registered account's reading, this one included. It lives here, in the probing
+    swap that found nowhere to go, so that `exhausted` can stay a pure read; the
+    cache-only tick never calls it.
+
+    Never refreshed: Claude Code owns the live token. The prologue has just banked
+    the live credential into this account, so its access token is as current as
+    ccd can know; if it is not, the probe fails, the row says so, and a failed
+    row is not proof."""
+    global NET_DEADLINE
+    cur = active_name()
+    acct = account_load(cur) if cur else None
+    if not acct:
+        return
+    outer, NET_DEADLINE = NET_DEADLINE, deadline
+    try:
+        _, cache = quota_for(cur, acct, allow_refresh=False)
+        quota_cache_save(cache)
+    finally:
+        NET_DEADLINE = outer
+
+
 def _swap_no(reason):
     """One line, on stderr, for the caller's breadcrumb. Exit 4 for everything:
     the only question worth asking after a failed swap is whether every
@@ -1858,18 +1886,20 @@ def _still_spent(rec):
     """Does this reading show a window that is out of room AND still open?
 
     A window that has reset since it was read says nothing about now, however
-    recently it was read. A reset time that is missing or unreadable is left to the
-    freshness of the reading itself."""
+    recently it was read — so a window counts only while it is KNOWN to be open:
+    its reset time parses, names its timezone, and is in the future. 99% with no
+    usable reset can have reset a second later while the row stays fresh for
+    minutes; a naive time is a guess about whose clock it was. Neither is proof."""
     for pct, reset in ((rec.get("five_hour_percent"), rec.get("five_hour_reset")),
                        (rec.get("seven_day_percent"), rec.get("seven_day_reset"))):
         if not isinstance(pct, (int, float)) or isinstance(pct, bool) or pct < HEADROOM:
             continue
         try:
-            if datetime.datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp() <= time.time():
-                continue
+            at = datetime.datetime.fromisoformat(reset.replace("Z", "+00:00"))
         except (AttributeError, ValueError, TypeError):
-            pass
-        return True
+            continue
+        if at.utcoffset() is not None and at.timestamp() > time.time():
+            return True
     return False
 
 
@@ -1882,33 +1912,38 @@ def subscriptions_proved_spent():
       - the accounts directory was read — not "listing it failed, so it is empty"
       - every registered account file in it was read
       - the credential stores are not under a stop
-      - every registered account other than the one this session is on has a
-        reading that is about this account's current identity, SUCCEEDED, is
-        younger than CANDIDATE_TTL (the same age at which a swap stops trusting a
-        reading and measures again), and shows a window out of room that has not
-        reset since. No registered spare at all, read successfully, is also proof.
+      - EVERY registered account — the one the store is on included, no
+        exceptions — has a reading that is about its current identity, SUCCEEDED,
+        is younger than CANDIDATE_TTL (the age at which a swap stops trusting a
+        reading and measures again), and shows a window out of room that is known
+        not to have reset. No account registered at all is also proof, vacuously.
 
-    It opens no socket, takes no lock and spends no token: the swap attempt that
-    comes before it has just measured every spare, and this reads what that left
-    behind. So a timeout, a 503, a busy store, an expired deadline or a refused
+    Nobody is excluded, because "the active account" is not this session's to
+    define: another session can swap the store onto an account with room while
+    this one is at the wall, and a proof that skipped whoever is active would then
+    skip exactly the account that could have taken the session.
+
+    It opens no socket, takes no lock, spends no token and writes nothing: the swap
+    attempt that comes before it has just measured every spare, and the active
+    account too when it found nowhere to go (measure_active), and this reads what
+    that left behind. So a timeout, a 503, a busy store, an expired deadline or a refused
     swap cannot become a yes here — each leaves a row that is stale, failed,
     missing, or shows room, and every one of those is a no.
-
-    The account we are on is not measured: that it is spent is what the caller's
-    own reading and the rate_limit error already established."""
+"""
     if store_split() is not None:
         return False
-    entries = os.listdir(ACCOUNTS_DIR)            # raises rather than reading as empty
+    try:
+        entries = os.listdir(ACCOUNTS_DIR)
+    except FileNotFoundError:
+        entries = []        # the kernel's own answer: a store that was never created
+    # ...and any OTHER failure raises, rather than reading as an empty store.
     names = sorted(e[:-5] for e in entries
                    if e.endswith(".json") and not e.startswith(".") and valid_name(e[:-5]))
     accounts = {n: account_load(n) for n in names}
     if any(a is None for a in accounts.values()):
         return False
-    cur = active_name()
     cache = quota_cache()
     for name, acct in accounts.items():
-        if name == cur:
-            continue
         rec = cache.get(name)
         if not _cache_row_valid(rec, acct) or rec.get("status") != "ok":
             return False
@@ -2455,6 +2490,10 @@ def main(argv):
     if not getattr(args, "fn", None):
         p.print_help()
         return 0
+    # A question, asked before anything below can act: no directory made, no
+    # credential banked, no pointer repaired. The proof reads and answers.
+    if args.fn is cmd_exhausted:
+        return cmd_exhausted(args)
     ensure_dirs()
     # Make the store true before anything reads it. Without this every command
     # below reasons about a snapshot that may have gone dead days ago.

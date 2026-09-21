@@ -158,9 +158,10 @@ continues on OpenRouter by itself, and comes back when the quota resets.
 
 Conditions and limits:
 
-- **It pays on proof, never on a guess.** Every registered spare must have a
-  fresh, successful reading that shows it spent (or there must be no spare at
-  all), on top of the rate-limit error, the key and this opt-in. A spare that
+- **It pays on proof, never on a guess.** Every registered account — the one
+  you are on included — must have a fresh, successful reading that shows it
+  spent, with a reset time still in the future (or nothing registered at all),
+  on top of the rate-limit error, the key and this opt-in. A spare that
   could not be measured, a busy store, a swap that failed — none of those is
   proof, and each one ends in a note instead of a bill.
 - **The launcher must be running.** If the opt-in is on but the session was not

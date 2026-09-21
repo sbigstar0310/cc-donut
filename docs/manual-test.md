@@ -152,7 +152,7 @@ claude          # 새 터미널에서. /status 로 로그인 계정 확인
 
 ## Stage 5 — 전환 판단 로직 (드라이런, 세션 영향 없음)
 
-"쿼타가 죽으면 B로 갈까, OpenRouter로 갈까"를 실제로 소진시키지 않고 확인한다. 쿼타 캐시를 직접 심으면 된다.
+"쿼타가 죽으면 B로 갈까"(선택)와 "과금해도 된다는 것이 증명됐나"(증명)를 실제로 소진시키지 않고 확인한다. 둘은 **다른 질문**이다 — `pick` 이 아무것도 못 고른 것은 과금의 근거가 아니다. 쿼타 캐시를 직접 심으면 된다.
 
 ```sh
 Q=~/.claude/ccd/accounts-quota.json
@@ -160,20 +160,37 @@ cp $Q $Q.bak 2>/dev/null || true
 A=$(./bin/ccd-account current)
 B=$(ls ~/.claude/ccd/accounts/*.json | xargs -n1 basename | sed 's/.json//' | grep -v "^$A$" | head -1)
 
-seed() { python3 -c "
-import json,time,sys
-now=int(time.time())
-json.dump({sys.argv[1]:{'status':'ok','checked_at':now,'five_hour_percent':int(sys.argv[3]),'seven_day_percent':int(sys.argv[4])},
-           sys.argv[2]:{'status':'ok','checked_at':now,'five_hour_percent':int(sys.argv[5]),'seven_day_percent':int(sys.argv[6])}},
-          open('$Q','w'))" "$A" "$B" "$@"; }
+# 행에는 신원(uuid, cred)과 **시간대가 있는 미래의 리셋 시각**이 있어야 한다. 신원이 없으면
+# 진짜 코드는 그 행을 버리고 네트워크로 다시 측정하고, 리셋 시각이 없으면 증명이 되지 못한다.
+seed() { python3 - "$Q" "$A" "$B" "$@" <<'PY'
+import datetime, hashlib, json, os, sys, time
+q, names, pct = sys.argv[1], sys.argv[2:4], list(map(int, sys.argv[4:8]))
+ahead = lambda h: (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=h)).isoformat()
+rows = {}
+for i, n in enumerate(names):
+    a = json.load(open(os.path.expanduser(f"~/.claude/ccd/accounts/{n}.json")))
+    at = (a.get("claudeAiOauth") or {}).get("accessToken") or ""
+    cred = hashlib.sha256(at.encode()).hexdigest()[:16] if at else ""   # = _cred_fingerprint
+    rows[n] = {"status": "ok", "checked_at": int(time.time()), "uuid": a.get("account_uuid"), "cred": cred,
+               "five_hour_percent": pct[2*i], "seven_day_percent": pct[2*i+1],
+               "five_hour_reset": ahead(2), "seven_day_reset": ahead(72)}
+json.dump(rows, open(q, "w"))
+PY
+}
 
 # A 소진, B 여유 → B로 가야 한다
 seed 99 99 10 20 && ./bin/ccd-account pick --json
 #   기대: {"account":"<B>", ..., "reason":"headroom"}
 
-# 둘 다 소진 → OpenRouter (rc=1)
+# 둘 다 소진 → 선택은 "갈 곳 없음" (rc=1). 이것만으로는 과금하지 않는다.
 seed 99 99 99 99 && ./bin/ccd-account pick --json; echo "rc=$?"
 #   기대: {"account":null,"reason":"all_exhausted"}  rc=1
+# 과금의 근거는 따로 묻는다: 등록된 **모든** 계정(지금 쓰는 계정 포함)이 방금 측정돼 바닥.
+./bin/ccd-account exhausted; echo "rc=$?"
+#   기대: every-subscription-measured-spent  rc=0
+# 한 계정이라도 여유가 있거나, 행이 낡았거나, 리셋 시각이 없으면 증명이 아니다.
+seed 10 20 99 99 && ./bin/ccd-account exhausted; echo "rc=$?"
+#   기대: (출력 없음)  rc=1   — 지금 쓰는 계정 A 에 여유가 있다
 
 # B의 5h는 비었지만 7일이 꽉참 → 가면 안 된다 (몇 분 뒤 또 죽으므로)
 seed 99 99 5 99 && ./bin/ccd-account pick --json; echo "rc=$?"

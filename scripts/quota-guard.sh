@@ -791,7 +791,7 @@ EOF
            # different question with its own answer, and nothing above feeds it:
            # not the swap's exit code, not its reason, not the three attempts. The
            # user's rule is three conditions — a key stored, `ccd setup --auto`,
-           # and no subscription able to take the session — and the third is
+           # and no registered subscription able to take the session — and the third is
            # PROVED or it is false. Only here, where the wall was actually hit;
            # the tick before the wall never bills while the subscription answers.
            if paid_optin && have_key && subscriptions_proved_spent; then

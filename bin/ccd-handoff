@@ -80,6 +80,17 @@ ccd_bin() {
 # a `ccd setup --no-auto` inside that window must not be outrun by an older hop.
 paid_optin() { [ -f "$HOME/.claude/ccd/paid-handoff" ]; }
 
+# ...and so is the proof. Same contract as the hook's subscriptions_proved_spent
+# (scripts/quota-guard.sh): the exact word on stdout AND a zero exit, from the
+# ccd-account that ships beside the ccd this relaunch would run. Anything else —
+# no plugin, a crash, silence — is not proof, and an unproved hop is not made.
+proved_spent() {
+  local t out
+  t=$(ccd_bin); [ -n "$t" ] && [ -x "${t%/*}/ccd-account" ] || return 1
+  out=$("${t%/*}/ccd-account" --no-color exhausted 2>/dev/null) || return 1
+  [ "$out" = "every-subscription-measured-spent" ]
+}
+
 # ── Burst tracking (docs/multi-account.md §5.2) ──────────────────────────────
 # Loop protection remembers WHERE we have been rather than HOW MANY times we
 # moved. A burst is a run of relaunches with no real work between them, and a
@@ -285,6 +296,15 @@ while :; do
         printf '\nccd: OpenRouter 자동 전환이 꺼져 있습니다 — 과금 없이 여기서 멈춥니다.\n' >&2
         printf '   이어서 하려면: claude --resume %s\n' "$sid" >&2
         printf '   유료 전환을 허용하려면: ccd setup --auto\n' >&2
+        exit "$rc"
+      fi
+      # Proved when it was armed is not proved now: the whole of Claude Code's
+      # shutdown lies between, and another session can have moved the store onto
+      # an account with room. Ask again, and do not bill on an old answer.
+      if ! proved_spent; then
+        printf '\nccd: 받아 줄 구독이 없다는 것이 지금은 확인되지 않습니다 — 과금 없이 여기서 멈춥니다.\n' >&2
+        printf '   이어서 하려면: claude --resume %s\n' "$sid" >&2
+        printf '   계정 상태: ccd account list · 직접 넘어가려면: ccd -c\n' >&2
         exit "$rc"
       fi
       if [ "$resumed" -eq 1 ]; then

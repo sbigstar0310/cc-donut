@@ -62,6 +62,15 @@ cat "$HOME/.stub-usage.json"
 EOF
 chmod +x "$FAKE/fakebin/node"
 export PATH="$FAKE/fakebin:$PATH"
+# No case may reach the network, and "there is no fake on PATH" is how one does:
+# the real curl is right behind it. So a REJECTING curl is always there, and a
+# section that needs an answer stages its own over it and puts this one back.
+curl_reject() {
+  printf '#!/bin/sh\necho "$*" >> "$HOME/.unstaged-curl"\necho "curl: unstaged network call in the test suite" >&2\nexit 7\n' \
+    > "$FAKE/fakebin/curl"
+  chmod +x "$FAKE/fakebin/curl"
+}
+curl_reject
 stub_usage() { # $1=5h $2=7d
   printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"R1","sevenDayPercent":%s,"sevenDayReset":"D1"}}\n' "$1" "$2" > "$FAKE/.stub-usage.json"
 }
@@ -560,7 +569,7 @@ esac
 printf '%s\n' "$doc" | grep -q 'OPUS.*\[1m\] applied' \
   && ok "doctor applies [1m] for a verified >200K pool" \
   || bad "doctor [1m] row" "got: $(printf '%s\n' "$doc" | grep OPUS)"
-rm -f "$FAKE/fakebin/curl"
+curl_reject
 
 head_ "14. rename surface: manifests, README coords, launcher resolution, uninstall text"
 python3 - "$ROOT" <<'PY' \
@@ -624,7 +633,7 @@ case "$row" in
   *"Claude recovered"*) ok "statusline shows the green recovery banner" ;;
   *) bad "recovery banner" "got: ${row:0:120}" ;;
 esac
-rm -f "$FAKE/fakebin/curl"
+curl_reject
 
 head_ "16. automatic handoff: arming predicate + hook stdin"
 mkdir -p "$FAKE/.claude/ccd/providers"
@@ -758,7 +767,8 @@ kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 # The discarded prototype used `timeout 0.5 cat` to read stdin. macOS has no
 # timeout(1), so under `set -e` every hook died silently — taking the quota
 # warnings with it. Assert the no-stdin path still works.
-quota 58 96; rm -f "$FAKE/.claude/ccd/last-warn"
+# Its own clean state: an earlier backstop may have left a note, and a tick shows it.
+quota 58 96; rm -f "$FAKE/.claude/ccd/last-warn" "$FAKE/.claude/ccd/swap-note"
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
 case "$out" in
   *"QUOTA NEARLY EXHAUSTED"*) ok "hook still warns when stdin is absent" ;;
@@ -1173,6 +1183,18 @@ cat > "$HB/ccd" <<'EOF'
 echo "CCD-RESUMED:$*"
 EOF
 chmod +x "$HB/ccd"
+# The launcher asks the proof again before it relaunches onto the paid backbone.
+# This stand-in answers NO unless the launcher cases have switched it on: it sits
+# in the plugin cache, which is also where an unrooted hook run looks for
+# ccd-account, and a stand-in that vouches for whoever asks hands "proof" to
+# sections that never staged any. Switched off again where those cases end.
+cat > "$HB/ccd-account" <<'EOF'
+#!/bin/sh
+for a in "$@"; do [ "$a" = exhausted ] && { [ -e "$HOME/.launcher-proof" ] || exit 1; echo every-subscription-measured-spent; exit 0; }; done
+exit 0
+EOF
+chmod +x "$HB/ccd-account"
+: > "$FAKE/.launcher-proof"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 [ -x "$SHIM" ] && ok "setup --auto installs the claude shim" \
   || bad "shim install" "not executable"
@@ -1302,6 +1324,20 @@ case "$out" in
   *) bad "revoked paid hop" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 : > "$FAKE/.claude/ccd/paid-handoff"
+
+# ...and so is the proof. Between the hook arming and the launcher relaunching,
+# another session can move the store onto an account with room; an order written
+# a moment ago is not evidence about now.
+rm -f "$FAKE/.launcher-proof"
+: > "$FAKE/.claude/projects/-tmp/sess-unproved.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-unproved","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
+case "$out" in
+  *CCD-RESUMED*) bad "unproved paid hop" "relaunched onto OpenRouter on an order it did not re-check" ;;
+  *"claude --resume sess-unproved"*) ok "a paid hop that is no longer proved does not relaunch, and says how to carry on" ;;
+  *) bad "unproved paid hop" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+: > "$FAKE/.launcher-proof"
 
 # to_subscription goes back to the real binary, not to ccd.
 fake_real '#!/bin/sh
@@ -2083,14 +2119,14 @@ printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
 paid_optin_on
 quota 58 96
 hf_reset
-stopfail sess-h rate_limit | "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-h rate_limit | CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
   && ok "an unsupervised session never leaves armed state behind" \
   || bad "stale armed handoff" "written without CCD_HANDOFF"
 
 : > "$keyfile"
 hf_reset
-stopfail sess-i rate_limit | CCD_HANDOFF=1 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+stopfail sess-i rate_limit | CCD_HANDOFF=1 CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
   && ok "no key → nothing is armed either" \
   || bad "armed without a key" "would end the session with nowhere to go"
@@ -2119,7 +2155,7 @@ else bad "automatic return" "recovery armed but never ended the session"; kill -
 wait "$TARGET" 2>/dev/null
 [ "$(hf_get direction)" = "to_subscription" ] && ok "recovery arms the return trip" \
   || bad "return direction" "got: $(hf_get direction)"
-rm -f "$FAKE/fakebin/curl" "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json"
+curl_reject; rm -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json"
 
 # A session that ended before its first exchange has no transcript, and
 # `--resume` on it fails with "No conversation found". Found by driving the real
@@ -2206,7 +2242,7 @@ mkdir -p "$BROKEN/.claude"     # deliberately no ccd/ subdirectory
 cp -R "$FAKE/.claude/ccd" "$BROKEN/.claude/ccd-backup" 2>/dev/null || true
 stopfail sess-w rate_limit | HOME="$BROKEN" CCD_HANDOFF=00000000000000000000000000000002 \
   CCD_HANDOFF_STATE="$BROKEN/.claude/ccd/handoff-00000000000000000000000000000002.json" \
-  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 sleep 0.5
 if kill -0 "$TARGET" 2>/dev/null; then ok "a failed state write means no signal"
 else bad "signalled without state" "the session would never come back"; fi
@@ -2404,6 +2440,7 @@ esac
 rm -f "$FAKE/.claude/ccd"/handoff-*.json
 "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
 
+rm -f "$FAKE/.launcher-proof"          # the launcher cases are over; the stand-in vouches for nobody
 head_ "21. multi-account: the store"
 # No test may reach the real network. If one does, fail in ~1s rather than
 # stalling for the full timeout on every account.
@@ -3270,7 +3307,10 @@ ka warm
 # The signed-in account's reading is parked too: without it the hook goes to measure it.
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20}}\n' \
   > "$FAKE/.claude/ccd/quota-cache.json"
-rm -f "$FAKE/.claude/ccd/last-stale-warn"
+# Its own clean state, once, before the first tick of this block: an earlier
+# backstop may have left a note, a tick shows it, and every assertion below is
+# about what a tick says.
+rm -f "$FAKE/.claude/ccd/last-stale-warn" "$FAKE/.claude/ccd/swap-note"
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
 case "$out" in
   *stale-spare*"account refresh"*) ok "...and the prompt hook delivers it, with the recovery command" ;;
@@ -5907,14 +5947,23 @@ pay_case() { # $1=spare 5h  $2=spare 7d
   sleep 0.3
   rm -f "$SWD/store-split" "$SWD/swap-note"
   sw_fixture 58 96 "$1" "$2"
+  python3 - "$SWD/accounts-quota.json" <<'PY'
+import datetime, json, sys
+ahead = lambda h: (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=h)).isoformat()
+q = json.load(open(sys.argv[1]))
+for row in q.values():
+    row["five_hour_reset"], row["seven_day_reset"] = ahead(2), ahead(72)
+json.dump(q, open(sys.argv[1], "w"))
+PY
   hf_reset
   paid_optin_on
   mkdir -p "$SWD/providers"
   printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$SWD/providers/keys.env"
 }
-age_spare_row() { python3 - "$SWD/accounts-quota.json" <<'PY'
+age_spare_row() { age_row spare; }
+age_row() { python3 - "$SWD/accounts-quota.json" "$1" <<'PY'
 import json, sys, time
-q = json.load(open(sys.argv[1])); q["spare"]["checked_at"] = int(time.time()) - 99999
+q = json.load(open(sys.argv[1])); q[sys.argv[2]]["checked_at"] = int(time.time()) - 99999
 json.dump(q, open(sys.argv[1], "w"))
 PY
 }
@@ -5938,6 +5987,53 @@ sw_stopfail sess-p2 >/dev/null
 { [ "$(hf_get direction)" = "to_fallback" ] && died_within "$SWPID" 5; } \
   && ok "...and so does no spare registered at all" \
   || bad "paid proof" "direction=$(hf_get direction), note: $(note_text | head -c 120)"
+
+# EVERY registered account has to prove itself — the one the store is on included.
+# Excluding "the active account" made the proof depend on who is active, and that
+# is not this session's to decide: another session swaps the store onto B, this
+# session's proof then skips B as "active", finds A's fresh 99%, and pays past a
+# subscription with room. Codex's interleaving, as it happens:
+pay_case 10 20                          # B (spare) has room
+"$ACCT" --no-color use spare --force >/dev/null 2>&1   # ...and another session moved the store onto it
+quota 58 96                             # this session's own reading still says: spent
+hf_reset; rm -f "$SWD/swap-note"
+sw_stopfail sess-p2b >/dev/null
+unpaid "the store moved onto an account with room while this session hit the wall" nonote
+
+# The active account is measured on the way, because nothing else on this path
+# does it: with one account registered its reading is the whole proof.
+pay_case 99 99; "$ACCT" --no-color rm spare >/dev/null 2>&1
+age_row spent; stage_usage 99 99
+: > "$CCD_FAKE_USAGE_LOG"
+CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2c >/dev/null
+{ [ "$(hf_get direction)" = "to_fallback" ] && [ -s "$CCD_FAKE_USAGE_LOG" ]; } \
+  && ok "one registered account, measured spent on the spot, is proof" \
+  || bad "paid proof" "direction=$(hf_get direction), measured $(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ') times"
+# ccd's copy of the active account's token can be out of date: Claude Code rotates
+# the live one on its own clock, and that token is the SESSION'S — ccd never renews
+# it, here or anywhere. So an expired copy is simply not a measurement, which makes
+# it not proof. (That no exchange happens is enforced twice: this probe asks for
+# none, and account_refresh refuses the active account whoever asks.)
+pay_case 99 99; "$ACCT" --no-color rm spare >/dev/null 2>&1
+age_row spent
+python3 - "$ADIR/spent.json" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1])); d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
+json.dump(d, open(sys.argv[1], "w"))
+PY
+stage_usage 99 99 200 0 AT-spent-rotated
+: > "$CCD_FAKE_USAGE_LOG"
+CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2e >/dev/null
+unpaid "the active account's stored token has expired, so it could not be measured"
+ptok() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$1"; }
+{ [ "$(ptok "$ADIR/spent.json")" = "AT-spent" ] && [ ! -s "$CCD_FAKE_USAGE_LOG" ]; } \
+  && ok "...and nothing is exchanged to find out: that token belongs to the running session" \
+  || bad "spent the live token" "stored token $(ptok "$ADIR/spent.json"), $(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ') network calls"
+
+pay_case 99 99; "$ACCT" --no-color rm spare >/dev/null 2>&1
+age_row spent; stage_usage 5 5 503
+CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p2d >/dev/null
+unpaid "the one registered account could not be measured"
 
 # The user's three conditions, one missing at a time.
 pay_case 99 99; rm -f "$SWD/providers/keys.env"
@@ -6110,6 +6206,42 @@ q = json.load(open(sys.argv[1])); q["spare"]["five_hour_reset"] = past; q["spare
 json.dump(q, open(sys.argv[1], "w"))
 PY
 proves && bad "proof" "a window that has since reset was proof" || ok "...nor a window that has reset since it was read"
+set_resets() { # $1=account  $2=python expression for the value
+  python3 - "$SWD/accounts-quota.json" "$1" "$2" <<'PY'
+import datetime, json, sys
+now = datetime.datetime.now(datetime.timezone.utc)
+q = json.load(open(sys.argv[1])); v = eval(sys.argv[3])
+for k in ("five_hour_reset", "seven_day_reset"):
+    if v is None: q[sys.argv[2]].pop(k, None)
+    else: q[sys.argv[2]][k] = v
+json.dump(q, open(sys.argv[1], "w"))
+PY
+}
+# A window is spent only while it is KNOWN to still be open. 99% with no usable
+# reset can have reset a second later, and the row stays "fresh" for five minutes.
+for shape in 'missing:None' 'malformed:"soon"' 'naive:(now + datetime.timedelta(hours=48)).replace(tzinfo=None).isoformat()'; do
+  pay_case 99 99; set_resets spare "${shape#*:}"
+  proves && bad "proof" "a ${shape%%:*} reset time was proof" \
+    || ok "...nor a spent window whose reset time is ${shape%%:*}"
+done
+pay_case 99 99; set_resets spare '(now + datetime.timedelta(hours=2)).isoformat().replace("+00:00", "Z")'
+proves && ok "...while a reset written with Z is as good as one written with an offset" \
+  || bad "proof" "a valid future reset in Z form was refused"
+# The active account is a registered account. Its row counts like any other.
+pay_case 99 99
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys
+q = json.load(open(sys.argv[1])); q["spent"]["five_hour_percent"] = 10; q["spent"]["seven_day_percent"] = 20
+json.dump(q, open(sys.argv[1], "w"))
+PY
+proves && bad "proof" "the account the store is on was left out of the proof" \
+  || ok "...nor anything while the account the store is on shows room"
+# Asking is not acting: no directory made, no credential banked, no pointer moved.
+rm -rf "$FAKE/proof-ro"; mkdir -p "$FAKE/proof-ro/.claude"
+out=$(HOME="$FAKE/proof-ro" "$ACCT" --no-color exhausted 2>/dev/null); rc=$?
+{ [ "$out" = "$PROOF" ] && [ "$rc" -eq 0 ] && [ ! -e "$FAKE/proof-ro/.claude/ccd" ]; } \
+  && ok "a store that was never created is an honest zero, and asking does not create it" \
+  || bad "proof is not read-only" "out=$out rc=$rc, made: $(ls -A "$FAKE/proof-ro/.claude")"
 pay_case 99 99; printf 'not json' > "$ADIR/spare.json"
 proves && bad "proof" "an account that cannot be read was skipped" || ok "...nor a store with an account file it cannot read"
 # Naming a store this suite cannot see, so the stop cannot lift itself first.
@@ -7618,6 +7750,17 @@ esac
 rm -rf "$ADIR" "$TXD/accounts-keepalive"
 unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
 unset -f tx_fixture tx_tok tx_uuid
+
+# Reported, not yet asserted. The rejecting stub is what guarantees nothing leaves
+# the machine; making this a failure means staging an answer in every section
+# that probes OpenRouter, which is its own piece of work. Until then the number
+# stays in plain sight instead of being a request nobody knew the suite made.
+if [ -s "$FAKE/.unstaged-curl" ]; then
+  printf '\n  note: %s curl calls had no staged answer and were REJECTED by the default stub:\n' \
+    "$(wc -l < "$FAKE/.unstaged-curl" | tr -d ' ')"
+  sed -E 's#.*(https?://[^ ]+).*#\1#; s#/models/[^ ]*/endpoints#/models/<slug>/endpoints#' "$FAKE/.unstaged-curl" \
+    | sort | uniq -c | sort -rn | sed 's/^/    /'
+fi
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
