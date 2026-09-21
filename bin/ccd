@@ -1149,8 +1149,9 @@ CCD_STATUSLINE_LAUNCHER
       printf '✓ quota handoff ready — nothing to install for it\n'
       printf '  %sWhen your Claude quota runs out, this session moves to whichever%s\n' "$d" "$r"
       printf '  %sother subscription has room, in place: nothing billed, no restart.%s\n' "$d" "$r"
-      printf '  %sOpenRouter (paid, your own key) is the last resort when every%s\n' "$d" "$r"
-      printf '  %ssubscription is spent — allow it with: ccd setup --auto%s\n' "$d" "$r"
+      printf '  %sOpenRouter (paid, your own key) is never automatic: when every%s\n' "$d" "$r"
+      printf '  %ssubscription is spent, you type `ccd -c`. `ccd setup --auto` adds%s\n' "$d" "$r"
+      printf '  %sonly the way BACK from there to a subscription.%s\n' "$d" "$r"
       ;;
     1)
       mkdir -p "$CCD_SHIM_DIR"

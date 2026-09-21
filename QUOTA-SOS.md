@@ -192,7 +192,7 @@ login only within that process; the login itself stays saved. **Never run
 ## Doing all of this automatically
 
 Everything above is the manual round trip to OpenRouter. It always works and needs
-nothing installed. If you would rather not type any of it:
+nothing installed. If you would rather not type the way back:
 
 ```sh
 ccd setup --auto

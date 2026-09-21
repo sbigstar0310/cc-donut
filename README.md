@@ -21,11 +21,15 @@
 When your Claude quota runs out, cc-donut moves the conversation to your **other
 Claude subscription**. The conversation, tools, hooks, skills and MCP servers all
 stay where they are, and nothing is billed: it is a subscription you already pay
-for. When the window resets, it moves you back.
+for. It does not move you back on a timer: the next time the account you are on
+runs low, it moves to whichever subscription has room — often the one you
+started on.
 
 Two subscriptions rarely run out at the same time, so switching between them is
-enough for most people. If they all run out, OpenRouter can take over as a paid
-fallback — with your own key, and only once you have said so.
+enough for most people. If they all run out, cc-donut tries three times, stops,
+and says so. OpenRouter is there as a paid fallback with your own key, and going
+to it is always something you type (`ccd -c`); only the way back from it can be
+automatic.
 
 ## Install
 

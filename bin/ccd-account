@@ -391,7 +391,7 @@ def cred_identity(oauth):
     credential. The refresh token is deliberately not used — it is optional in
     everything ccd accepts, so two unrelated logins that both lack one would
     compare equal, which is absence of evidence read as agreement."""
-    at = (oauth or {}).get("accessToken")
+    at = oauth.get("accessToken") if isinstance(oauth, dict) else None
     return at if isinstance(at, str) and at else None
 
 
@@ -432,12 +432,26 @@ def live_creds():
 
 
 def store_split():
-    """The stop a credential write left behind, as recorded. A cheap read: it
-    says a stop may be standing, not that it still applies."""
-    return read_json(STORE_SPLIT)
+    """The stop a credential write left behind, as recorded — None only when there
+    is no record. A cheap read: it says a stop may be standing, not that it still
+    applies.
+
+    Never falsy while the file exists. A record that is empty, corrupt or
+    unreadable is still a stop; reading it as "no record" fails open in exactly
+    the state where nothing is known."""
+    try:
+        with open(STORE_SPLIT) as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        rec = None
+    if isinstance(rec, dict) and rec:
+        return rec
+    return {"detail": "the record of it cannot be read"}
 
 
-def store_split_now():
+def store_split_now(expect=None):
     """The stop, re-tested against the stores. Call it holding the store lock.
 
     It lifts on positive evidence and on nothing else: every store the record
@@ -446,18 +460,25 @@ def store_split_now():
     "holds something unidentifiable" all keep it standing — each was once read as
     agreement, and each lifted a stop on a store nobody had seen agree. A backend
     that really is gone for good has an explicit exit instead (split_way_out).
+    A record that names no stores has nothing that could answer, so it stands.
+
+    `expect` adds one condition for the caller that has just written: the one
+    identity in sight must be the one it installed.
 
     The lock is what makes the test honest. A writer that has recorded its intent
     but not yet touched a backend leaves the stores agreeing, and lifting the stop
     there would throw away exactly the protection the record exists to give."""
-    rec = read_json(STORE_SPLIT)
+    rec = store_split()
     if rec is None:
         return None
+    named = rec.get("stores")
+    if not isinstance(named, list) or not named \
+            or not all(isinstance(n, str) for n in named):
+        return rec
     held, blind = live_creds()
-    named = rec.get("stores") or []
     ids = {cred_identity(held.get(n)) for n in named}
     ids |= {cred_identity(o) for o in held.values()}
-    if blind or None in ids or len(ids) != 1:
+    if blind or None in ids or len(ids) != 1 or (expect and ids != {expect}):
         return rec
     clear_store_split()
     return None
@@ -495,6 +516,12 @@ def split_way_out():
 def _tilde(path):
     home = os.path.expanduser("~")
     return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def die_split(rec):
+    die("the credential stores disagree with each other ("
+        + str(rec.get("detail") or "unknown") + ")."
+        "\n     " + split_way_out())
 
 
 def clear_store_split():
@@ -1083,6 +1110,11 @@ def account_refresh(name, acct):
             # exchange spends the token a session is carrying. And a backend that
             # will not answer is unknown, which refuses — it may hold that token.
             # Every refresh token, identifiable credential or not.
+            #
+            # And never while a stop stands. The stop may name a backend this run
+            # does not look at, and that backend may be holding this token.
+            if store_split_now():
+                return False, "unsure"
             held, blind = live_creds()
             if blind or not held:
                 return False, "unsure"
@@ -1354,9 +1386,7 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     with Lock(LOCK_FILE, timeout=lock_timeout):
         split = store_split_now()
         if split:
-            die("the credential stores disagree with each other ("
-                + str(split.get("detail") or "unknown") + ")."
-                "\n     " + split_way_out())
+            die_split(split)
         target = account_load(name)
         if not target:
             die(f"no such account: {name}")
@@ -1382,7 +1412,11 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
         # under a name that does not own them.
         cur = active_name()
         live_oauth = blob.get("claudeAiOauth")
-        if cur and isinstance(live_oauth, dict):
+        # One question for the backup and for the evening below: does the blob
+        # live_read() prefers hold a login at all? Banking one that does not
+        # overwrites a healthy snapshot with something ccd would refuse to install.
+        has_login = bool(cred_identity(live_oauth))
+        if cur and has_login:
             prev = account_load(cur)
             if prev:
                 prev["claudeAiOauth"] = live_oauth
@@ -1404,8 +1438,11 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
             # and a keychain left with nothing but mcpOAuth would otherwise be
             # copied over the login in the file, erasing the only credential.
             evened, failed = True, []
-            if cred_identity(live_oauth):
+            if has_login:
                 evened, failed, _ = live_write(blob, sources)
+            else:
+                warn("the credentials Claude Code is reading hold no login — nothing "
+                     "was backed up or copied. Sign in with /login.")
             if not evened:
                 # Not fatal: nothing was supposed to change and the credential in
                 # use is still good. But a silent failure here is how a stale
@@ -1453,7 +1490,17 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
                     f"the one before it", targets)
                 die("failed to write the credential store (" + note + ")"
                     + "\n     " + split_way_out())
-            clear_store_split()
+            # Both writes succeeding proves only that ccd wrote twice. Claude Code
+            # shares no lock with ccd, and a refresh of the outgoing account can
+            # land on one backend between them — so the record goes away by the
+            # same rule as always, on stores SEEN to agree, and on the credential
+            # just installed. This narrows that race; it does not close it.
+            split = store_split_now(cred_identity(oauth))
+            if split:
+                detail = (f"every store took {name}'s credential, but they are "
+                          f"not all seen holding it now")
+                mark_store_split(detail, targets)
+                die_split({"detail": detail})
             active_set(name)
             # The credential is only half of an account. The other half is what
             # Claude Code cached about the one we just left.

@@ -8,6 +8,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAKE=$(mktemp -d)
 trap 'rm -rf "$FAKE" 2>/dev/null || true' EXIT
 export HOME="$FAKE"
+# CLAUDE_CONFIG_DIR outranks HOME everywhere ccd looks, so an inherited one would
+# send fixture writes to the developer's real configuration. Cases that test it
+# set it themselves.
+unset CLAUDE_CONFIG_DIR
 # The suite must behave identically when launched from inside a ccd session:
 # CCD_ACTIVE would suppress quota-guard warnings and flip the statusline branch.
 unset CCD_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
@@ -6428,9 +6432,24 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
 m.ensure_dirs()
-def kc(fn):                               # never the developer key, on any path
-    m._keychain_read = fn
-kc(lambda: None)
+# The fake sits at the subprocess boundary, not on ccd functions: whatever a
+# revision calls its keychain reader, it ends in `security`, and that is where a
+# test has to stand to be about behaviour. Anything not staged ends the test —
+# and as a BaseException, because the code under test swallows Exception.
+import types
+class Unstaged(BaseException):
+    pass
+class Ran:
+    def __init__(self, rc, out=""):
+        self.returncode, self.stdout, self.stderr = rc, out, ""
+STAGED = {}
+def fake_run(argv, *a, **k):
+    if list(argv[:2]) == ["security", "find-generic-password"] and "find" in STAGED:
+        return STAGED["find"]()
+    raise Unstaged("unstaged external call: " + " ".join(argv[:2]))
+m.subprocess = types.SimpleNamespace(run=fake_run)
+def kc(fn=None, rc=0):                    # what `security find-generic-password` answers
+    STAGED["find"] = lambda: Ran(rc, json.dumps(fn()) if rc == 0 else "")
 OLD = {"claudeAiOauth": {"accessToken": "AT-old", "refreshToken": "RT-old"}}
 TARGET = {"name": "target", "claudeAiOauth":
           {"accessToken": "AT-target", "refreshToken": "RT-target"}}
@@ -6599,7 +6618,7 @@ assert okd is False and st == "stale", f"got {okd!r}/{st!r}"
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 spent = []
 m.use_keychain = lambda: True
-kc(lambda: None)                        # the keychain will not answer
+kc(rc=1)                                # the keychain will not answer
 m.token_refresh = lambda rt: (spent.append(rt), (None, 500))[1]
 m.active_name = lambda: None
 far = int((time.time() + 8 * 86400) * 1000)
@@ -6727,7 +6746,7 @@ assert m.store_split_now() is not None, "a file ccd was refused was read as a fi
 # too, so it cannot prove the item is absent.
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 m.use_keychain = lambda: True
-kc(lambda: None)
+kc(rc=44)                               # exit 44, staged as itself
 m.write_json(m.credentials_file(), json.loads(sys.argv[3]))
 exec(sys.argv[4])
 assert m.store_split_now() is not None, "a keychain that found nothing was read as an empty one"
@@ -6817,11 +6836,130 @@ m.open = denied
 
 PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
 m.use_keychain = lambda: True
-kc(lambda: None)
+kc(rc=1)
 m.write_json(m.credentials_file(), json.loads(sys.argv[3]))
 '"$GATE" "$ROOT/bin/ccd-account" "$(split_home gatesilent)" "$HEALTHY" \
   && ok "a keychain that gives no answer stops the exchange, healthy file or not" \
   || bad "spent a token blind" "a silent keychain was treated as an empty one"
+
+# Two writes that both succeed prove only that ccd wrote twice. Claude Code shares
+# no lock with ccd, and a refresh of the outgoing account can land on one backend
+# between them. So the record goes away on what the stores are SEEN to hold, not
+# on what the writes returned. (This narrows that race; it cannot close it.)
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+A = {"claudeAiOauth": {"accessToken": "AT-a", "refreshToken": "RT-a"}}
+back = {"kc": json.loads(json.dumps(A))}
+m.write_json(m.credentials_file(), A)
+m.use_keychain = lambda: True
+kc(lambda: back["kc"])
+def kwrite(blob):
+    # ccd write lands, and then the refresh Claude Code had in flight for the
+    # outgoing account lands on top of it — before ccd reaches the file.
+    back["kc"] = {"claudeAiOauth": {"accessToken": "AT-a2", "refreshToken": "RT-a2"}}
+    return True
+m._keychain_write = kwrite
+moved = []
+m.active_set = lambda n, stamp=True: moved.append(n)
+m.active_name = lambda: "a"
+m.account_load = lambda n: only_target(n) or ({"name": "a", **A} if n == "a" else None)
+m.account_save = lambda n, o: None
+m.drop_account_scoped_config = lambda: None
+try:
+    m.swap_to("target", force=True)
+except SystemExit:
+    pass
+else:
+    raise AssertionError("the swap reported success over stores that disagree")
+rec = json.load(open(m.STORE_SPLIT))
+assert moved == [], f"the pointer moved onto a store that is divided: {moved!r}"
+assert "interrupted" not in rec["detail"], "the record still tells the write-ahead story: " + rec["detail"]
+' "$ROOT/bin/ccd-account" "$(split_home foreign)" 2> "$FAKE/.foreign-err" \
+  && ok "two successful writes do not clear the stop when the stores are seen to disagree" \
+  || bad "cleared on write success" "$(tail -1 "$FAKE/.foreign-err")"
+grep -q 'ccd/store-split' "$FAKE/.foreign-err" \
+  && ok "...and the refusal names the record, as every other one does" \
+  || bad "no way out" "got: $(tr '\n' ' ' < "$FAKE/.foreign-err" | head -c 160)"
+
+# ...and agreeing is not enough: they have to agree on what was just installed. On
+# a one-store machine a foreign write cannot divide anything, but it can replace
+# the credential before the pointer moves — and a pointer moved then files the
+# outgoing account's fresh token under the incoming account's name.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+A = {"claudeAiOauth": {"accessToken": "AT-a", "refreshToken": "RT-a"}}
+m.use_keychain = lambda: False
+m.write_json(m.credentials_file(), A)
+real_live_write = m.live_write
+def overtaken(blob, sources):
+    got = real_live_write(blob, sources)
+    m.write_json(m.credentials_file(), {"claudeAiOauth": {"accessToken": "AT-a2", "refreshToken": "RT-a2"}})
+    return got
+m.live_write = overtaken
+moved = []
+m.active_set = lambda n, stamp=True: moved.append(n)
+m.active_name = lambda: "a"
+m.account_load = lambda n: only_target(n) or ({"name": "a", **A} if n == "a" else None)
+m.account_save = lambda n, o: None
+m.drop_account_scoped_config = lambda: None
+try:
+    m.swap_to("target", force=True)
+except SystemExit:
+    pass
+assert moved == [], f"the pointer moved though the store no longer holds what was installed: {moved!r}"
+assert os.path.exists(m.STORE_SPLIT), "the record was cleared on a credential ccd did not install"
+' "$ROOT/bin/ccd-account" "$(split_home overtaken)" 2>/dev/null \
+  && ok "stores that agree on something ccd did not install do not complete the swap" \
+  || bad "pointer moved onto a foreign credential" "agreement alone cleared the record"
+
+# A record ccd cannot make sense of is still a record. Each of these used to fail
+# open: no stores named meant nothing had to answer, and an empty one read as
+# "no stop" to every caller that tested it for truth.
+for bad_rec in '{}' '{"detail":"x"}' '{"detail":"x","stores":[]}' '{"detail":"x","stores":["floppy"]}' 'not json at all'; do
+  BAD_REC="$bad_rec" PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: False
+m.write_json(m.credentials_file(), json.loads(sys.argv[3]))
+open(m.STORE_SPLIT, "w").write(os.environ["BAD_REC"])
+assert m.store_split(), "the record reads as no stop at all"
+assert m.store_split_now(), "one healthy backend lifted a stop that names nothing it can check"
+assert os.path.exists(m.STORE_SPLIT), "the record was deleted"
+' "$ROOT/bin/ccd-account" "$(split_home malformed)" "$HEALTHY" 2>/dev/null \
+    && ok "a malformed stop still stops: $bad_rec" \
+    || bad "malformed record fails open" "$bad_rec"
+done
+
+# The outgoing backup and the evening of the stores ask the same question — does
+# the blob live_read() prefers hold a login at all — and must get the same answer.
+# Banking a refresh-only blob overwrites a healthy snapshot with something ccd
+# itself would refuse to install.
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: False
+m.write_json(m.credentials_file(), {"claudeAiOauth": {"refreshToken": "RT-only"}})
+saved, warned = [], []
+m.account_save = lambda n, o: saved.append((n, o.get("claudeAiOauth")))
+m.warn = lambda msg: warned.append(msg)
+m.active_name = lambda: "target"
+m.account_load = only_target
+m.swap_to("target", force=True)
+assert saved == [], "a blob holding no login was banked over the snapshot: " + json.dumps(saved)
+assert warned, "nothing was done and nothing was said"
+' "$ROOT/bin/ccd-account" "$(split_home nobank)" \
+  && ok "a live blob holding no login is neither banked nor copied, and ccd says so" \
+  || bad "snapshot overwritten" "the outgoing backup banked a credential-free blob"
+
+PYTHONDONTWRITEBYTECODE=1 python3 -c "$SPLIT_PRE"'
+m.use_keychain = lambda: False
+m.write_json(m.credentials_file(), {"claudeAiOauth": {"refreshToken": "RT-only"}})
+saved = []
+m.account_save = lambda n, o: saved.append(n)
+m.active_name = lambda: "a"
+m.account_load = lambda n: only_target(n) or ({"name": "a", "claudeAiOauth": {"accessToken": "AT-a"}} if n == "a" else None)
+m.active_set = lambda n, stamp=True: None
+m.drop_account_scoped_config = lambda: None
+m.swap_to("target", force=True)
+assert "a" not in saved, "the outgoing account was overwritten with a blob holding no login"
+assert not os.path.exists(m.STORE_SPLIT), "a clean single-store install left its record behind"
+' "$ROOT/bin/ccd-account" "$(split_home nobank2)" \
+  && ok "...nor banked on the way out to another account, and a one-store install still clears its record" \
+  || bad "snapshot overwritten" "a swap away banked a credential-free blob"
 
 # ...and while the stop stands, nothing else may touch the credential stores. The
 # record names both backends; this suite can only see the file one, so it cannot
@@ -6836,6 +6974,12 @@ out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
 { [ "$rc" -ne 0 ] && ! grep -q 'AT-split_b' "$CREDS"; } \
   && ok "a swap refuses to run on a store that is known to disagree with itself" \
   || bad "swapped on a split store" "rc=$rc, credential $(tx_tok "$CREDS")"
+: > "$CCD_FAKE_USAGE_LOG"
+CCD_HTTP_TIMEOUT=10 "$ACCT" --no-color refresh split_b >/dev/null 2>&1; rrc=$?
+calls=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
+{ [ "${calls:-0}" -eq 0 ] && [ "$rrc" -ne 0 ]; } \
+  && ok "...and no stored token is spent while a store the stop names cannot be seen" \
+  || bad "spent a token on a split store" "${calls:-0} exchanges, rc=$rrc"
 case "$out" in
   *"/login"*) ok "...and sends the user to /login, which replaces the credential in use" ;;
   *) bad "no way out" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
@@ -6865,25 +7009,29 @@ esac
   || ok "...and there is no ccd command that claims to repair a credential store"
 rm -f "$TXD/store-split"
 
-# Write-ahead, on the real filesystem and not a stubbed one: the record's own path
-# is made unwritable (a directory sits where the file goes) while everything else
-# stays writable. A protection that cannot be recorded is none at all, so the
-# credential must not move either.
-write_creds split_a
-mkdir -p "$TXD/store-split"
-out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
-{ [ "$rc" -ne 0 ] && [ "$(tx_tok "$CREDS")" = "AT-split_a" ]; } \
-  && ok "a record ccd cannot write means the credential is not written either" \
-  || bad "wrote what it could not record" "rc=$rc, credential $(tx_tok "$CREDS")"
-case "$out" in
-  *"refusing to touch the credential stores"*) ok "...and says so instead of swapping quietly" ;;
-  *) bad "silent unrecorded write" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
-esac
-rm -rf "$TXD/store-split"
+# Write-ahead, on the real filesystem and not a stubbed one: the state directory
+# stops taking new files while everything the swap reads stays readable. A
+# protection that cannot be recorded is none at all, so the credential must not
+# move either. Root writes through a read-only directory, so containers skip it.
+if [ "$(id -u)" -ne 0 ]; then
+  write_creds split_a
+  chmod 500 "$TXD"
+  out=$("$ACCT" --no-color use split_b --force 2>&1); rc=$?
+  chmod 700 "$TXD"
+  { [ "$rc" -ne 0 ] && [ "$(tx_tok "$CREDS")" = "AT-split_a" ]; } \
+    && ok "a record ccd cannot write means the credential is not written either" \
+    || bad "wrote what it could not record" "rc=$rc, credential $(tx_tok "$CREDS")"
+  case "$out" in
+    *"refusing to touch the credential stores"*) ok "...and says so instead of swapping quietly" ;;
+    *) bad "silent unrecorded write" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 120)" ;;
+  esac
+fi
 
+write_creds split_a
 "$ACCT" --no-color use split_b --force >/dev/null 2>&1 \
   && grep -q 'AT-split_b' "$CREDS" \
-  && ok "...after which a swap works again" \
+  && [ ! -e "$TXD/store-split" ] \
+  && ok "...after which a swap works again, and clears its own record on a one-store machine" \
   || bad "still blocked" "the store stayed unusable once the stop was gone"
 rm -rf "$FAKE"/split-*
 
