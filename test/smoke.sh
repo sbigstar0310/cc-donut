@@ -651,17 +651,11 @@ quota() { printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s
 # StopFailure payload as Claude Code delivers it.
 stopfail() { printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"%s"}' "$1" "$2"; }
 
-# What the backstop does when it fires is: try to move the session to a spare,
-# and if it cannot, leave one line saying so. Nothing is armed and nothing is
-# signalled — ccd does not move a conversation onto a metered backbone. So the
-# observable here is that note, and the fixture is an account store ccd cannot
-# reach (the plugin copy of ccd-account is not staged until section 21).
-NOTEF="$FAKE/.claude/ccd/swap-note"
-mkdir -p "$FAKE/.claude/ccd/accounts"
-printf '{"name":"spare-x","claudeAiOauth":{"accessToken":"AT-x","refreshToken":"RT-x"}}' \
-  > "$FAKE/.claude/ccd/accounts/spare-x.json"
-note_reset() { rm -f "$NOTEF"; }
-noted() { [ -f "$NOTEF" ] && printf 'yes'; }
+# Arming requires the full readiness set, so these run as a supervised session
+# would: a launcher marker, a key, and a resolvable claude process. Section 19
+# covers what happens when each of those is missing.
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 # Stand-in for the claude process. Nothing resolves as "claude" on every
 # platform at once — a symlink shows the target on Linux, a script shows the
 # interpreter on macOS, and copied system binaries fail code-signing there. On
@@ -689,17 +683,19 @@ set +m 2>/dev/null
 sleep 0.3
 # Signalling is section 17's subject; here we only care what gets armed, so aim
 # CLAUDE_PID at a live stand-in and let it be killed.
-fire_stopfail() { CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
+fire_stopfail() { CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$ARMPID CCD_STANDIN_PID=$ARMPID CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1; }
 arm_run() { stopfail "$1" "$2" | fire_stopfail; }
 
 # rate_limit ALONE is not enough — it can be transient throttling. The dashboard
 # reading has to agree, and a missing reading must never arm.
-note_reset; hf_reset; quota 58 96
+hf_reset; quota 58 96
 arm_run sess-a rate_limit
-[ "$(noted)" = "yes" ] && ok "rate_limit + 96% puts the backstop to work" \
-  || bad "corroborated rate_limit" "the backstop did not run"
-[ -z "$(hf_get armed)" ] && ok "...and arms no hop onto a paid backbone" \
-  || bad "paid arm" "armed $(hf_get direction)"
+[ "$(hf_get armed)" = "True" ] && ok "rate_limit + 96% arms the handoff" \
+  || bad "arming on corroborated rate_limit" "armed=$(hf_get armed)"
+[ "$(hf_get direction)" = "to_fallback" ] && ok "armed toward the OpenRouter backbone" \
+  || bad "handoff direction" "got: $(hf_get direction)"
+[ "$(hf_get session_id)" = "sess-a" ] && ok "session id recorded for --resume" \
+  || bad "session id" "got: $(hf_get session_id)"
 kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 # The payload Claude Code really sends, verbatim from an interactive session
@@ -710,55 +706,58 @@ kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 captured_stopfail() { # $1=session id
   printf '{"session_id":"%s","transcript_path":"/tmp/w/t.jsonl","cwd":"/tmp/w","prompt_id":"42d3d934-7b41-49f6-91a7-f3355451fcd6","effort":{"level":"xhigh"},"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Request rejected (429)"}' "$1"
 }
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
 sleep 0.3
-note_reset; quota 58 96
+hf_reset; quota 58 96
 captured_stopfail sess-real | fire_stopfail
-[ "$(noted)" = "yes" ] && ok "the payload Claude Code actually sends reaches the backstop" \
-  || bad "the real StopFailure payload" "the backstop did not run"
+[ "$(hf_get armed)" = "True" ] && ok "the payload Claude Code actually sends arms the handoff" \
+  || bad "arming on the real StopFailure payload" "armed=$(hf_get armed)"
+[ "$(hf_get session_id)" = "sess-real" ] && ok "...and its session id is the one recorded for --resume" \
+  || bad "session id from the real payload" "got: $(hf_get session_id)"
 kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 # No version of Claude Code sends error_type. Reading it as well would let the
 # real key rot unnoticed behind a fixture only this suite ever produces.
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
 sleep 0.3
-note_reset; quota 58 96
+hf_reset; quota 58 96
 printf '{"session_id":"sess-legacy","cwd":"/tmp/w","hook_event_name":"StopFailure","error_type":"rate_limit"}' \
   | fire_stopfail
-[ -z "$(noted)" ] && ok "the retired error_type key reaches nothing" \
-  || bad "error_type must not be read" "the backstop ran on it"
+[ -z "$(hf_get armed)" ] && ok "the retired error_type key arms nothing" \
+  || bad "error_type must not be read" "armed=$(hf_get armed)"
 # Positive control. Nothing armed is also what a dead stand-in, a readiness check
 # that failed, or a hook that never ran leaves behind — so the assertion above can
 # pass while proving nothing. The real payload through the SAME stand-in and the
 # SAME fixture must arm: only then was that silence the key being rejected.
-note_reset
+hf_reset
 captured_stopfail sess-legacy-control | fire_stopfail
-[ "$(noted)" = "yes" ] && ok "...on a fixture that runs the moment the key is right" \
-  || bad "positive control for the error_type case" "the backstop did not run"
+[ "$(hf_get armed)" = "True" ] && ok "...on a fixture that arms the moment the key is right" \
+  || bad "positive control for the error_type case" "armed=$(hf_get armed)"
 kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 "$FAKE/sigbin/claude" 8 2>/dev/null & ARMPID=$!
 sleep 0.3
-note_reset; quota 20 40
+hf_reset; quota 20 40
 arm_run sess-b rate_limit
-[ -z "$(noted)" ] && ok "rate_limit at 40% moves nothing (transient throttle)" \
-  || bad "must not act below threshold" "the backstop ran"
+[ -z "$(hf_get armed)" ] && ok "rate_limit at 40% does not arm (transient throttle)" \
+  || bad "must not arm below threshold" "armed=$(hf_get armed)"
 
-note_reset; quota 58 96
+hf_reset; quota 58 96
 arm_run sess-c overloaded
-[ -z "$(noted)" ] && ok "overloaded moves nothing (not a quota problem)" \
-  || bad "must not act on non-rate_limit" "the backstop ran"
+[ -z "$(hf_get armed)" ] && ok "overloaded does not arm (not a quota problem)" \
+  || bad "must not arm on non-rate_limit" "armed=$(hf_get armed)"
 
-note_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json"
+hf_reset; rm -f "$FAKE/.claude/ccd/quota-cache.json"
 arm_run sess-d rate_limit
-[ -z "$(noted)" ] && ok "no quota reading moves nothing (fails closed)" \
-  || bad "must not act without corroboration" "the backstop ran"
+[ -z "$(hf_get armed)" ] && ok "no quota reading does not arm (fails closed)" \
+  || bad "must not arm without corroboration" "armed=$(hf_get armed)"
 kill -9 $ARMPID 2>/dev/null; wait $ARMPID 2>/dev/null
 
 # The discarded prototype used `timeout 0.5 cat` to read stdin. macOS has no
 # timeout(1), so under `set -e` every hook died silently — taking the quota
 # warnings with it. Assert the no-stdin path still works.
-note_reset; rm -rf "$FAKE/.claude/ccd/accounts"
 quota 58 96; rm -f "$FAKE/.claude/ccd/last-warn"
 out=$("$ROOT/scripts/quota-guard.sh" UserPromptSubmit < /dev/null 2>/dev/null)
 case "$out" in
@@ -776,18 +775,8 @@ esac
 head_ "17. automatic handoff: the SIGHUP interlock"
 # THE safety property: never signal unless a relaunch loop is there to catch it.
 # Otherwise the session just dies with nothing bringing it back.
-#
-# One path still ends a session: the return from OpenRouter, where the backbone
-# is an environment variable and leaving it really does take a relaunch. That is
-# what these fire, and the interlock is the same one it always was.
-ret_fire() {  # $1=session id ; the recovery the launcher is there to catch
-  cat > "$FAKE/.claude/ccd/run-state.json" <<'RSEOF'
-{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5,"last_seven_day_percent":97,"last_seven_day_reset":"D1"}
-RSEOF
-  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"fiveHourReset":"R1","sevenDayPercent":3,"sevenDayReset":"D2"}}\n' \
-    > "$FAKE/.claude/ccd/quota-cache.json"
-  printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"UserPromptSubmit"}' "$1"
-}
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 # Stand-in for the claude process. Nothing resolves as "claude" on every
 # platform at once — a symlink shows the target on Linux, a script shows the
 # interpreter on macOS, and copied system binaries fail code-signing there. On
@@ -815,8 +804,7 @@ quota 58 96
 "$FAKE/sigbin/claude" 8 & TARGET=$!
 sleep 0.3
 hf_reset
-ret_fire sess-e | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
-  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+stopfail sess-e rate_limit | CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 sleep 0.4
 if kill -0 "$TARGET" 2>/dev/null; then ok "no CCD_HANDOFF → session is never signalled"
 else bad "interlock breached" "target died without a relaunch loop"; fi
@@ -828,17 +816,23 @@ set +m 2>/dev/null
 "$FAKE/sigbin/claude" 8 2>/dev/null & TARGET=$!
 sleep 0.3
 hf_reset
-ret_fire sess-f | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
-  CCD_HANDOFF=00000000000000000000000000000002 \
-  CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" \
-  CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
-if died_within "$TARGET" 5; then ok "the launcher's own token → SIGHUP delivered to the claude process"
-else bad "handoff signal" "target survived a complete launcher contract"; fi
+stopfail sess-f rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+if died_within "$TARGET" 5; then ok "CCD_HANDOFF=1 → SIGHUP delivered to the claude process"
+else bad "handoff signal" "target survived CCD_HANDOFF=1"; fi
 kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
-[ "$(hf_get direction)" = "to_subscription" ] \
-  && ok "...and what it armed is the return, the only direction there is" \
-  || bad "return direction" "got: $(hf_get direction)"
-rm -f "$FAKE/.claude/ccd/run-state.json"
+
+# An armed handoff with no key would end the session with nowhere to go.
+: > "$FAKE/.claude/ccd/providers/keys.env"
+"$FAKE/sigbin/claude" 8 & TARGET=$!
+sleep 0.3
+hf_reset
+stopfail sess-g rate_limit | CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" CLAUDE_PID=$TARGET CCD_STANDIN_PID=$TARGET "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+sleep 0.4
+if kill -0 "$TARGET" 2>/dev/null; then ok "missing OpenRouter key → no signal (fails closed)"
+else bad "signalled without a key" "target died with no fallback available"; fi
+kill -9 "$TARGET" 2>/dev/null; wait "$TARGET" 2>/dev/null
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_on
 
 head_ "17b. the statusline never waits on the dashboard"
 # ccd renders the dashboard's rows above its own by running it as a child. That
@@ -1286,29 +1280,39 @@ PATH="$SHIMPATH" shim_run "$SHIM" >/dev/null 2>&1
 
 # --resume only happens when the session actually has a transcript.
 mkdir -p "$FAKE/.claude/projects/-tmp"; : > "$FAKE/.claude/projects/-tmp/sess-x.jsonl"
-# The one direction there is: a ccd run coming back to the subscription. It
-# relaunches the REAL claude — never ccd, which is what the user types to go the
-# other way.
-fake_real '#!/bin/sh
-[ "$1" = --resume ] && { echo "REAL-RESUMED:$*"; exit 0; }
-exit 129'
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-x","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-x","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
-  *"REAL-RESUMED:--resume sess-x"*) ok "armed 129 relaunches the conversation on the subscription" ;;
+  *"CCD-RESUMED:--resume sess-x"*) ok "armed 129 relaunches the conversation on ccd" ;;
   *) bad "handoff relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
 esac
 [ ! -f "$HSTATE" ] && ok "handoff is disarmed before relaunching" \
   || bad "stale handoff left armed"
 
-# A direction nothing writes any more is one the launcher must not act on.
+# Consent is checked again here, not only where the hop was armed. The two moments
+# are separated by the whole of Claude Code's shutdown, and a `--no-auto` inside
+# that window must not be outrun by a hop armed a minute earlier.
+rm -f "$FAKE/.claude/ccd/paid-handoff"
 : > "$FAKE/.claude/projects/-tmp/sess-revoked.jsonl"
 printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-revoked","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
 case "$out" in
-  *RESUMED*) bad "retired direction" "acted on a direction ccd no longer writes" ;;
-  *"claude --resume sess-revoked"*) ok "a hop onto OpenRouter is not a direction it knows" ;;
-  *) bad "retired direction" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+  *CCD-RESUMED*) bad "revoked paid hop" "billed on a permission that was withdrawn" ;;
+  *"claude --resume sess-revoked"*) ok "a paid hop whose opt-in was withdrawn does not relaunch" ;;
+  *) bad "revoked paid hop" "stopped without saying how to carry on: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+esac
+: > "$FAKE/.claude/ccd/paid-handoff"
+
+# to_subscription goes back to the real binary, not to ccd.
+fake_real '#!/bin/sh
+[ "$1" = --resume ] && { echo "REAL-RESUMED:$*"; exit 0; }
+exit 129'
+: > "$FAKE/.claude/projects/-tmp/sess-y.jsonl"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-y","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
+case "$out" in
+  *"REAL-RESUMED:--resume sess-y"*) ok "recovery relaunches on the subscription" ;;
+  *) bad "subscription relaunch" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)" ;;
 esac
 
 # A transcript can exist and still fail to open — Claude Code answers "No
@@ -1319,26 +1323,24 @@ esac
 rm -f "$FAKE/.tries"
 fake_real '#!/bin/sh
 exit 129'
-fake_real '#!/bin/sh
-printf "launch %s\n" "$*" >> "$HOME/.tries"
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "%s\n" "$*" >> "$HOME/.tries"
 case "$1" in --resume) echo "No conversation found"; exit 1 ;; esac
-[ -f "$HOME/.been-fresh" ] && { echo "REAL-FRESH:$*"; exit 0; }
-: > "$HOME/.been-fresh"
-exit 129'
-rm -f "$FAKE/.been-fresh"
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-bad","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+echo "CCD-FRESH:$*"
+EOF
+chmod +x "$HB/ccd"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-bad","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>&1)
 case "$out" in
-  *"REAL-FRESH:"*) ok "a resume that fails starts a fresh session instead of erroring" ;;
+  *"CCD-FRESH:go"*) ok "a resume that fails starts a fresh session instead of erroring" ;;
   *) bad "resume fallback" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 case "$out" in
   *"복원하지 못했습니다"*"--resume sess-bad"*) ok "...and says the thread is still there, with how to get it" ;;
   *) bad "resume fallback" "silent about the lost thread" ;;
 esac
-# Three launches: the one that armed, the resume that failed, and the fresh
-# session that replaced it. A loop would keep going past that.
-[ "$(grep -c . "$FAKE/.tries" 2>/dev/null)" = "3" ] \
+[ "$(grep -c . "$FAKE/.tries" 2>/dev/null)" = "2" ] \
   && ok "it retries exactly once, not in a loop" \
   || bad "resume fallback" "ran $(grep -c . "$FAKE/.tries" 2>/dev/null) times"
 rm -f "$HSTATE" "$FAKE/.tries" "$FAKE/.claude/projects/-tmp/sess-bad.jsonl"
@@ -1350,19 +1352,28 @@ rm -f "$HSTATE" "$FAKE/.tries" "$FAKE/.claude/projects/-tmp/sess-bad.jsonl"
 rm -f "$FAKE/.hops"
 fake_real '#!/bin/sh
 printf "%s\n" x >> "$HOME/.hops"
-printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_subscription\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_fallback\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
 exit 129'
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "%s\n" x >> "$HOME/.hops"
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_fallback\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129
+EOF
+chmod +x "$HB/ccd"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 PATH="$SHIMPATH" shim_run "$SHIM" >/dev/null 2>&1
 hops=$(wc -l < "$FAKE/.hops" 2>/dev/null | tr -d ' ')
-# Exactly 3 launches. With one direction left there is no destination set to
-# remember, so the numeric cap is the guard again — the same cap, and the same
-# value, this launcher had before it ever carried more than one road. An exact
-# count matters: a loose range would also pass if the loop stopped early for an
-# unrelated reason (a token mismatch, say).
-[ "${hops:-0}" -eq 3 ] \
-  && ok "a relaunch that keeps re-arming itself is stopped (ran $hops times)" \
-  || bad "burst loop guard" "expected 3 launches, ran ${hops:-0}"
+# Exactly 2 launches. Every arming here points at the SAME destination
+# (fallback), and a destination may be entered once per burst — so the second
+# 129 is refused rather than relaunched. This is stricter than the old hop
+# counter, which allowed a third launch before tripping: repeating a destination
+# is a loop by definition, no matter how high a numeric cap is set.
+# An exact count matters — a loose range would also pass if the loop stopped
+# early for an unrelated reason (a token mismatch, say).
+[ "${hops:-0}" -eq 2 ] \
+  && ok "a destination is never entered twice in one burst (ran $hops times)" \
+  || bad "burst loop guard" "expected 2 launches, ran ${hops:-0}"
 rm -f "$HSTATE"
 
 # The cap must not count LEGITIMATE transitions. Quota dying, recovering, and
@@ -1372,9 +1383,15 @@ rm -f "$FAKE/.hops2"
 fake_real '#!/bin/sh
 printf "%s\n" x >> "$HOME/.hops2"
 sleep 2
-printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_subscription\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_fallback\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
 exit 129'
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "{\"armed\":true,\"token\":\"00000000000000000000000000000001\",\"direction\":\"to_subscription\",\"session_id\":\"sess-z\",\"cwd\":\"/tmp\",\"armed_at\":1}" > "$HOME/.claude/ccd/handoff-00000000000000000000000000000001.json"
+exit 129
+EOF
+chmod +x "$HB/ccd"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-z","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 # A 1s window makes each 2s session count as "long"; run briefly and count.
 ( PATH="$SHIMPATH" CCD_HOP_RESET_SECONDS=1 shim_run "$SHIM" >/dev/null 2>&1 ) &
 LOOPPID=$!
@@ -1909,42 +1926,75 @@ rm -f "$RC" "$FAKE/.claude/ccd/auto-path"
 "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 
 
-head_ "18d. --auto installs the way back, and nothing that spends money"
-# ccd never moves a conversation ONTO a metered backbone: that is `ccd -c`, typed
-# by the user. What `--auto` installs is the launcher that brings such a run back
-# to the subscription by itself — so there is no consent to money to record, and
-# no file recording one.
+head_ "18d. --auto is the opt-in for the paid hop, and only for that"
+# The free hop between registered subscriptions costs nothing and is what the
+# product promises; the hop to OpenRouter spends the user's money. One flag used to
+# stand for both. `--auto` now records consent for the paid one, and the launcher
+# it installs carries the free one on its own.
 rm -f "$RC"; printf '# my own file\n' > "$RC"
-rm -f "$FAKE/.claude/ccd/auto-path"
+rm -f "$FAKE/.claude/ccd/paid-handoff" "$FAKE/.claude/ccd/auto-path"
 HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
-[ ! -e "$FAKE/.claude/ccd/paid-handoff" ] \
-  && ok "--auto records no permission to spend, because nothing spends" \
-  || bad "paid opt-in" "setup --auto wrote a consent file for a hop that does not exist"
-[ -x "$SHIM" ] && ok "...and installs the launcher that carries the return" \
-  || bad "return launcher" "no shim after --auto"
+[ -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "--auto records the paid-hop opt-in" \
+  || bad "paid opt-in" "setup --auto left no record of consent"
 
-# Every surface has to say the same true thing: going to OpenRouter is typed,
-# coming back is automatic.
+HOME="$FAKE" "$ROOT/bin/ccd" setup --no-auto >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "--no-auto takes it back" \
+  || bad "paid opt-in" "consent survived --no-auto"
+
+# Consent must not be re-granted by a run that never asked for it. A bare setup
+# installs neither the launcher nor the opt-in, so it must leave this alone in
+# both directions.
+HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "a bare setup does not grant it" \
+  || bad "paid opt-in" "a bare setup opted the user into billing"
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+HOME="$FAKE" "$ROOT/bin/ccd" setup >/dev/null 2>&1
+[ -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "...and does not revoke it either" \
+  || bad "paid opt-in" "a bare setup revoked consent the user had given"
+
+# Removing ccd removes the consent with it.
+HOME="$FAKE" "$ROOT/bin/ccd" uninstall >/dev/null 2>&1
+[ ! -f "$FAKE/.claude/ccd/paid-handoff" ] \
+  && ok "uninstall removes it" || bad "paid opt-in" "left behind by uninstall"
+
+# It has to be legible somewhere. `ccd doctor` is where the handoff already
+# explains itself, and the two hops now have different answers.
 rm -f "$RC"; printf '# my own file\n' > "$RC"
 HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
 out=$(HOME="$FAKE" "$ROOT/bin/ccd" doctor 2>&1)
+# "OpenRouter" alone is not enough: doctor names it in the key section too, so that
+# string was green before this line existed. Match the state, not the word.
 case "$out" in
-  *"never automatic"*) ok "doctor says ccd will not take a session onto OpenRouter" ;;
+  *"OpenRouter hop allowed"*) ok "doctor says where the paid hop stands" ;;
   *) bad "doctor paid hop" "no mention: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
+rm -f "$FAKE/.claude/ccd/paid-handoff"
+out=$(HOME="$FAKE" "$ROOT/bin/ccd" doctor 2>&1)
 case "$out" in
-  *"return launcher installed"*) ok "...and that the way back is installed" ;;
-  *) bad "doctor return" "no mention: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
+  *"ccd setup --auto"*) ok "...and how to turn it on when it is off" ;;
+  *) bad "doctor paid hop" "no remedy: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
+# The status screen makes a promise about where a session goes. With the paid hop
+# off it must not promise OpenRouter, because nothing will take it there.
+rm -f "$FAKE/.claude/ccd/paid-handoff"
+# SHIMPATH puts the shim ahead of the real claude, which is the branch that makes
+# the promise at all — without it status only says "installed, but not active".
 out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" 2>&1)
 case "$out" in
-  *"only when none do"*) bad "status promise" "still promises a hop nothing makes" ;;
-  *"never by itself"*) ok "status promises no hop onto OpenRouter at all" ;;
+  *"to OpenRouter only when none do"*)
+    bad "status promise" "promised a paid hop that is not allowed" ;;
+  *"Subscriptions only"*) ok "status promises subscriptions only when the paid hop is off" ;;
   *) bad "status promise" "said neither: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
+HOME="$FAKE" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+out=$(PATH="$SHIMPATH" HOME="$FAKE" "$ROOT/bin/ccd" 2>&1)
 case "$out" in
-  *"ccd -c"*) ok "...and names the command that does go there" ;;
-  *) bad "status promise" "left the user without the manual route" ;;
+  *"to OpenRouter only when none do"*) ok "...and names it once it is allowed" ;;
+  *) bad "status promise" "never names the paid hop: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 
 head_ "18e. the launcher is the paid hop's, and nothing else's"
@@ -2008,32 +2058,44 @@ grep -qxF 'export PATH="$HOME/.claude/ccd/bin:$PATH"' "$RC" \
   && ok "...and yes wires it" || bad "consent" "y did not wire the PATH line"
 
 head_ "19. automatic handoff: readiness gates"
-# The one path that ends a session is the return from OpenRouter, and it must
-# fail closed: armed state left behind by a session no launcher is watching
-# would be consumed by a later one and resume the wrong conversation.
-#
-# An OpenRouter KEY is not among the conditions any more. Nothing here goes to
-# OpenRouter — the user types that — and coming back needs no key at all.
+# Each of these ends a session, so each must fail closed. A key ccd would later
+# reject is the same as no key: the session would end with nowhere to go.
+eval "$(sed -n '/^have_key()/,/^}/p' "$ROOT/scripts/quota-guard.sh")"
 CCD_DIR="$FAKE/.claude/ccd"
 keyfile="$CCD_DIR/providers/keys.env"
 mkdir -p "$CCD_DIR/providers"
+keycase() { printf '%s\n' "$2" > "$keyfile"
+  if env -u OPENROUTER_API_KEY bash -c "CCD_DIR='$CCD_DIR'; $(declare -f have_key); have_key" 2>/dev/null
+  then got=usable; else got=unusable; fi
+  [ "$got" = "$3" ] && ok "key: $1 → $3" || bad "key: $1" "got $got, want $3"; }
+keycase 'empty double quotes'  'OPENROUTER_API_KEY=""'                     unusable
+keycase 'empty single quotes'  "OPENROUTER_API_KEY=''"                     unusable
+keycase 'commented out'        '# OPENROUTER_API_KEY="sk-or-v1-real"'      unusable
+keycase 'whitespace only'      'OPENROUTER_API_KEY="   "'                  unusable
+keycase 'bare assignment'      'OPENROUTER_API_KEY='                       unusable
+keycase 'real key'             'OPENROUTER_API_KEY="sk-or-v1-real"'        usable
+keycase 'export prefix'        'export OPENROUTER_API_KEY="sk-or-v1-real"' usable
+keycase 'unquoted'             'OPENROUTER_API_KEY=sk-or-v1-real'          usable
+
+# Arming must not outlive the conditions that justified it: a file left behind by
+# an unsupervised session would be consumed by a later launcher.
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
+paid_optin_on
 quota 58 96
 hf_reset
-ret_fire sess-h | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
-  "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+stopfail sess-h rate_limit | "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
   && ok "an unsupervised session never leaves armed state behind" \
   || bad "stale armed handoff" "written without CCD_HANDOFF"
 
 : > "$keyfile"
 hf_reset
-ret_fire sess-i | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
-  CCD_HANDOFF=1 "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+stopfail sess-i rate_limit | CCD_HANDOFF=1 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
 [ ! -f "$FAKE/.claude/ccd/handoff-00000000000000000000000000000002.json" ] \
-  && ok "a token the hook would refuse arms nothing either" \
-  || bad "armed on a bad token" "would end the session with nothing watching"
+  && ok "no key → nothing is armed either" \
+  || bad "armed without a key" "would end the session with nowhere to go"
 printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$keyfile"
-rm -f "$FAKE/.claude/ccd/run-state.json"
+paid_optin_on
 
 # The headline promise: on recovery the session must actually END, or the return
 # trip waits for an unrelated exit that may never come.
@@ -2066,24 +2128,30 @@ rm -f "$FAKE/fakebin/curl" "$FAKE/.claude/ccd/handoff-00000000000000000000000000
 # Exit 129 the first time so the shim performs a handoff, then 0 so the loop
 # ends — without the second launch the relaunch would spin to the hop cap.
 fake_real '#!/bin/sh
-[ -f "$HOME/.been-here" ] && { printf "REAL:%s\n" "$*"; exit 0; }
+printf "REAL:%s\n" "$*"
+[ -f "$HOME/.been-here" ] && exit 0
 : > "$HOME/.been-here"
 exit 129'
+cat > "$HB/ccd" <<'EOF'
+#!/bin/sh
+printf "CCD:%s\n" "$*"
+EOF
+chmod +x "$HB/ccd"
 rm -rf "$FAKE/.claude/projects" "$FAKE/.been-here" "$HSTATE"
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-new","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-new","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
-  *"REAL:"*) ok "a session with no transcript starts fresh instead of failing" ;;
+  *"CCD:go"*) ok "a session with no transcript starts fresh instead of failing" ;;
   *) bad "no-transcript handoff" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 # With a transcript present it must still resume rather than start over.
 mkdir -p "$FAKE/.claude/projects/-tmp"
 : > "$FAKE/.claude/projects/-tmp/sess-old.jsonl"
 rm -f "$FAKE/.been-here"
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-old","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-old","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 out=$(PATH="$SHIMPATH" shim_run "$SHIM" 2>/dev/null)
 case "$out" in
-  *"REAL:--resume sess-old"*) ok "an existing transcript is resumed, not discarded" ;;
+  *"CCD:--resume sess-old"*) ok "an existing transcript is resumed, not discarded" ;;
   *) bad "transcript resume" "got: $(printf '%s' "$out" | tr '\n' ' ' | head -c 90)" ;;
 esac
 rm -rf "$FAKE/.claude/projects" "$HSTATE"
@@ -2162,7 +2230,7 @@ else bad "valid contract refused" "the launcher could never hand off"; fi
 # shared state file, whichever exits 129 first — for any reason — resumes the
 # other's conversation and leaves the signalled session with nothing to bring it
 # back. State is per-launcher and token-tagged to make that impossible.
-printf '{"armed":true,"token":"000000000000000000000000000000ff","direction":"to_subscription","session_id":"sess-other","cwd":"/tmp","armed_at":1}' \
+printf '{"armed":true,"token":"000000000000000000000000000000ff","direction":"to_fallback","session_id":"sess-other","cwd":"/tmp","armed_at":1}' \
   > "$FAKE/.claude/ccd/handoff-000000000000000000000000000000ff.json"
 rm -f "$HSTATE"
 # A plain ccd stub: the earlier loop-cap test left one that exits 129, which
@@ -2251,7 +2319,7 @@ cat > "$FAKE/realbin/claude" <<'EOF'
 #!/bin/sh
 [ "$1" = --resume ] && { printf '%s' "${CCD_HANDOFF:-<none>}" > "$HOME/.tok2"; exit 0; }
 printf '%s' "${CCD_HANDOFF:-<none>}" > "$HOME/.tok1"
-printf '{"armed":true,"token":"%s","direction":"to_subscription","session_id":"sess-n","cwd":"/tmp","armed_at":1}' \
+printf '{"armed":true,"token":"%s","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' \
   "${CCD_HANDOFF:-x}" > "${CCD_HANDOFF_STATE:-/dev/null}"
 exit 129
 EOF
@@ -2286,7 +2354,7 @@ esac
 # `-p` is not the only way in: Claude Code also goes non-interactive when its
 # output is redirected. Relaunching that one lands the user in ccd's no-terminal
 # refusal where they expected output, so no pty here — the point is its absence.
-printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_subscription","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
+printf '{"armed":true,"token":"00000000000000000000000000000001","direction":"to_fallback","session_id":"sess-n","cwd":"/tmp","armed_at":1}' > "$HSTATE"
 PATH="$NESTPATH" "$SHIM" hello > "$FAKE/.piped" 2> "$FAKE/.piped-err"
 case "$(cat "$FAKE/.piped-err")" in
   *"non-interactive run"*) ok "redirected output counts as headless too" ;;
@@ -4179,41 +4247,136 @@ row=$(hatch)
   && ok "a spare that needs a re-login is not offered as the escape" || bad "warning target" "got: $row"
 rm -rf "$ADIR"; mkdir -p "$ADIR"
 
-head_ "27d. the row says what is true about this session"
+head_ "27d. a session that cannot hand off says so where you are looking"
 # The whole of #21 was an install that sat inert for four days while every surface
-# except `ccd doctor` reported success. What the row used to carry for that was a
-# supervision warning — and with the hop between subscriptions happening inside the
-# session, there is nothing left for a launcher to supervise here. A row that warns
-# about a launcher this path never uses is a row people learn to ignore.
+# except `ccd doctor` reported success. doctor is the command nobody runs BEFORE the
+# thing they installed fails to happen; this row is the one people actually read, and
+# it already carries "needs re-login" for the same reason.
 rm -rf "$ADIR" "$SLQ"; mkdir -p "$ADIR"
 mk_sl_acct main; mk_sl_acct backup
 printf 'main' > "$ADIR/.active"; date +%s > "$ADIR/.active-at"
 seed_rows main:ok:0:22:18000:600000 backup:ok:20:30:18000:600000
+# Below the threshold: this section is about supervision, not about the warning.
+# (CCDD is not defined until section 28; WDIR from 27b names the same directory.)
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":10,"sevenDayPercent":20,"fiveHourReset":"R1","sevenDayReset":"D1"}}\n' \
   > "$WDIR/quota-cache.json"
 SHIMD="$FAKE/.claude/ccd/bin"
 sl_env() { env -u CCD_HANDOFF "$@" HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
              | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:'; }
+# A launcher is only needed by the hop that is authorised here. With the paid hop
+# on, an unsupervised session cannot take it — which is what these cases are about.
+paid_optin_on
+mkdir -p "$FAKE/.claude/ccd/providers"
+printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$FAKE/.claude/ccd/providers/keys.env"
 
-# Nothing installed, and nothing to say about it: this session can move to the
-# spare on its own.
+# Nothing installed: there is no launcher, so no session can hand off.
 rm -rf "$SHIMD"
 row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
 case "$row" in
-  *"not supervised"*) bad "supervision" "warned about a launcher this session never needs: $row" ;;
-  *"spare backup"*) ok "a session that can move itself is told nothing about launchers" ;;
-  *) bad "supervision" "got: $row" ;;
+  *"OpenRouter handoff will not happen"*) ok "with no launcher the row says the handoff cannot fire" ;;
+  *) bad "supervision" "said nothing about it: $row" ;;
 esac
 
-# ...and the same with one installed but unreachable, which used to be the loudest
-# case of all.
+# Installed but unreachable — the exact state that stranded the reporter.
 mkdir -p "$SHIMD"; printf '#!/bin/sh\n' > "$SHIMD/claude"; chmod +x "$SHIMD/claude"
 row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
 case "$row" in
-  *"not supervised"*) bad "supervision" "warned about an unreachable launcher: $row" ;;
-  *"spare backup"*) ok "...and an unreachable one is not this row's business either" ;;
+  *"OpenRouter handoff will not happen"*) ok "...and an installed launcher that is not on PATH is the same answer" ;;
+  *) bad "supervision" "counted an unreachable launcher as working: $row" ;;
+esac
+
+# On PATH but with no token: this session started before the launcher did, and
+# nothing here can hand off either.
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | PATH="$SHIMD:$PATH" sl_env)
+case "$row" in
+  *"OpenRouter handoff will not happen"*) ok "a session that predates the launcher is not called supervised" ;;
   *) bad "supervision" "got: $row" ;;
 esac
+
+# A token the hook would refuse must not read as supervision here. launcher_present()
+# wants 32 lowercase hex and the state path that token implies; anything weaker calls
+# a session supervised that the hook will then decline to signal.
+HST="$FAKE/.claude/ccd/handoff-00000000000000000000000000000001.json"
+for bad_tok in "x" "0000000000000000000000000000000" "0000000000000000000000000000000G"; do
+  row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+          | CCD_HANDOFF="$bad_tok" CCD_HANDOFF_STATE="$HST" HOME="$FAKE" \
+            "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:')
+  case "$row" in
+    *"OpenRouter handoff will not happen"*) : ;;
+    *) bad "supervision" "a token the hook rejects read as supervised: '$bad_tok' -> $row" ;;
+  esac
+done
+ok "a malformed token is not supervision"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+        | CCD_HANDOFF=00000000000000000000000000000001 CCD_HANDOFF_STATE="$FAKE/elsewhere.json" \
+          HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:')
+case "$row" in
+  *"OpenRouter handoff will not happen"*) ok "...and neither is a good token with the wrong state path" ;;
+  *) bad "supervision" "accepted a mismatched state path: $row" ;;
+esac
+
+# Supervised: say nothing. A row that warns when everything is fine is a row people
+# learn not to read.
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' \
+        | CCD_HANDOFF=00000000000000000000000000000001 CCD_HANDOFF_STATE="$HST" \
+          PATH="$SHIMD:$PATH" HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
+        | sed $'s/\x1b\\[[0-9;]*m//g' | grep 'claude:')
+case "$row" in
+  *"OpenRouter handoff will not happen"*) bad "supervision" "warned a supervised session: $row" ;;
+  *"spare backup"*) ok "a session holding the hook's own contract is told nothing" ;;
+  *) bad "supervision" "got: $row" ;;
+esac
+
+# Neither is a session that needs no launcher at all. Without the paid opt-in the
+# only hop this install can make happens inside the session, and warning about
+# supervision there marks a correct, complete install as broken.
+paid_optin_off
+rm -rf "$SHIMD"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"OpenRouter handoff will not happen"*) bad "supervision" "warned an install whose only hop needs no launcher: $row" ;;
+  *"spare backup"*) ok "...and an install with no paid hop is not warned about a launcher it does not need" ;;
+  *) bad "supervision" "got: $row" ;;
+esac
+paid_optin_on
+mkdir -p "$SHIMD"; printf '#!/bin/sh\n' > "$SHIMD/claude"; chmod +x "$SHIMD/claude"
+
+# The note and the warning no longer compete: the warning takes its own line, so both
+# can say their piece without either being truncated away.
+printf '{"claude":{"available":true,"error":false,"fiveHourPercent":99,"sevenDayPercent":40,"fiveHourReset":"%s","sevenDayReset":"%s"}}\n' \
+  "$(iso 3600)" "$(iso 500000)" > "$WDIR/quota-cache.json"
+both=$(printf '%s' '{"model":{"id":"claude-fable-5"}}' \
+         | env -u CCD_HANDOFF HOME="$FAKE" "$ROOT/bin/ccd-statusline" 2>/dev/null \
+         | sed $'s/\\x1b\\[[0-9;]*m//g')
+case "$both" in
+  *"OpenRouter handoff will not happen"*"quota 99%"*) ok "the note and the warning both survive, on their own lines" ;;
+  *) bad "supervision" "one crowded the other out: $(printf '%s' "$both" | tr '\n' '/')" ;;
+esac
+[ "$(printf '%s' "$both" | grep -c 'quota 99%')" = "1" ] \
+  && ok "...and the warning is on a line of its own" \
+  || bad "supervision" "the warning did not get its own line"
+
+# The opt-in alone is not paid auto mode: without a key the hop cannot happen for a
+# reason no launcher fixes, and the row is not where that is said.
+mv "$FAKE/.claude/ccd/providers/keys.env" "$FAKE/.claude/ccd/providers/keys.env.off"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"OpenRouter handoff will not happen"*) bad "supervision" "warned an install with no key: $row" ;;
+  *) ok "an opt-in with no key stored is not warned about supervision" ;;
+esac
+mv "$FAKE/.claude/ccd/providers/keys.env.off" "$FAKE/.claude/ccd/providers/keys.env"
+
+# One account is where the paid hop matters MOST — no spare is itself the proof —
+# so it is warned exactly like the rest, and names the fix.
+rm -f "$ADIR/backup.json"
+row=$(printf '%s' '{"model":{"id":"claude-opus-5"}}' | sl_env)
+case "$row" in
+  *"OpenRouter handoff will not happen"*"claude"*) ok "with one account the warning still shows, and says what to do" ;;
+  *) bad "supervision" "one account, paid auto on, unsupervised, and the row said: '$row'" ;;
+esac
+rm -f "$FAKE/.claude/ccd/providers/keys.env"
+paid_optin_off
+rm -rf "$ADIR" "$SHIMD"; mkdir -p "$ADIR"
 
 head_ "27e. the spare's reading keeps pace with the row"
 # #54. The row is only as current as accounts-quota.json, and only a typed prompt
@@ -4710,17 +4873,26 @@ nd_arm() { # $1=session id ; leaves the hook's exit code in $ND_RC
   kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
 }
 
-# Nothing registered: there is nowhere free to go, and nowhere else either —
-# ccd does not take a session onto a metered backbone.
+# Nothing registered: the only place left to go is OpenRouter.
 rm -rf "$ADIR" "$SLQ"
-hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff" "$CCDD/swap-note"
+hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 stage_usage 58 96
 nd_arm sess-nd1
-[ -f "$CCDD/quota-cache.json" ] \
-  && ok "a self-measured 96% is reading enough for the backstop to act on" \
-  || bad "self-measured reading" "no reading was taken at all"
-[ -z "$(hf_get armed)" ] && ok "...and with nothing registered it arms nothing" \
-  || bad "arming without a dashboard" "armed $(hf_get direction)"
+[ "$(hf_get armed)" = "True" ] && ok "rate_limit + a self-measured 96% arms the handoff" \
+  || bad "arming without a dashboard" "armed=$(hf_get armed)"
+[ "$(hf_get direction)" = "to_fallback" ] && ok "...toward OpenRouter when no subscription is registered" \
+  || bad "direction" "got: $(hf_get direction)"
+
+# Without the opt-in the same situation arms nothing. A key configured at some point
+# in the past says the paid backbone is reachable; it does not say the user agreed
+# that quota exhaustion may start billing while they are not at the keyboard.
+paid_optin_off
+hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
+stage_usage 58 96
+nd_arm sess-nd1b
+[ -z "$(hf_get armed)" ] \
+  && ok "...and not at all when the paid hop was never opted into" \
+  || bad "paid opt-in" "armed $(hf_get direction) on a configured key alone"
 
 # Two subscriptions: the spare wins, and nothing is billed. The opt-in stays OFF
 # through this one, because that is the whole point — the free hop is the product
@@ -4762,9 +4934,10 @@ grep -q 'AT-nd_two' "$CREDS" && ok "...and onto the other subscription when one 
   || bad "backstop swap" "the credential never moved"
 [ "$ND_RC" = "2" ] && ok "...waking the parked session rather than arming a relaunch" \
   || bad "wake" "exit code $ND_RC, and a handoff of $(hf_get direction)"
-[ -z "$(hf_get armed)" ] \
-  && ok "...without arming anything for a launcher to carry" \
-  || bad "free hop" "armed $(hf_get direction) for a swap it had already made"
+[ ! -f "$CCDD/paid-handoff" ] \
+  && ok "...and it needed no paid opt-in to get there" \
+  || bad "free hop" "the fixture left an opt-in behind, so this proved nothing"
+paid_optin_on
 
 # ── Fails closed ────────────────────────────────────────────────────────────
 # No dashboard AND no reading is the same as no reading: a bare rate_limit can be
@@ -4772,10 +4945,9 @@ grep -q 'AT-nd_two' "$CREDS" && ok "...and onto the other subscription when one 
 rm -rf "$ADIR" "$SLQ"
 hf_reset; rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 stage_usage 58 96 500
-rm -f "$CCDD/swap-note"
 nd_arm sess-nd3
-[ ! -f "$CCDD/swap-note" ] && ok "an unmeasurable account leaves the backstop asleep" \
-  || bad "acted on no reading" "the backstop ran without corroboration"
+[ -z "$(hf_get armed)" ] && ok "an unmeasurable account still refuses to arm" \
+  || bad "armed on no reading" "armed=$(hf_get armed)"
 [ ! -f "$CCDD/quota-cache.json" ] && ok "...and no unusable reading is cached as if it were one" \
   || bad "cached a failed probe" "cache: $(cat "$CCDD/quota-cache.json" 2>/dev/null | head -c 80)"
 
@@ -4801,28 +4973,25 @@ n2=$(wc -l < "$CCD_FAKE_USAGE_LOG" | tr -d ' ')
 sleep 0.3
 kill -9 $NDPID 2>/dev/null; wait $NDPID 2>/dev/null
 rm -rf "$ADIR" "$SLQ"
-mkdir -p "$ADIR"
-printf '{"name":"nd_only","claudeAiOauth":{"accessToken":"AT-nd","refreshToken":"RT-nd"}}' \
-  > "$ADIR/nd_only.json"
-rm -f "$CCDD/swap-note"; rm -f "$CCDD/.usage-probe-backoff"
+hf_reset; rm -f "$CCDD/.usage-probe-backoff"
 quota 58 96                      # a good reading...
 nd_age "$CCDD/quota-cache.json" 5400     # ...taken an hour and a half ago
 stage_usage 58 96 500            # and every refresh since has failed
 nd_arm sess-nd4
-[ ! -f "$CCDD/swap-note" ] && ok "a reading too old to describe now moves nothing" \
-  || bad "acted on a stale reading" "the backstop ran on it"
+[ -z "$(hf_get armed)" ] && ok "a reading too old to describe now does not arm" \
+  || bad "armed on a stale reading" "armed=$(hf_get armed)"
 # The bound has to be an upper one, not a rejection of everything: a reading from
 # four minutes ago is what a working install always has.
-rm -f "$CCDD/swap-note"; quota 58 96
+hf_reset; quota 58 96
 nd_age "$CCDD/quota-cache.json" 240
 nd_arm sess-nd5
-[ -f "$CCDD/swap-note" ] && ok "...while a recent one still reaches the backstop" \
-  || bad "rejected a fresh reading" "the backstop ignored a usable reading"
+[ "$(hf_get armed)" = "True" ] && ok "...while a recent one still does" \
+  || bad "rejected a fresh reading" "armed=$(hf_get armed)"
 
 # A reading can be young and still describe a window that no longer exists. Four
 # minutes old passes every age bound, and if its 5-hour window reset three minutes
 # ago then 96% is a fact about quota the user no longer has.
-rm -f "$CCDD/swap-note" "$CCDD/.usage-probe-backoff"
+hf_reset; rm -f "$CCDD/.usage-probe-backoff"
 past=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=3)).isoformat())")
 future=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).isoformat())")
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
@@ -4830,17 +4999,16 @@ printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHour
 nd_age "$CCDD/quota-cache.json" 240
 stage_usage 58 96 500
 nd_arm sess-nd6
-[ ! -f "$CCDD/swap-note" ] && ok "a window that has already reset does not corroborate" \
-  || bad "acted across a reset" "the backstop ran on a window that no longer exists"
+[ -z "$(hf_get armed)" ] && ok "a window that has already reset does not corroborate" \
+  || bad "armed across a reset" "armed=$(hf_get armed)"
 # The same reading before its reset is exactly what a real handoff runs on.
-rm -f "$CCDD/swap-note"
+hf_reset
 printf '{"claude":{"available":true,"error":false,"fiveHourPercent":96,"fiveHourReset":"%s","sevenDayPercent":40,"sevenDayReset":"%s"}}\n' \
   "$future" "$future" > "$CCDD/quota-cache.json"
 nd_age "$CCDD/quota-cache.json" 240
 nd_arm sess-nd7
-[ -f "$CCDD/swap-note" ] && ok "...while one whose window is still open does" \
-  || bad "rejected a live window" "the backstop ignored a live reading"
-rm -f "$CCDD/swap-note" "$ADIR/nd_only.json"
+[ "$(hf_get armed)" = "True" ] && ok "...while one whose window is still open does" \
+  || bad "rejected a live window" "armed=$(hf_get armed)"
 
 # ── One probe, not one per hook ─────────────────────────────────────────────
 # UserPromptSubmit and PostToolUse overlap constantly. Recording the attempt only
@@ -5026,15 +5194,11 @@ rm -rf "$FAKE/slowplug"
 # StopFailure takes no lease, so an armed handoff fires straight through it.
 rm -f "$CCDD/quota-cache.json" "$CCDD/.usage-probe-backoff"
 mkdir -p "$CCDD/.usage-probe.lock"          # as a killed hook would leave it
-mkdir -p "$ADIR"
-printf '{"name":"nd_only","claudeAiOauth":{"accessToken":"AT-nd","refreshToken":"RT-nd"}}' \
-  > "$ADIR/nd_only.json"
 stage_usage 58 96
-rm -f "$CCDD/swap-note"
+hf_reset
 nd_arm sess-nd8
-[ -f "$CCDD/swap-note" ] && ok "...and a stranded lease never blocks the backstop" \
-  || bad "lease blocks the backstop" "the reading never reached it"
-rm -f "$CCDD/swap-note" "$ADIR/nd_only.json"
+[ "$(hf_get armed)" = "True" ] && ok "...and a stranded lease never blocks a handoff" \
+  || bad "lease blocks arming" "armed=$(hf_get armed)"
 rm -rf "$CCDD/.usage-probe.lock"
 
 # Publication that fails must not look like one that succeeded: clearing the
@@ -5725,39 +5889,235 @@ kill -9 "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 unset PYTHONPATH CCD_FAKE_USAGE CCD_FAKE_USAGE_LOG
 
-# ── Nothing here arms a hop onto a paid backbone ────────────────────────────
-# ccd moves a session between subscriptions it owns. Moving it onto a metered
-# backbone is the user's own call, typed by the user, so no path may do it for
-# them — not when every spare is spent, not when the tool is broken, not ever.
+# ── Paying is proved, never inferred ────────────────────────────────────────
+# Every way a swap can fail that is not "there is measurably nowhere free to go"
+# used to end at the same fork, and one branch of that fork spends the user's
+# money. The paid arm asks its own question now, and only a fresh successful
+# measurement of every registered account can answer it yes.
 export PYTHONPATH="$FAKE/pysite${PYTHONPATH:+:$PYTHONPATH}"
 export CCD_FAKE_USAGE="$FAKE/.stage-usage.json" CCD_FAKE_USAGE_LOG="$FAKE/.usage-calls"
-paid_optin_on                       # the strongest case: the old opt-in is set
-mkdir -p "$SWD/providers"
-printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$SWD/providers/keys.env"
-"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
-sleep 0.3
-# Every registered spare measured, fresh, and spent: the case that used to buy a
-# relaunch onto OpenRouter.
-sw_fixture 58 96 99 99
-hf_reset
-rc=$(sw_stopfail sess-np1)
-[ -z "$(hf_get direction)" ] \
-  && ok "every spare spent arms nothing at all" \
-  || bad "paid arm" "armed $(hf_get direction) with an opt-in file present"
-if kill -0 "$SWPID" 2>/dev/null; then ok "...and ends no session over it"
-else bad "paid arm" "signalled a session it had nowhere to send"; fi
-[ "$rc" != "2" ] && ok "...and wakes nothing into the wall it just hit" \
-  || bad "paid arm" "woke a session whose account is still spent"
-case "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["message"])' "$SWD/swap-note" 2>/dev/null)" in
-  *"ccd -c"*) ok "...while the note names the one way onto OpenRouter: the user typing it" ;;
-  *) bad "paid arm" "note: $(cat "$SWD/swap-note" 2>/dev/null | head -c 160)" ;;
+paid_optin_on
+# Each case seeds its own store, stand-in, consent and key: a case that ran on the
+# last one's leftovers could not tell a hop that was refused from one that had
+# already been made.
+PROOF="every-subscription-measured-spent"
+pay_case() { # $1=spare 5h  $2=spare 7d
+  kill -9 "${SWPID:-0}" 2>/dev/null; wait "${SWPID:-0}" 2>/dev/null
+  "$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
+  sleep 0.3
+  rm -f "$SWD/store-split" "$SWD/swap-note"
+  sw_fixture 58 96 "$1" "$2"
+  hf_reset
+  paid_optin_on
+  mkdir -p "$SWD/providers"
+  printf 'OPENROUTER_API_KEY="sk-or-v1-smoketest"\n' > "$SWD/providers/keys.env"
+}
+age_spare_row() { python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys, time
+q = json.load(open(sys.argv[1])); q["spare"]["checked_at"] = int(time.time()) - 99999
+json.dump(q, open(sys.argv[1], "w"))
+PY
+}
+note_text() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["message"])' "$SWD/swap-note" 2>/dev/null; }
+unpaid() { # $1=what was missing  [$2=nonote]
+  if [ -n "$(hf_get direction)" ]; then bad "paid without proof: $1" "armed $(hf_get direction)"
+  elif ! kill -0 "$SWPID" 2>/dev/null; then bad "paid without proof: $1" "ended the session"
+  elif [ "${2:-}" != nonote ] && [ ! -f "$SWD/swap-note" ]; then bad "paid without proof: $1" "stopped and said nothing"
+  else ok "no paid hop: $1"; fi
+}
+
+# The two proofs.
+pay_case 99 99
+sw_stopfail sess-p1 >/dev/null
+{ [ "$(hf_get direction)" = "to_fallback" ] && died_within "$SWPID" 5; } \
+  && ok "every spare freshly measured and spent, a key, the opt-in and a launcher: the paid hop fires" \
+  || bad "paid proof" "direction=$(hf_get direction), note: $(note_text | head -c 120)"
+pay_case 99 99
+"$ACCT" --no-color rm spare >/dev/null 2>&1
+sw_stopfail sess-p2 >/dev/null
+{ [ "$(hf_get direction)" = "to_fallback" ] && died_within "$SWPID" 5; } \
+  && ok "...and so does no spare registered at all" \
+  || bad "paid proof" "direction=$(hf_get direction), note: $(note_text | head -c 120)"
+
+# The user's three conditions, one missing at a time.
+pay_case 99 99; rm -f "$SWD/providers/keys.env"
+sw_stopfail sess-p3 >/dev/null; unpaid "no key stored"
+pay_case 99 99; paid_optin_off
+sw_stopfail sess-p4 >/dev/null; unpaid "no opt-in"
+case "$(note_text)" in
+  *"ccd -c"*) ok "...and the note still names the way there by hand" ;;
+  *) bad "stop note" "got: $(note_text | head -c 140)" ;;
 esac
-# The whole vocabulary is gone, not just this path.
-"$ACCT" --no-color exhausted >/dev/null 2>&1 \
-  && bad "paid arm" "the exhausted question still answers, and nothing asks it" \
-  || ok "...and the question that only paying needed is gone with it"
-rm -f "$SWD/providers/keys.env" "$SWD/swap-note"
+
+# The mechanical one: the hop is a relaunch, and only a launcher can relaunch.
+pay_case 99 99
+printf '{"session_id":"sess-p5","cwd":"/tmp/w","hook_event_name":"StopFailure","error":"rate_limit"}' \
+  | env -u CCD_HANDOFF -u CCD_HANDOFF_STATE CLAUDE_PID=$SWPID CCD_STANDIN_PID=$SWPID \
+      CLAUDE_PLUGIN_ROOT="$ROOT" CCD_SWAP_SETTLE=0 "$ROOT/scripts/quota-guard.sh" StopFailure >/dev/null 2>&1
+unpaid "no launcher supervising the session"
+case "$(note_text)" in
+  *"launcher"*"claude"*) ok "...and the note says the opt-in is on but this session cannot take it, and what fixes that" ;;
+  *) bad "launcher note" "got: $(note_text | head -c 160)" ;;
+esac
+pay_case 99 99
+CCD_HANDOFF_HEADLESS=1 sw_stopfail sess-p6 >/dev/null; unpaid "a headless run"
+
+# What is NOT proof. Each of these once reached the paying branch, or could have.
+pay_case 10 20                          # the spare HAS room; the store is just busy
+python3 - "$ADIR/.lock" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX); time.sleep(6)
+PY
+HOLD=$!; sleep 0.4
+CCD_SWAP_PICK_BUDGET=3 sw_stopfail sess-p7 >/dev/null
+kill -9 "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
+unpaid "a store lock that timed out"
+
+pay_case 99 99; age_spare_row; stage_usage 5 5 503
+CCD_HTTP_TIMEOUT=5 sw_stopfail sess-p8 >/dev/null; unpaid "a spare that answered 503"
+
+pay_case 99 99; age_spare_row
+CCD_SWAP_PICK_BUDGET=0 sw_stopfail sess-p9 >/dev/null; unpaid "a deadline that expired before anything was measured"
+
+pay_case 99 99
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys, time
+q = json.load(open(sys.argv[1])); q["spare"] = {"status": "unknown", "checked_at": int(time.time())}
+json.dump(q, open(sys.argv[1], "w"))
+PY
+sw_stopfail sess-p10 >/dev/null; unpaid "a spare whose reading is not a measurement"
+
+pay_case 99 99
+printf '{"detail":"x","stores":["file","keychain"]}' > "$SWD/store-split"
+sw_stopfail sess-p11 >/dev/null; unpaid "credential stores that disagree"
+rm -f "$SWD/store-split"
+
+pay_case 10 20                          # room to go to, and a swap that cannot get there
+mkdir -p "$FAKE/failroot/bin"
+printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = swap ] && { echo "could not act" >&2; exit 4; }; done\nexec "$CCD_REAL_ACCOUNT" "$@"\n' \
+  > "$FAKE/failroot/bin/ccd-account"
+chmod +x "$FAKE/failroot/bin/ccd-account"
+export CCD_REAL_ACCOUNT="$ACCT"
+SW_ROOT="$FAKE/failroot" sw_stopfail sess-p12 >/dev/null; unpaid "a swap that was attempted and failed"
+
+mkdir -p "$FAKE/unconfroot/bin"
+cat > "$FAKE/unconfroot/bin/ccd-account" <<'UEOF'
+#!/bin/sh
+case " $* " in *" current --json "*) [ -e "$HOME/.unconf-swapped" ] && { echo '{}'; exit 0; } ;; esac
+for a in "$@"; do
+  [ "$a" = swap ] && { "$CCD_REAL_ACCOUNT" "$@"; rc=$?; : > "$HOME/.unconf-swapped"; exit "$rc"; }
+done
+exec "$CCD_REAL_ACCOUNT" "$@"
+UEOF
+chmod +x "$FAKE/unconfroot/bin/ccd-account"
+pay_case 10 20; rm -f "$FAKE/.unconf-swapped"
+SW_ROOT="$FAKE/unconfroot" sw_stopfail sess-p13 >/dev/null; unpaid "a swap that landed but could not be confirmed"
+rm -f "$FAKE/.unconf-swapped"
+
+# chmod cannot stage this: every ccd-account command re-asserts 0700 on its own
+# directory, which heals it. A store that cannot be listed is staged where the
+# listing happens, and as a path that is not a directory at all.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/ccd-account" "$FAKE/proof-unlistable" <<'PY' \
+  && ok "no paid hop: an accounts directory that could not be read" \
+  || bad "paid without proof: unreadable accounts directory" "a listing that failed read as no spare registered"
+import importlib.machinery, importlib.util, os, sys
+os.makedirs(sys.argv[2] + "/.claude", exist_ok=True)
+os.environ["HOME"] = sys.argv[2]; os.environ["CCD_CREDENTIALS_BACKEND"] = "file"
+loader = importlib.machinery.SourceFileLoader("ccdproof", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(m); m.ensure_dirs()
+real = os.listdir
+def denied(p):
+    if str(p) == m.ACCOUNTS_DIR:
+        raise PermissionError(13, "Permission denied", p)
+    return real(p)
+m.os.listdir = denied
+try:
+    verdict = m.subscriptions_proved_spent()
+except OSError:
+    verdict = "raised"
+finally:
+    m.os.listdir = real
+assert verdict is not True, "an unlistable store was proof that nothing is registered"
+PY
+pay_case 99 99; mv "$ADIR" "$ADIR.real"; : > "$ADIR"
+sw_stopfail sess-p14 >/dev/null
+rm -f "$ADIR"; mv "$ADIR.real" "$ADIR"
+unpaid "an accounts path that is not a directory" nonote
+
+# ccd does not start billing while the subscription still answers.
+pay_case 99 99
+sw_prompt UserPromptSubmit sess-p15 >/dev/null
+unpaid "the tick before the wall, with everything else in place" nonote
+
+# The verdict is one positive answer. A caller that inferred it from an exit code,
+# or from there being no output, is how an operational failure used to pay.
+for shape in silent-success wrong-word right-word-but-failed crashed; do
+  mkdir -p "$FAKE/proofroot-$shape/bin"
+  case "$shape" in
+    silent-success)        body='exit 0' ;;
+    wrong-word)            body='echo yes; exit 0' ;;
+    right-word-but-failed) body="echo $PROOF; exit 1" ;;
+    crashed)               body='echo "Traceback (most recent call last):" >&2; exit 1' ;;
+  esac
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = exhausted ] && { %s; }; done\nexec "$CCD_REAL_ACCOUNT" "$@"\n' "$body" \
+    > "$FAKE/proofroot-$shape/bin/ccd-account"
+  chmod +x "$FAKE/proofroot-$shape/bin/ccd-account"
+  pay_case 99 99
+  SW_ROOT="$FAKE/proofroot-$shape" sw_stopfail "sess-p16-$shape" >/dev/null
+  unpaid "an answer that is not the proof ($shape)"
+done
+{ [ "$(grep -c "\"$PROOF\"" "$ROOT/bin/ccd-account")" = "1" ] \
+  && [ "$(grep -c 'print(EXHAUSTED_PROOF)' "$ROOT/bin/ccd-account")" = "1" ] \
+  && grep -q "= \"$PROOF\" \]" "$ROOT/scripts/quota-guard.sh"; } \
+  && ok "the proof is one word, printed in one place, and compared for equality" \
+  || bad "proof mechanism" "the verdict can be produced or accepted some other way"
+
+# The question itself, asked directly. It reads what the measurement left behind
+# and opens no socket of its own, so nothing in it can time out into a yes.
+proves() { [ "$("$ACCT" --no-color exhausted 2>/dev/null)" = "$PROOF" ]; }
+pay_case 99 99
+: > "$CCD_FAKE_USAGE_LOG"
+{ proves && [ ! -s "$CCD_FAKE_USAGE_LOG" ]; } \
+  && ok "every spare measured, fresh and spent is proof, read without a network call" \
+  || bad "proof" "refused proof in hand, or went to the network for it"
+pay_case 10 99
+proves && ok "...one window spent is an account spent" || bad "proof" "a spare at 99% weekly was called free"
+pay_case 10 20
+proves && bad "proof" "a spare with room was called spent" || ok "...and a spare with room is not"
+pay_case 99 99; age_spare_row
+proves && bad "proof" "a reading past its TTL was proof" || ok "...nor is a reading too old to describe now"
+pay_case 99 99
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys
+q = json.load(open(sys.argv[1])); q["spare"]["status"] = "error"
+json.dump(q, open(sys.argv[1], "w"))
+PY
+proves && bad "proof" "a failed measurement was proof" || ok "...nor a measurement that failed"
+pay_case 99 99
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import json, sys
+q = json.load(open(sys.argv[1])); del q["spare"]
+json.dump(q, open(sys.argv[1], "w"))
+PY
+proves && bad "proof" "an unmeasured spare was proof" || ok "...nor a spare nobody measured"
+pay_case 99 99
+python3 - "$SWD/accounts-quota.json" <<'PY'
+import datetime, json, sys
+past = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)).isoformat()
+q = json.load(open(sys.argv[1])); q["spare"]["five_hour_reset"] = past; q["spare"]["seven_day_reset"] = past
+json.dump(q, open(sys.argv[1], "w"))
+PY
+proves && bad "proof" "a window that has since reset was proof" || ok "...nor a window that has reset since it was read"
+pay_case 99 99; printf 'not json' > "$ADIR/spare.json"
+proves && bad "proof" "an account that cannot be read was skipped" || ok "...nor a store with an account file it cannot read"
+# Naming a store this suite cannot see, so the stop cannot lift itself first.
+pay_case 99 99; printf '{"detail":"x","stores":["file","keychain"]}' > "$SWD/store-split"
+proves && bad "proof" "proved over a standing stop" || ok "...nor anything at all while the credential stores disagree"
+rm -f "$SWD/store-split"
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
+rm -f "$SWD/providers/keys.env" "$SWD/swap-note"
 paid_optin_off
 
 # ── stdout is the protocol; stderr is not ───────────────────────────────────

@@ -693,13 +693,6 @@ if not spares:
     tail = ""           # nothing to hand off to; the row is just who is answering
 
 
-# ── The escape hatch, above the threshold ────────────────────────────────────
-# The loudest thing on the screen has to be the best qualified. Three gates, the
-# same three the arming path applies before it ends a session (quota_peak in
-# scripts/quota-guard.sh): the reading must be usable, recent, and about a window
-# that still exists. Without them a sample taken before a reset went on reading 96%
-# afterwards, and a swap left the previous account's 99% shouting beside the new
-# account's 3%.
 def have_key():
     """Is there an OpenRouter key to fall back to? Same shapes the hook accepts."""
     if os.environ.get("OPENROUTER_API_KEY", "").strip():
@@ -718,6 +711,39 @@ def have_key():
     return False
 
 
+
+# ── Is a launcher supervising THIS session? ──────────────────────────────────
+# The contract the hook checks before it signals (launcher_present,
+# scripts/quota-guard.sh): 32 lowercase hex whose state path is the one that token
+# implies. Anything weaker calls a session supervised that the hook will refuse,
+# which is the silence this row exists to end — #21 sat inert for four days while
+# every surface except `ccd doctor` reported success, and doctor is the command
+# nobody runs BEFORE the thing they installed fails to happen.
+#
+# Shown only where it is true AND wanted: the user opted into the paid hop, a key
+# is stored, and this session cannot take it because no launcher is watching. An
+# install that never opted in needs no launcher for anything it does — the hop
+# between subscriptions happens inside the session — so it is told nothing. Not
+# gated on spares: with none registered the paid hop is the only one there is.
+#
+# It says what will not happen and the one fix that is always right. "(not
+# supervised)" named a mechanism; nobody knew what it cost them.
+tok = os.environ.get("CCD_HANDOFF", "")
+supervised = bool(re.fullmatch(r"[0-9a-f]{32}", tok)) and os.environ.get(
+    "CCD_HANDOFF_STATE") == os.path.join(os.environ.get("CCD_DIR", ""), f"handoff-{tok}.json")
+paid_hop = os.path.exists(os.path.join(os.environ.get("CCD_DIR", ""), "paid-handoff"))
+if paid_hop and not supervised and have_key():
+    head += (f" {Y}⚠ automatic OpenRouter handoff will not happen here — "
+             f"/exit, then start claude again (ccd doctor){RS}")
+
+
+# ── The escape hatch, above the threshold ────────────────────────────────────
+# The loudest thing on the screen has to be the best qualified. Three gates, the
+# same three the arming path applies before it ends a session (quota_peak in
+# scripts/quota-guard.sh): the reading must be usable, recent, and about a window
+# that still exists. Without them a sample taken before a reset went on reading 96%
+# afterwards, and a swap left the previous account's 99% shouting beside the new
+# account's 3%.
 warn = ""
 try:
     c = (json.load(open(cache_file)).get("claude") or {})

@@ -32,9 +32,9 @@ CCD=$([ -x "$HOME/.local/bin/ccd" ] && echo "$HOME/.local/bin/ccd" \
 ## Claude accounts — the spare subscriptions
 
 With two or more registered, quota exhaustion moves the conversation to a spare
-subscription — in place, inside the running session, with nothing installed. When
-no spare can be reached ccd stops and says so; it never moves a session onto
-OpenRouter, because that bills. `ccd -c` is the user's own command for that.
+subscription — in place, inside the running session — and only reaches OpenRouter
+when every one is measured spent, a key is stored, and the user opted in. Only that last hop needs the launcher `ccd setup --auto`
+installs; the hop between subscriptions needs nothing installed.
 
 | They want | You run |
 |---|---|
@@ -119,12 +119,14 @@ with a bare slug in the sonnet slot.
 inside the running session, so a plain `$CCD setup` installs no launcher and edits
 no startup file for it — registering a second account is the whole setup.
 
-`--auto` is the only thing that installs a launcher, and what it buys is the way
-BACK: a `ccd -c` run returns to the subscription by itself once a spare has room.
-It may need one line in a startup file so that launcher leads `PATH`, and it asks
-before touching a dotfile, reaching `/dev/tty` when stdin is a pipe. Agree the
-dotfile edit in the conversation first, then run `$CCD setup --auto --yes` so it
-does not stop on a prompt they cannot see. `$CCD setup --no-auto` takes it out.
+`--auto` is the paid question, and it is the only thing that installs a launcher:
+it grants consent for the OpenRouter hop when every subscription is spent (a key
+must be stored too; a swap that merely failed never pays), and
+installs the shim that carries a session there and back. It may need one line in a
+startup file so that shim leads `PATH`, and it asks before touching a dotfile,
+reaching `/dev/tty` when stdin is a pipe. Get the user's agreement about the
+billing in the conversation first, then run `$CCD setup --auto --yes` so it does
+not stop on a prompt they cannot see. `$CCD setup --no-auto` takes both back out.
 
 The switch onto OpenRouter and back is the user's to type, because each command
 replaces itself with `claude`:
@@ -143,8 +145,8 @@ replaces itself with `claude`:
 3. **`/model`** — an in-session slash command.
 
 Everything else on this page you run for them. `setup --auto` is the one command
-that needs their word before you run it, not their hands: agree on the dotfile
-edit in the conversation, then pass `--yes`.
+that needs their word before you run it, not their hands: agree on the billing and
+the dotfile edit in the conversation, then pass `--yes`.
 
 ## Never
 

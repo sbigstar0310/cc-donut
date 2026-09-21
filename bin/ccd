@@ -458,21 +458,21 @@ status() {
   else
     printf '    %sRegister a second subscription first: ccd account add%s\n' "$d" "$r"
   fi
-  # OpenRouter is never automatic outbound: it bills, so it is typed. What IS
-  # automatic is the way back, which is what the launcher carries.
-  printf '  %sOpenRouter:%s never by itself — %sccd -c%s moves this conversation there at your own cost.\n' "$b" "$r" "$b" "$r"
-  if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
+  if is_ccd_shim "$CCD_SHIM_DIR/claude" && [ -f "$CCD_PAID_OPTIN" ]; then
     if shim_leads_path; then
-      printf '    %sThe way back is automatic: a ccd session returns to the subscription%s\n' "$d" "$r"
-      printf '    %swhen a spare has room or the window resets. Remove it with: ccd setup --no-auto%s\n' "$d" "$r"
+      printf '  %sThen OpenRouter:%s the conversation moves to OpenRouter only when none do (paid).\n' "$grn" "$r"
+      printf '    %sIt relaunches there, and returns by itself when the quota resets.%s\n' "$d" "$r"
     else
-      printf '  %s⚠ The automatic return is installed, but not active in this shell.%s Open a new terminal, or:\n' "$ylw" "$r"
+      printf '  %s⚠ The OpenRouter hop is installed, but not active in this shell.%s Open a new terminal, or:\n' "$ylw" "$r"
       printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
     fi
+    printf '  %sTurn the paid hop off with: ccd setup --no-auto%s\n' "$d" "$r"
   else
-    printf '    %sTo come back automatically afterwards: ccd setup --auto%s\n' "$d" "$r"
+    printf '  %sSubscriptions only — allow the paid OpenRouter hop with: ccd setup --auto%s\n' "$d" "$r"
   fi
-  printf '  %sBy hand at any time: !ccd account use%s\n' "$d" "$r"
+  # The manual route still works and always will. Automation you cannot step
+  # around is worse than no automation — show the way out, quietly.
+  printf '  %sBy hand at any time: !ccd account use, or /exit then ccd -c for OpenRouter%s\n' "$d" "$r"
   printf '\n%sOther commands%s\n' "$b" "$r"
   printf '  %sccd pick%s        Change the three model slots\n' "$b" "$r"
   printf '  %sccd models%s      Full catalog and prices\n' "$b" "$r"
@@ -539,7 +539,7 @@ doctor() {
   printf '      %sThe model list, Fable access and /status keep describing the previous%s\n' "$d" "$r"
   printf '      %saccount until the next launch; the credential and the billing move now.%s\n' "$d" "$r"
   if is_ccd_shim "$CCD_SHIM_DIR/claude"; then
-    printf '  %s✓%s return launcher installed at %s\n' "$grn" "$r" "$(tilde "$CCD_SHIM_DIR/claude")"
+    printf '  %s✓%s OpenRouter launcher installed at %s\n' "$grn" "$r" "$(tilde "$CCD_SHIM_DIR/claude")"
     if shim_leads_path; then
       printf '  %s✓%s active in this shell — `claude` starts the supervised launcher\n' "$grn" "$r"
     else
@@ -547,17 +547,26 @@ doctor() {
       printf '      %sOpen a new terminal, or run: %s%s\n' "$d" "$CCD_PATH_LINE" "$r"
     fi
     if [ -n "${CCD_HANDOFF:-}" ]; then
-      printf '  %s✓%s this session is supervised — a ccd run started here can return by itself\n' "$grn" "$r"
+      printf '  %s✓%s this session is supervised — a paid handoff can fire here, and return by itself\n' "$grn" "$r"
     elif [ -n "${CLAUDECODE:-}" ]; then
-      printf '  %s✗ this session is NOT supervised%s — a ccd run started here would not return by itself\n' "$red" "$r"
+      printf '  %s✗ this session is NOT supervised%s — nothing will hand off to OpenRouter from here\n' "$red" "$r"
       printf '      %sIt started before the launcher was on PATH. /exit, then run claude again.%s\n' "$d" "$r"
     fi
   else
-    printf '  %s· no return launcher%s — install it with: ccd setup --auto\n' "$d" "$r"
+    printf '  %s· no OpenRouter launcher%s — install it with: ccd setup --auto\n' "$d" "$r"
   fi
-  # And the one hop ccd will never make for you, said plainly so nobody waits
-  # for it: OpenRouter costs money, so it is typed.
-  printf '  %s· onto OpenRouter: never automatic%s — `ccd -c` is the way there\n' "$d" "$r"
+  # Two hops, two answers. The one above is the road; this is permission to take
+  # it, and only that one spends money — so the line says which, and what else it
+  # takes: ccd pays only on proof that no subscription can take the session.
+  if [ -f "$CCD_PAID_OPTIN" ]; then
+    if [ -n "${OPENROUTER_API_KEY//[[:space:]]/}" ]; then
+      printf '  %s✓%s OpenRouter hop allowed (paid) — only when no spare is registered, or every one is measured spent\n' "$grn" "$r"
+    else
+      printf '  %s✗ OpenRouter hop allowed, but no key is stored%s — it cannot happen; store one with: ccd key\n' "$red" "$r"
+    fi
+  else
+    printf '  %s· OpenRouter hop off%s — subscriptions only; allow it with: ccd setup --auto\n' "$d" "$r"
+  fi
 
   # A store that disagrees with itself stops every swap and every bank, so it is
   # the first thing to say: everything below it is describing a machine that
@@ -625,8 +634,9 @@ if not spares:
     print(f"      {DIM}Only one account registered — sign in to another "
           f"(/login) and run `ccd account add`.{RS}")
 elif not any(a.get("headroom") for a in spares):
-    print(f"      {DIM}No spare has room right now; when the quota runs out ccd will "
-          f"stop and say so. `ccd -c` is the paid way on, and it is yours to type.{RS}")
+    print(f"      {DIM}No spare has room right now. When the quota runs out ccd moves this "
+          f"session to OpenRouter only if the paid hop above is allowed and a key is "
+          f"stored; otherwise it stops and says so, and `ccd -c` goes there by hand.{RS}")
 # The store holds refresh tokens good for days. Loose permissions matter.
 p = os.environ["ACCT_DIR"]
 try:
@@ -994,6 +1004,14 @@ rc_file() {
 # file. So record every file we actually wrote to, and clean exactly those.
 CCD_PATH_TARGET="$CCD_DIR/auto-path"
 
+# Consent to spend money without being asked again. The launcher carries the free
+# hop between registered subscriptions on its own — that is the product, and it
+# needs no flag. Moving the session onto OpenRouter bills the user's own key, and
+# that is what `--auto` now stands for. Kept as its own file rather than inferred
+# from the launcher's presence, because those two facts are about to stop agreeing:
+# a bare `ccd setup` will install the launcher without asking about billing.
+CCD_PAID_OPTIN="$CCD_DIR/paid-handoff"
+
 record_path_target() {
   grep -qxF "$1" "$CCD_PATH_TARGET" 2>/dev/null && return 0
   printf '%s\n' "$1" >> "$CCD_PATH_TARGET" 2>/dev/null
@@ -1193,12 +1211,19 @@ CCD_CLAUDE_SHIM
       # consent it was given. The two are independent: consent does not expire
       # because a startup file could not be edited.
       #
-      printf '✓ automatic return installed at %s\n' "$(tilde "$claude_shim")"
+      # Checked, not fire-and-forget. An unwritten record means the paid hop will
+      # not arm, so swallowing the failure would leave setup promising a hop that
+      # cannot happen — the same class of silent half-install this release exists
+      # to end.
+      if ! { : > "$CCD_PAID_OPTIN"; } 2>/dev/null; then
+        fail="the paid-hop opt-in could not be recorded — subscription hops still work"
+        fix="make $(tilde "$CCD_DIR") writable, then re-run: ccd setup --auto"
+      fi
+      printf '✓ OpenRouter handoff installed at %s\n' "$(tilde "$claude_shim")"
       printf '  %sThe hop between your subscriptions needs none of this — it happens%s\n' "$d" "$r"
-      printf '  %sinside the session, with no restart. This launcher is for the way%s\n' "$d" "$r"
-      printf '  %sBACK: a `ccd -c` run returns to your subscription by itself when a%s\n' "$d" "$r"
-      printf '  %sspare has room or the window resets. Going to OpenRouter stays%s\n' "$d" "$r"
-      printf '  %syours to type — ccd never moves a session onto a paid backbone.%s\n' "$d" "$r"
+      printf '  %sinside the session, with no restart. This launcher is the last%s\n' "$d" "$r"
+      printf '  %sresort: it carries a session onto OpenRouter (paid, your own key)%s\n' "$d" "$r"
+      printf '  %swhen every subscription is spent, and back when the quota resets.%s\n' "$d" "$r"
 
       # The shim is only reachable if its directory comes before the real claude
       # on PATH. Ask before editing a startup file: running setup is consent to
@@ -1278,6 +1303,15 @@ CCD_CLAUDE_SHIM
         rm "$claude_shim"; printf '✓ automatic handoff disabled\n'
       elif [ -e "$claude_shim" ] || [ -L "$claude_shim" ]; then
         printf '%s⚠ %s is not a ccd shim — left alone%s\n' "$ylw" "$(tilde "$claude_shim")" "$r"
+      fi
+      # Consent goes with the feature it was given for, or a later `--auto` would
+      # inherit an answer given before the user turned the whole thing off. A
+      # revocation that did not happen must never be reported as one: it is the
+      # only failure here that can still cost money.
+      rm -f "$CCD_PAID_OPTIN" 2>/dev/null
+      if [ -f "$CCD_PAID_OPTIN" ]; then
+        fail="the paid-hop opt-in could not be removed — it is still in effect"
+        fix="delete $(tilde "$CCD_PAID_OPTIN") to withdraw it"
       fi
       # Take the PATH line back out with the shim: an entry pointing at a
       # directory we just emptied is litter in someone's startup file.
@@ -1431,6 +1465,7 @@ PY
   # A plain uninstall keeps the key and the rest of the state, but not this: it is
   # permission for a feature that is being removed, and a later reinstall must ask
   # again rather than find an answer already on disk.
+  rm -f "$CCD_PAID_OPTIN" 2>/dev/null || true
   [ -e "$statusline_launcher" ] || [ -L "$statusline_launcher" ] && rm "$statusline_launcher"
   printf '✓ launchers removed\n'
 
@@ -1479,7 +1514,15 @@ exec_claude() {
   # a launcher that is watching a different one: the batch dies for a relaunch
   # nobody makes. Supervision is granted by the launcher that starts you, never
   # by the environment you happened to be born in.
-  unset CCD_HANDOFF CCD_HANDOFF_STATE CCD_HANDOFF_HEADLESS
+  #
+  # The one exception is the launcher starting ccd for the paid leg: it names its
+  # own token in CCD_HANDOFF_LEG, which nothing else sets and which is dropped
+  # here so no grandchild inherits the claim.
+  if [ "$interactive" -ne 1 ] || [ -z "${CCD_HANDOFF:-}" ] \
+     || [ "${CCD_HANDOFF_LEG:-}" != "${CCD_HANDOFF:-}" ]; then
+    unset CCD_HANDOFF CCD_HANDOFF_STATE CCD_HANDOFF_HEADLESS
+  fi
+  unset CCD_HANDOFF_LEG
   local IFS=:
   for d in $PATH; do
     [ -n "$d" ] || continue

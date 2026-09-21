@@ -416,9 +416,9 @@ p = os.environ["CCD_HF"]
 state = {
     "armed": os.environ["CCD_ARMED"] == "true",
     "token": os.environ.get("CCD_TOKEN", ""),
-    # to_subscription — the way back from OpenRouter, and the only direction
-    # left. Which account it lands on is whatever the live store holds by then,
-    # so nothing here has to name one.
+    # to_fallback | to_subscription — the paid hop and the way back from it.
+    # Which account the way back lands on is whatever the live store holds by
+    # then, so nothing here has to name one.
     "direction": os.environ["CCD_DIR_TO"],
     "session_id": os.environ["CCD_SID"],
     "cwd": os.environ["CCD_CWD"],
@@ -532,13 +532,65 @@ request_handoff() {
   kill -HUP "$pid" 2>/dev/null || return 1
 }
 
+# Is a usable OpenRouter key configured? Deliberately strict: a key that ccd will
+# later reject is the same as no key, and signalling on one would end the session
+# with nowhere to go. Mirrors the parser `ccd setup` uses to report readiness.
+have_key() {
+  # An exported key gets the same scrutiny as the file: a whitespace-only value
+  # is not a key, and accepting one would end a session with nowhere to go.
+  case "${OPENROUTER_API_KEY:-}" in
+    '') : ;;
+    *[![:space:]]*) return 0 ;;
+    *) : ;;
+  esac
+  [ -f "$CCD_DIR/providers/keys.env" ] || return 1
+  python3 - "$CCD_DIR/providers/keys.env" 2>/dev/null <<'PY'
+import re, sys
+try:
+    s = open(sys.argv[1]).read()
+except Exception:
+    raise SystemExit(1)
+for line in s.splitlines():
+    line = line.strip()
+    if line.startswith("#"):
+        continue
+    m = re.match(r'^(?:export\s+)?OPENROUTER_API_KEY=(.*)$', line)
+    if not m:
+        continue
+    v = m.group(1).strip().strip('"').strip("'").strip()
+    if v:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# May quota exhaustion move this session onto the paid backbone unattended?
+# Separate from have_key on purpose: a key says OpenRouter is REACHABLE, this says
+# the user agreed it may be USED. Written by `ccd setup --auto`.
+paid_optin() { [ -f "$CCD_DIR/paid-handoff" ]; }
+
+# The only thing that may authorise spending money: PROOF that no subscription can
+# take this session. It is one word on stdout AND a zero exit — never an exit code
+# alone, never silence, never "the swap did not happen". Five review passes each
+# found an operational failure (a lock timeout, a 503, an unreadable directory, a
+# die()) reaching the paying branch through an inference like those; a positive
+# answer that only one line of ccd-account can print cannot be reached that way.
+# What the proof consists of is ccd-account's business (cmd_exhausted).
+subscriptions_proved_spent() {
+  local ab out
+  ab=$(ccd_account_bin) || return 1
+  out=$("$ab" --no-color exhausted 2>/dev/null) || return 1
+  [ "$out" = "every-subscription-measured-spent" ]
+}
+
 # Everything that must hold before a session may be ended. Checked BEFORE arming,
 # not after: an armed file left behind by an unsupervised or unready session
 # would be consumed by a later launcher and resume the wrong conversation.
 #
-# One destination is left for it: the return from OpenRouter, which needs a
-# launcher to relaunch through and no key at all — the credential it is about to
-# stop using is the one the key buys.
+# Both relaunches need exactly this — the paid hop out and the return from it.
+# The key is NOT part of it: coming back needs none, and requiring one would
+# strand a session on the paid backbone over a credential it is about to stop
+# using. The hop out asks for the key separately (have_key).
 launcher_ready() {
   # A run the launcher cannot relaunch must not be ended for one: signalling a
   # batch job kills the work and nothing brings it back.
@@ -735,12 +787,38 @@ EOF
              swap_note "[ccd] The Claude quota ran out and ccd switched this session to $account, but could not confirm that account's credential went live. Nothing was billed. Carry on — \`ccd account list\` shows which account is active."
              exit 0
            fi
-           # No swap, and no second road. Moving a conversation onto a metered
-           # backbone is the user's own call, typed by the user — so ccd stops
-           # here and leaves the reason where the next prompt will say it. Only
-           # where a spare could have been the answer: with nothing registered
-           # there was never anything to move to, and a note every time the quota
-           # runs out is noise.
+           # No swap. Whether this session may move onto a PAID backbone is a
+           # different question with its own answer, and nothing above feeds it:
+           # not the swap's exit code, not its reason, not the three attempts. The
+           # user's rule is three conditions — a key stored, `ccd setup --auto`,
+           # and no subscription able to take the session — and the third is
+           # PROVED or it is false. Only here, where the wall was actually hit;
+           # the tick before the wall never bills while the subscription answers.
+           if paid_optin && have_key && subscriptions_proved_spent; then
+             if launcher_ready; then
+               # Arm first, then signal: the launcher must find the file when the
+               # session exits. If the write fails, do NOT signal — ending a
+               # session whose handoff was never recorded leaves nothing to bring
+               # it back. And un-arm if the signal fails, so a later launcher
+               # cannot consume a stale order.
+               if write_handoff true to_fallback "$SESSION_ID" "$HOOK_CWD"; then
+                 rm -f "$SWAP_NOTE" 2>/dev/null || true
+                 request_handoff || rm -f "$HANDOFF" 2>/dev/null || true
+               else
+                 rm -f "$HANDOFF" 2>/dev/null || true
+               fi
+               exit 0
+             fi
+             # Everything the user asked for holds, and the hop still cannot be
+             # made: it is a relaunch, and nothing is here to relaunch. Do not
+             # pay, do not pretend — say which half is missing and what fixes it.
+             swap_note "[ccd] The Claude quota ran out and every subscription is spent. The automatic OpenRouter handoff is on, but this session was not started through the ccd launcher (or has no terminal to come back to), so it cannot happen here. Nothing was billed. /exit and start \`claude\` again to be covered next time — \`ccd doctor\` shows what is missing — or move this conversation now with \`ccd -c\`."
+             exit 0
+           fi
+           # Not proved, not allowed, or no key: ccd stops here and leaves the
+           # reason where the next prompt will say it. Only where a spare could
+           # have been the answer: with nothing registered there was never
+           # anything to move to, and a note every time the quota runs out is noise.
            has_accounts && swap_note "[ccd] The Claude quota ran out and ccd could not move this session to another subscription (${SWAP_REASON:-reason unknown}). Nothing was billed and nothing was ended. \`ccd account list\` shows what each spare looks like, and \`ccd -c\` moves this conversation onto OpenRouter at your own cost if you want it."
          fi ;;
     esac
@@ -760,7 +838,10 @@ except Exception:
     raise SystemExit(0)
 if not s.get("armed"):
     raise SystemExit(0)
-msg = "[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다"
+if s.get("direction") == "to_fallback":
+    msg = "[ccd] 🍩 도넛으로 갈아끼웁니다 — 대화 그대로 이어집니다 (OpenRouter, 유료)"
+else:
+    msg = "[ccd] ✓ 구독으로 돌아갑니다 — 대화 그대로 이어집니다"
 print(json.dumps({"systemMessage": msg}, ensure_ascii=False))
 PY
   fi

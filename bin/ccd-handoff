@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Automatic return from OpenRouter — runs the real claude and, when a `ccd -c`
-# session's quota comes back, relaunches that conversation on the subscription.
+# Automatic quota handoff — runs the real claude and relaunches it on OpenRouter
+# when the quota-guard hook asks for it, and back when the quota returns.
 #
-# That is the ONLY hop through here. Moving between Claude subscriptions happens
-# inside the live session (scripts/quota-guard.sh, #57), and moving ONTO
-# OpenRouter is the user's own command — ccd never does it for them.
+# Only the PAID hop comes through here. Moving to another Claude subscription
+# happens inside the live session (scripts/quota-guard.sh, #57): the credential
+# ccd writes is the one the next request reads, so nothing ends and nothing is
+# relaunched for it.
 #
 # Installed indirectly: `ccd setup --auto` writes a small resolver at
 # ~/.local/bin/claude that execs the newest copy of THIS file, so a plugin
@@ -16,7 +17,7 @@
 #     present and consistent, so a session is never ended with nothing to catch it
 #   - the hook writes that state file and SIGHUPs claude
 #   - claude exits 129 (128+SIGHUP) after running its SessionEnd hooks
-#   - we read the file and relaunch the same conversation on the subscription
+#   - we read the file and relaunch the same conversation on the other backbone
 #
 # Every exit code other than 129 is passed through untouched, so this is
 # invisible until a handoff actually happens.
@@ -69,6 +70,24 @@ v = d.get(sys.argv[2])
 print(v if isinstance(v, str) else ("true" if v is True else ""))
 ' "$CCD_STATE" "$1" 2>/dev/null
 }
+
+ccd_bin() {
+  ls -d "$HOME/.claude/plugins/cache"/*/ccd/*/bin/ccd 2>/dev/null | sort -V | tail -1
+}
+
+# quota-guard checks this before it arms; this is the boundary. Not redundant —
+# arming and relaunching are separated by the whole of Claude Code's shutdown, and
+# a `ccd setup --no-auto` inside that window must not be outrun by an older hop.
+paid_optin() { [ -f "$HOME/.claude/ccd/paid-handoff" ]; }
+
+# ── Burst tracking (docs/multi-account.md §5.2) ──────────────────────────────
+# Loop protection remembers WHERE we have been rather than HOW MANY times we
+# moved. A burst is a run of relaunches with no real work between them, and a
+# destination entered twice inside one is a loop by definition — which catches a
+# hop earlier, and more honestly, than any numeric cap.
+visited=""
+visited_has() { case " $visited " in *" $1 "*) return 0 ;; esac; return 1; }
+visited_add() { visited_has "$1" || visited="${visited:+$visited }$1"; }
 
 # Does a transcript exist for this session? A session that ended before its first
 # exchange has none, and `--resume` on it fails with "No conversation found",
@@ -133,14 +152,16 @@ trap 'rm -f "$CCD_STATE" 2>/dev/null' EXIT
 export CCD_HANDOFF_STATE="$CCD_STATE"
 
 # The cap exists to stop a relaunch LOOP, not to limit how many times a long
-# session may legitimately come back. Quota dying, recovering, and dying
+# session may legitimately change backbone. Quota dying, recovering, and dying
 # again over a workday is normal, so a lifetime counter would strand the user on
 # the third ordinary transition. Count only relaunches that arrive in quick
 # succession, and forget them once a session has run for a useful stretch.
-# An unrelated SIGHUP (closing terminal, user kill) must exit rather than
-# silently relaunch, and exit 129 alone never implies intent.
-hops=0                         # a relaunch that keeps re-arming itself
-args=("$@")                    # arguments for the next launch
+# One loop, one backbone per iteration. Both legs go through the SAME checks:
+# an unrelated SIGHUP (closing terminal, user kill) on either backbone must exit
+# rather than silently switch, and exit 129 alone never implies intent.
+hops=0                         # backstop only; the real guard is `visited`
+backbone=subscription          # which binary this iteration runs
+args=("$@")                    # arguments for it
 resuming=0                     # did we ask this leg to restore a conversation?
 last_sid=""                    # the one it was asked to restore
 
@@ -166,7 +187,20 @@ else
 fi
 while :; do
   session_start=$(date +%s 2>/dev/null || echo 0)
-  "$REAL" ${args+"${args[@]}"}
+  if [ "$backbone" = "fallback" ]; then
+    t=$(ccd_bin)
+    if [ -z "$t" ]; then
+      printf 'ccd: plugin not found — resume with: claude --resume %s\n' "${sid:-<session>}" >&2
+      exit 1
+    fi
+    # The leg is ours, so the contract goes with it — and ccd is told so in as
+    # many words. It drops an INHERITED token on purpose (a `ccd -p` started
+    # inside a supervised session must not claim its parent's launcher); this is
+    # how it tells that apart from the launcher starting it for this hop.
+    CCD_HANDOFF_LEG="$CCD_HANDOFF" "$t" ${args+"${args[@]}"}
+  else
+    "$REAL" ${args+"${args[@]}"}
+  fi
   rc=$?
 
   # A relaunch we asked to --resume, that dies immediately with an error, could
@@ -180,17 +214,21 @@ while :; do
     printf '\n\033[33m⚠ 이전 대화를 복원하지 못했습니다 — 새 세션으로 이어갑니다\033[0m\n' >&2
     printf '\033[2m   대화는 남아 있습니다: claude --resume %s\033[0m\n' "$last_sid" >&2
     resuming=0
-    args=()
+    case "$backbone" in
+      fallback) args=(go) ;;
+      *)        args=() ;;
+    esac
     continue
   fi
 
   [ "$rc" -eq 129 ] || exit "$rc"
 
-  # A session that ran a while was working, not thrashing. Quota dying,
-  # recovering, and dying again over a workday is normal and must never be
-  # mistaken for a loop.
+  # A session that ran a while was working, not thrashing: the burst is over, so
+  # every destination becomes available again. Quota dying, recovering, and dying
+  # again over a workday is normal and must never be mistaken for a loop.
   if [ "$((now - session_start))" -ge "$HOP_RESET_SECONDS" ]; then
     hops=0
+    visited=""
   fi
 
   # 129 without armed state belonging to THIS launcher means something else sent
@@ -205,9 +243,20 @@ while :; do
   dir=$(hf direction)
   [ -n "$sid" ] || exit "$rc"
 
+  # Where this hop is headed. Only the paid backbone is a destination worth
+  # remembering: going there twice inside one burst is the loop this guards.
+  case "$dir" in
+    to_fallback) dest="fallback" ;;
+    *)           dest="" ;;
+  esac
+  if [ -n "$dest" ] && visited_has "$dest"; then
+    printf 'ccd: 갈 수 있는 백본을 모두 시도했습니다 — 중단합니다.\n     이어서 하려면: claude --resume %s\n' "$sid" >&2
+    exit "$rc"
+  fi
+
   # Resuming a session that never got a transcript fails outright. That happens
   # when a session ends before its first exchange — there is no conversation to
-  # carry over, so start a fresh one instead of erroring.
+  # carry over, so start a fresh one on the new backbone instead of erroring.
   # `ccd` with no arguments prints status rather than launching, and bare
   # `claude` is the right way to start fresh, so the two differ here.
   resumed=1
@@ -217,15 +266,38 @@ while :; do
   # finds no armed state and exits instead of looping.
   rm -f "$CCD_STATE" 2>/dev/null || true
 
-  # Runaway backstop: a return that arms itself again would otherwise cycle
-  # unbounded. Three in quick succession is a bug, not a workday.
+  # Runaway backstop. `visited` is the real guard and catches a repeat first; this
+  # is here for the one direction that records no destination — a return that
+  # arms itself again would otherwise cycle unbounded.
   hops=$((hops + 1))
   if [ "$hops" -ge 3 ]; then
     printf 'ccd: too many consecutive handoffs — stopping.\n     Resume with: claude --resume %s\n' "$sid" >&2
     exit "$rc"
   fi
 
+  [ -n "$dest" ] && visited_add "$dest"
+
   case "$dir" in
+    to_fallback)
+      # Revoked since this was armed: stop rather than bill on a permission that
+      # no longer exists. The conversation is still there.
+      if ! paid_optin; then
+        printf '\nccd: OpenRouter 자동 전환이 꺼져 있습니다 — 과금 없이 여기서 멈춥니다.\n' >&2
+        printf '   이어서 하려면: claude --resume %s\n' "$sid" >&2
+        printf '   유료 전환을 허용하려면: ccd setup --auto\n' >&2
+        exit "$rc"
+      fi
+      if [ "$resumed" -eq 1 ]; then
+        printf '\n\033[33m▶ 🍩 Claude 쿼타 소진 — 같은 대화를 OpenRouter에서 이어갑니다 (유료)\033[0m\n'
+        printf '\033[2m   회복되면 구독으로 자동 복귀합니다\033[0m\n'
+        args=(--resume "$sid"); resuming=1; last_sid="$sid"
+      else
+        printf '\n\033[33m▶ 🍩 Claude 쿼타 소진 — OpenRouter에서 새 세션으로 시작합니다 (유료)\033[0m\n'
+        printf '\033[2m   회복되면 구독으로 자동 복귀합니다\033[0m\n'
+        args=(go)
+      fi
+      backbone=fallback
+      ;;
     to_subscription)
       # Returning to the subscription means returning to it completely. ccd runs
       # as our child so its exports cannot reach us, but clear them anyway: a
@@ -246,6 +318,7 @@ while :; do
         printf '\n\033[32m▶ ✓ 구독으로 돌아왔습니다 — 새 세션으로 시작합니다 (OpenRouter 과금 종료)\033[0m\n'
         args=()
       fi
+      backbone=subscription
       ;;
     *)
       # Unrecognized direction: fail closed rather than guessing a backbone.

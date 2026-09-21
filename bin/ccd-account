@@ -30,11 +30,13 @@ Commands:
   ccd account refresh [--all] [--inactive-only] [<name>]
   ccd account pick [--json]
   ccd account swap [--from N] [--window K] (internal: called by the hook)
+  ccd account exhausted          (internal: the only thing that may justify paying)
   ccd account keepalive          (internal: called by the hook, at most daily)
   ccd account current [--json]   (internal: statusline / doctor)
 """
 
 import argparse
+import datetime
 import errno
 import hashlib
 import json
@@ -1802,8 +1804,8 @@ def cmd_swap(args):
 
     Prints `<account>TAB<installed credential>TAB<the credential it replaced>` and
     exits 0, or prints one line saying why not and exits non-zero. Nothing about
-    that reason is evidence of anything, and nothing acts on it: a session that
-    cannot be moved to a spare stays where it is."""
+    that reason is evidence of anything, and nothing acts on it: whether the paid
+    hop is allowed is a separate question with its own proof (cmd_exhausted)."""
     names = account_names()
     if not names:
         return _swap_no("no accounts registered")
@@ -1850,6 +1852,86 @@ def _swap_no(reason):
     subscription is measurably spent, and no exit code can answer that."""
     print(reason, file=sys.stderr)
     return 4
+
+
+def _still_spent(rec):
+    """Does this reading show a window that is out of room AND still open?
+
+    A window that has reset since it was read says nothing about now, however
+    recently it was read. A reset time that is missing or unreadable is left to the
+    freshness of the reading itself."""
+    for pct, reset in ((rec.get("five_hour_percent"), rec.get("five_hour_reset")),
+                       (rec.get("seven_day_percent"), rec.get("seven_day_reset"))):
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool) or pct < HEADROOM:
+            continue
+        try:
+            if datetime.datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp() <= time.time():
+                continue
+        except (AttributeError, ValueError, TypeError):
+            pass
+        return True
+    return False
+
+
+def subscriptions_proved_spent():
+    """Is it PROVED that no subscription can take this session? True or False.
+
+    The one question that may authorise spending the user's money, so it is
+    answered from positive evidence and from nothing else:
+
+      - the accounts directory was read — not "listing it failed, so it is empty"
+      - every registered account file in it was read
+      - the credential stores are not under a stop
+      - every registered account other than the one this session is on has a
+        reading that is about this account's current identity, SUCCEEDED, is
+        younger than CANDIDATE_TTL (the same age at which a swap stops trusting a
+        reading and measures again), and shows a window out of room that has not
+        reset since. No registered spare at all, read successfully, is also proof.
+
+    It opens no socket, takes no lock and spends no token: the swap attempt that
+    comes before it has just measured every spare, and this reads what that left
+    behind. So a timeout, a 503, a busy store, an expired deadline or a refused
+    swap cannot become a yes here — each leaves a row that is stale, failed,
+    missing, or shows room, and every one of those is a no.
+
+    The account we are on is not measured: that it is spent is what the caller's
+    own reading and the rate_limit error already established."""
+    if store_split() is not None:
+        return False
+    entries = os.listdir(ACCOUNTS_DIR)            # raises rather than reading as empty
+    names = sorted(e[:-5] for e in entries
+                   if e.endswith(".json") and not e.startswith(".") and valid_name(e[:-5]))
+    accounts = {n: account_load(n) for n in names}
+    if any(a is None for a in accounts.values()):
+        return False
+    cur = active_name()
+    cache = quota_cache()
+    for name, acct in accounts.items():
+        if name == cur:
+            continue
+        rec = cache.get(name)
+        if not _cache_row_valid(rec, acct) or rec.get("status") != "ok":
+            return False
+        ts = rec.get("checked_at")
+        if not isinstance(ts, (int, float)) or not (0 <= now() - ts < CANDIDATE_TTL):
+            return False
+        if not _still_spent(rec):
+            return False
+    return True
+
+
+# The proof, as the hook reads it: this exact word on stdout AND exit 0. Printed in
+# one place, as the last thing cmd_exhausted does — so a die(), a SystemExit, an
+# uncaught exception or a bare non-zero exit is structurally unable to produce it.
+EXHAUSTED_PROOF = "every-subscription-measured-spent"
+
+
+def cmd_exhausted(args):
+    """Internal: the quota hook. See subscriptions_proved_spent()."""
+    if subscriptions_proved_spent() is not True:
+        return 1
+    print(EXHAUSTED_PROOF)
+    return 0
 
 
 def cmd_refresh(args):
@@ -2346,6 +2428,10 @@ def main(argv):
     a.add_argument("--deadline", type=float, default=60.0,
                    help="seconds this decision may spend, lock wait included")
     a.set_defaults(fn=cmd_swap)
+
+    a = sub.add_parser("exhausted",
+                       help="is it proved that no subscription can take the session? (internal)")
+    a.set_defaults(fn=cmd_exhausted)
 
     a = sub.add_parser("keepalive", help="keep spare tokens alive (internal)")
     a.add_argument("--force", action="store_true")

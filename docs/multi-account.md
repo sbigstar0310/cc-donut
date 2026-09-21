@@ -5,12 +5,22 @@
 >
 > 구현하면서 설계에서 바뀐 지점은 §13에 정리했다.
 >
-> **2026-09-18 (#57) 2차 개정.** 이 브랜치는 **유료 백본으로 자동으로 넘어가지 않는다.**
-> 갈 수 있는 예비 구독이 없으면 ccd 는 멈추고 한 줄 남긴다 (`swap-note`); OpenRouter 로
-> 가는 것은 사용자가 `ccd -c` 로 직접 친다. 그래서 `to_fallback` 방향, `paid-handoff`
-> 옵트인 파일, `handoff_ready()`/`have_key()`, `ccd account exhausted` 는 전부 없어졌다.
-> 런처에 남은 것은 **OpenRouter 에서 구독으로 돌아오는 길** 하나뿐이고, `ccd setup --auto`
-> 가 사는 것도 그것이다.
+> **2026-09-21 (#57) 3차 개정 — 유료 홉이 조건부로 돌아왔다.** ccd 가 세션을 스스로
+> OpenRouter 로 옮기는 것은 세 가지가 모두 맞을 때뿐이다: (1) 세션을 받아 줄 구독이
+> 없다 — 등록된 예비 구독이 없거나, 전부 바닥난 것이 **증명**됐다, (2) OpenRouter 키가
+> 저장돼 있다, (3) 사용자가 `ccd setup --auto` 로 허용했다 (`paid-handoff`). 여기에 기계적
+> 조건 하나가 붙는다 — 홉은 relaunch 이므로 세션이 런처의 감독 아래 있고 대화형이어야
+> 한다. 증명은 `ccd account exhausted` 가 내는 **단 하나의 양성 답**(stdout 의 고정된 한
+> 단어 + exit 0)이다: 예비 구독마다 이 계정의 것이고, 성공했고, `CANDIDATE_TTL` 보다
+> 새롭고, 아직 리셋되지 않은 창이 바닥인 측정이 있어야 한다. 읽지 못한 디렉터리, 실패한
+> 측정, 낡은 값, 락 타임아웃, 만료된 데드라인, `store-split` 정지, 실패했거나 확인되지
+> 않은 스왑은 어느 것도 증명이 아니고, 그때는 기존의 "세 번 시도 후 멈추고 알림" 으로
+> 간다. 95% 틱에서는 절대 과금하지 않는다 — 벽에 실제로 부딪힌 `StopFailure` 에서만.
+>
+> **2026-09-18 (#57) 2차 개정 (3차에서 뒤집힘).** 한때 이 브랜치는 유료 백본으로 자동으로
+> 넘어가지 않았다: 다섯 번의 리뷰가 매번 운영상의 실패(락 타임아웃, 503, 읽지 못한
+> 디렉터리)가 "갈 곳 없음" 으로 읽혀 과금 분기에 닿는 길을 찾아냈기 때문이다. 3차 개정은
+> 그 추론을 증명으로 바꿔서 되살렸다.
 >
 > **2026-09-17 (#57) 개정.** 계정 간 스왑은 이제 **세션 안에서** 일어난다. 세션을
 > 끝내고 relaunch 하던 `to_account` 방향과, 그걸 위해 있던 계정 사다리 / 방문 집합
@@ -20,12 +30,14 @@
 
 ## 1. 목표
 
-계정이 여러 개인 사용자가 한 계정의 쿼타를 소진했을 때, **여유가 있는 다른 Claude 계정으로 세션 안에서 이동**한다. 임계치에서 미리 옮기고, 벽에 먼저 부딪히면 `StopFailure` 가 뒷받침한다. 등록된 모든 계정이 소진되면 세 번까지 시도한 뒤 **멈추고 한 줄로 알린다**. OpenRouter 백본으로 가는 것은 자동이 아니며 사용자가 `ccd -c` 를 직접 친다. 자동인 것은 거기서 구독으로 **돌아오는 길**뿐이고, 그 길에는 런처(`ccd setup --auto`)가 필요하다.
+계정이 여러 개인 사용자가 한 계정의 쿼타를 소진했을 때, **여유가 있는 다른 Claude 계정으로 세션 안에서 이동**한다. 임계치에서 미리 옮기고, 벽에 먼저 부딪히면 `StopFailure` 가 뒷받침한다. 갈 구독이 없다는 것이 **증명**되고(예비 구독이 없거나 전부 방금 측정돼 바닥), 키가 저장돼 있고, `ccd setup --auto` 로 허용돼 있으면 런처를 통해 OpenRouter 백본으로 relaunch 한다. 그중 하나라도 아니면 — 스왑이 그냥 실패한 경우를 포함해 — 세 번까지 시도한 뒤 **멈추고 한 줄로 알린다**; 과금의 근거는 증명뿐이다. 거기서 구독으로 **돌아오는 길**도 런처가 맡는다.
 
 ```
 계정 A 소진
   ├─ 등록된 다른 계정 중 여유분 있음  → 계정 B 로 세션 안에서 스왑      (구독, 무과금, 재시작 없음)
-  └─ 전부 소진                        → 3회 시도 후 멈추고 알림. OpenRouter 는 `ccd -c` 로 직접 (유료, 자동 아님)
+  └─ 전부 소진이 증명됨               → 키 + `--auto` 옵트인 + 런처?  예 → OpenRouter 백본 (relaunch, 유료)
+                                                                     아니오 → 멈추고 알림 (`ccd -c` 는 언제든 수동)
+  └─ 증명 없음 (측정 실패·락·스왑 실패) → 3회 시도 후 멈추고 알림. 절대 과금하지 않는다
 ```
 
 ### 비목표
@@ -42,7 +54,7 @@
 
 | 파일 | 역할 |
 |---|---|
-| `bin/ccd-handoff` | `ccd setup --auto` 가 설치하는 런처. 실제 claude를 돌리고, `ccd -c` 로 시작된 OpenRouter 세션이 exit 129 로 끝나면 **구독으로 되돌려 relaunch** 한다. OpenRouter 로 나가는 것은 사용자가 `ccd -c` 를 직접 치는 것이고, 계정 간 이동은 여기를 지나지 않는다 |
+| `bin/ccd-handoff` | `ccd setup --auto` 가 설치하는 런처. 실제 claude를 돌리고 exit 129를 잡아, 무장된 방향대로 **OpenRouter 백본으로 relaunch**(`to_fallback`, 유료 — 증명·키·옵트인이 모두 있을 때만 훅이 무장한다)하거나 **구독으로 되돌린다**(`to_subscription`). 계정 간 이동은 여기를 지나지 않는다 |
 | `scripts/quota-guard.sh` | 훅 (`UserPromptSubmit`/`PostToolUse`/`StopFailure`/`SessionEnd`). 소진·회복을 판단하고 handoff 상태를 쓴 뒤 claude에 SIGHUP |
 | `bin/ccd` | OpenRouter 백본 런처 (`ANTHROPIC_BASE_URL` 등을 세팅하고 claude exec) |
 | `bin/ccd-statusline` | 상태 표시 |
@@ -54,7 +66,7 @@
 3. claude 가 SessionEnd 훅 실행 후 **129** 로 종료
 4. 런처가 상태 파일을 읽고 `direction` 에 따라 반대편 백본에서 `--resume <sid>` 로 재기동
 
-`direction` 은 `to_subscription` 하나뿐이다 (2차 개정 전에는 `to_fallback` 도 있었다). 0.4.0 설계는 여기에 세 번째 값(`to_account`)을 더했지만, #57 에서 다시 두 값으로 돌아왔다 — 계정 간 이동은 세션을 끝내지 않으므로 방향이 필요 없다. 인터록, hop 카운터, transcript 존재 검사, headless 거부, 복원 실패 시 새 세션 폴백은 전부 그대로다.
+`direction` 은 `to_fallback` | `to_subscription` 두 값뿐이다. 0.4.0 설계는 여기에 세 번째 값(`to_account`)을 더했지만, #57 에서 다시 두 값으로 돌아왔다 — 계정 간 이동은 세션을 끝내지 않으므로 방향이 필요 없다. 인터록, hop 카운터, transcript 존재 검사, headless 거부, 복원 실패 시 새 세션 폴백은 전부 그대로다.
 
 ## 3. 검증된 사실
 
@@ -135,7 +147,7 @@ User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 
 주의: Anthropic이 토큰 교환을 `https://platform.claude.com/v1/oauth/token` 으로 옮기는 중이라는 보고가 있다. **두 엔드포인트를 순차 시도**하고, 성공한 쪽을 캐시한다.
 
-이건 공개 문서가 없는 비공식 표면이다. 깨질 수 있다 — 하지만 깨져도 치명적이지 않다: refresh 실패는 "해당 계정 skip" 으로 강등되고, 갈 계정이 없으면 ccd 는 멈추고 알린다. OpenRouter 는 `ccd -c` 로 직접 가는 길로 그대로 남아 있다 (§8).
+이건 공개 문서가 없는 비공식 표면이다. 깨질 수 있다 — 하지만 깨져도 치명적이지 않다: refresh 실패는 "해당 계정 skip" 으로 강등되고, refresh 에 실패한 계정은 **바닥난 것으로 증명된 계정이 아니므로** 유료 홉의 근거가 되지 못한다 — 그때 ccd 는 멈추고 알린다. OpenRouter 는 `ccd -c` 로 직접 가는 길로도 그대로 남아 있다 (§8).
 
 ## 4. 상태 파일 스키마
 
@@ -186,7 +198,7 @@ User-Agent: claude-cli/<설치된 Claude Code 버전> (external, cli)
 {
   "armed": true,
   "token": "<32 hex>",
-  "direction": "to_subscription",   // 남은 유일한 방향
+  "direction": "to_fallback",       // to_fallback | to_subscription
   "session_id": "…",
   "cwd": "…",
   "armed_at": 1755300000
@@ -220,11 +232,11 @@ pick_account():
 
 ### 5.2 루프 방지 — 횟수가 아니라 방문 집합으로
 
-> **#57 개정.** 계정 사다리도, 런처의 `visited` 방문 집합도, 훅으로 그걸 넘기던
-> `CCD_BURST_VISITED` 도 전부 없어졌다 (`ccd-account pick` 의 `--exclude` 포함). 런처가
-> 다루는 방향이 `to_subscription` 하나뿐이라 방문 집합이 막을 루프가 남아 있지 않다.
+> **#57 개정.** 계정 사다리와, 훅으로 방문 집합을 넘기던 `CCD_BURST_VISITED` 는 없어졌다
+> (`ccd-account pick` 의 `--exclude` 포함). 런처 안의 지역 변수 `visited` 는 남아 있다 —
+> 한 burst 안에서 유료 백본에 두 번 들어가는 것을 막는 장치다.
 
-지금 남은 장치는 둘이다.
+지금 남은 장치는 셋이다.
 
 - **세션 안 스왑 쪽**: 방금 떠나온 계정은 그 창이 리셋될 때까지 목적지에서 뺀다
   (`swapped-windows`, TTL 로 만료). 떠나는 것 자체는 한 번도 막지 않는다.
@@ -232,6 +244,10 @@ pick_account():
   멈추고 `claude --resume <sid>` 를 안내한다. 세션이 `HOP_RESET_SECONDS`(60초) 이상
   살아남으면 카운터를 0 으로 되돌린다. 하루에 쿼타가 죽었다 살아나기를 반복하는 것은
   정상이고 루프가 아니다 (§13.4).
+- **런처의 `visited`**: 한 burst(사이에 `HOP_RESET_SECONDS` 이상 산 세션이 없는 연속
+  relaunch) 안에서 `fallback` 에 두 번 들어가려 하면 그 자리에서 멈춘다. 그리고 relaunch
+  직전에 `paid-handoff` 를 다시 확인한다 — 무장과 relaunch 사이에 `--no-auto` 가 있었다면
+  과금하지 않고 멈춘다.
 
 ## 6. 크레덴셜 스왑
 
@@ -252,8 +268,8 @@ cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운�
 좁힐 뿐 닫지는 못한다. 닫으려면 Claude Code 쪽 writer 와의 조율이 필요하고, #67 로
 추적한다.
 
-그래서 스왑은 세션 안에서 일어난다. 세션을 끝내는 홉은 사용자가 `ccd -c` 로 직접 나가는 OpenRouter 행과
-거기서 (런처가 있으면 자동으로) 돌아오는 길뿐이다 — 그동안 백본은 프로세스의 환경 변수라서, 파일을 아무리 고쳐도
+그래서 스왑은 세션 안에서 일어난다. 세션을 끝내는 홉은 OpenRouter 로 나가는 길(자동은 증명·키·옵트인·런처가 모두 있을 때만, 그 밖에는 `ccd -c`)과
+거기서 돌아오는 길뿐이다 — 그동안 백본은 프로세스의 환경 변수라서, 파일을 아무리 고쳐도
 그 세션에는 닿지 않는다.
 
 다른 터미널에서 돌고 있는 세션도 같은 저장소를 읽으므로 함께 옮겨간다. 즉시 깨지지 않고,
@@ -342,12 +358,12 @@ refresh token 8.5일 만료 때문에, 등록만 해두고 안 쓰는 계정은 
 
 | 상황 | 동작 |
 |---|---|
-| 다른 계정 전부 소진 | 멈추고 `swap-note` 에 이유를 남긴다. 자동으로 유료 백본에 가지 않는다 |
-| 등록된 계정 없음 | 아무것도 하지 않는다 (남길 노트도 없다) |
-| 후보 계정 refresh 실패 | `status=dead`, 후보에서 제외, 다음 후보로. 전부 실패하면 멈춘다 |
+| 다른 계정 전부 소진 (측정으로 증명됨) | 키 + `--auto` 옵트인 + 런처가 있으면 `to_fallback`. 하나라도 없으면 멈추고 알림 |
+| 등록된 계정 없음 (디렉터리를 읽어서 확인됨) | 위와 같다 — 예비 구독이 없다는 것 자체가 증명이다 |
+| 후보 계정 refresh 실패 | `status=dead`, 후보에서 제외, 다음 후보로. 전부 실패하면 **멈추고 알림** — 실패한 refresh 는 소진의 증명이 아니다 |
 | 쿼타 조회 네트워크 오류 | `status=error`, 제외. **낙관적 스왑을 하지 않는다** — 읽히지 않는 값은 절대 "여유 있음" 이 아니다 (기존 `quota_peak` 의 원칙과 동일) |
 | 스왑 도중 크래시 | `.lock` + atomic write 로 blob 은 항상 온전. `.active` 가 어긋나면 다음 실행 시 live blob 과 대조해 복구 |
-| 복귀 relaunch 가 즉시 실패 | 기존 로직 재사용: 15초 내 비정상 종료면 새 세션으로 이어가고 `--resume <sid>` 안내 |
+| 유료 홉 후 relaunch 가 즉시 실패 | 기존 로직 재사용: 15초 내 비정상 종료면 새 세션으로 이어가고 `--resume <sid>` 안내 |
 | 다른 터미널에 세션 존재 | 안내 후 진행. 그 세션도 다음 refresh 때 새 계정으로 옮겨가며, **재시작할 필요는 없다** (§6.1) |
 | 무한 전환 루프 | §5.2. 계정 간 이동은 relaunch 를 하지 않으므로 루프 대상이 아니고, `(계정, 리셋 창)` 당 한 번으로 따로 제한된다 |
 | OpenRouter 키 없음 + 다른 계정 있음 | **전환은 가능해야 한다.** 계정 간 스왑 경로에는 키 검사가 아예 없고, `launcher_ready()` 도 키를 요구하지 않는다 (§10) |
@@ -403,14 +419,14 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 
 - `handoff_ready()` 를 `launcher_ready()` / `handoff_ready()` 로 분리. 전자는 `have_key()` 를 요구하지 않는다 — OpenRouter 에서 **돌아오는** 길에는 키가 필요 없다 (§8 마지막 행)
 - 프롬프트·툴 틱: `peak >= ARM_THRESHOLD` 이고 여유 있는 계정이 있으면 **그 자리에서** `ccd-account use <name> --force` (#57 전에는 `StopFailure` 에서 `to_account` 로 무장했다)
-- `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 갈 계정이 없으면 멈추고 `swap-note` 를 남긴다 (깨우지 않는다 — 같은 벽에 다시 부딪힌다)
+- `StopFailure` 백스톱: 같은 스왑을 한 뒤 exit 2 로 `asyncRewake` 를 깨운다. 스왑하지 못했으면 `paid_optin && have_key && subscriptions_proved_spent` 를 묻고, 참이면서 `launcher_ready` 일 때만 `to_fallback` 을 무장하고 SIGHUP 한다 (무장 먼저, 신호 실패 시 해제). 그 밖에는 멈추고 `swap-note` 를 남긴다 (깨우지 않는다 — 같은 벽에 다시 부딪힌다). 세 조건은 맞는데 런처가 없으면 그 사실과 고치는 법을 note 에 적는다
 - keep-alive: 하루 1회 `ccd-account refresh --all --inactive-only` 를 백그라운드로
-- `SessionEnd` 안내 문구는 `to_subscription` 하나 (나가는 방향은 자동이 아니다)
+- `SessionEnd` 안내 문구는 `to_fallback` / `to_subscription` 두 가지
 
 ### `bin/ccd-handoff`
 
-- `hops` 카운터 하나. 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 0 으로 되돌린다 (`visited` 집합은 #57 에서 삭제)
-- `case "$dir"` 은 `to_subscription` 한 분기. #57 에서 `to_fallback`·`to_account` 분기와 `hf account`, 계정 수에서 파생하던 상한, `CCD_BURST_VISITED` export 가 전부 삭제됐다
+- `hops` 카운터와 지역 `visited`. 세션이 `HOP_RESET_SECONDS` 이상 살아남으면 둘 다 비운다
+- `case "$dir"` 은 `to_fallback` / `to_subscription` 두 분기. `to_fallback` 은 relaunch 직전에 옵트인을 다시 확인하고, ccd 를 `CCD_HANDOFF_LEG` 와 함께 띄워 그 세션이 같은 런처의 감독 아래 남게 한다. #57 에서 `to_account` 분기와 `hf account`, 계정 수에서 파생하던 상한, `CCD_BURST_VISITED` export 가 전부 삭제됐다
 - `to_subscription` (OpenRouter → 구독 복귀) 은 **손대지 않는다.** §13.1 참조
 
 ### `bin/ccd-statusline`
@@ -447,7 +463,7 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 통합 (fake claude 바이너리 + stub HTTP) — #57 이후의 프로토콜 기준:
 - A 소진 → **세션을 끝내지 않고** B 로 스왑하고, 그 사실을 한 줄로 알리는가 (relaunch 도 `--resume` 도 없다)
 - 벽에 먼저 부딪힌 경우: `StopFailure` 가 스왑한 뒤 exit 2 로 멈춘 턴을 깨우는가
-- A·B 모두 소진 → 세 번 시도한 뒤 멈추고 이유를 남기는가 (OpenRouter 로 자동으로 가지 않는다)
+- A·B 모두 **측정돼** 소진 + 키 + 옵트인 + 런처 → OpenRouter 로 가는가; 그중 하나라도 없거나 증명이 아니면(503, 낡은 값, 락 타임아웃, 읽지 못한 디렉터리, `store-split`, 실패·미확인 스왑, 95% 틱) 과금 없이 멈추고 이유를 남기는가
 - 계정 0개 등록 시 현행과 바이트 단위로 동일하게 동작하는가 (**가장 중요한 회귀 테스트**)
 - 스왑 중 kill -9 후 blob 무결성
 
@@ -462,7 +478,7 @@ ccd account pick --json                      §5 알고리즘. 훅이 호출하�
 - 리셋 타임스탬프가 없는 판독에서도 기록이 남는가 (구멍 없음)
 - 기록이 TTL 을 넘기면 다시 목적지가 되는가 (개수가 아니라 시간으로 만료)
 - 떠나는 것 자체는 **한 번도 막지 않는가** — 소진된 계정에 갇히는 실패가 불가능해야 한다
-- 런처 쪽 백스톱: 연속 3홉에서 멈추는가, `HOP_RESET_SECONDS` 뒤에는 카운터가 되돌아가는가
+- 런처 쪽: `to_fallback` 을 한 burst 에 두 번 시도하면 멈추는가, 연속 3홉에서 멈추는가, `HOP_RESET_SECONDS` 뒤에는 둘 다 되돌아가는가
 
 ## 12. 알려진 한계 / 미해결 질문
 
