@@ -49,8 +49,8 @@ The ladder becomes:
 account A spent  →  account B has room?  →  B      free
                  →  B spent too?         →  key stored and --auto opted in?
                                             yes →  🍩  OpenRouter (paid)
-                                            no  →  nowhere; ccd stops and says so,
-                                                   switch by hand (below)
+                                            no  →  no automatic handoff; ccd stops and says
+                                                   so. Wait for the quota, or type `ccd -c` (top)
 ```
 
 The first rung needs nothing typed and nothing installed: when the quota reading
