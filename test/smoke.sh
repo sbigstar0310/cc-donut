@@ -8286,5 +8286,14 @@ dg_gate - arm64; dg_rc=$?
   || bad "uncached image" "rc=$dg_rc stderr: $(head -c 160 "$DG/err")"
 rm -rf "$DG"
 
+head_ "34. the suite leaves no bytecode in the product"
+# The suite imports bin/ccd-account as a module in many places, and Python writes
+# its bytecode next to the source unless told not to. One such file was committed
+# and shipped in v0.8.0 (#77). Whatever the suite runs, bin/ and scripts/ must come
+# out of it holding only what was put there.
+pyc=$(find "$ROOT/bin" "$ROOT/scripts" \( -name __pycache__ -o -name '*.pyc' \) 2>/dev/null | head -3)
+[ -z "$pyc" ] && ok "no __pycache__ or .pyc under bin/ or scripts/" \
+  || bad "bytecode in the product" "$pyc"
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
