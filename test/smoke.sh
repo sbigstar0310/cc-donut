@@ -12,6 +12,9 @@ export HOME="$FAKE"
 # send fixture writes to the developer's real configuration. Cases that test it
 # set it themselves.
 unset CLAUDE_CONFIG_DIR
+# The suite imports bin/ccd-account as a module; Python would otherwise leave its
+# bytecode in bin/, and one such file shipped in v0.8.0 (#77).
+export PYTHONDONTWRITEBYTECODE=1
 
 # One reading per account, one file each — the layout bin/ccd-account's reading_save
 # writes. Fixtures still think of "the readings" as one dict, so these carry a dict
