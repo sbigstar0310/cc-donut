@@ -8286,5 +8286,77 @@ dg_gate - arm64; dg_rc=$?
   || bad "uncached image" "rc=$dg_rc stderr: $(head -c 160 "$DG/err")"
 rm -rf "$DG"
 
+head_ "35. a pointer repair cannot undo a swap"
+# active_name() heals the pointer after a /login: the profile names a, the pointer
+# still says b. A heal decided outside the store lock can land AFTER a swap that
+# finished meanwhile — the pointer goes back to the account the swap just left,
+# and the next swap's backup files the live credential, b's, under a (#73).
+# Process 1 has read the identity and stops before its repair; process 2 swaps
+# a → b; process 1 resumes. Two processes, because the lock is reentrant in one.
+PH="$FAKE/ptr-race"
+rm -rf "$PH"; mkdir -p "$PH/.claude/ccd/accounts"
+python3 - "$PH" <<'PY'
+import json, os, sys, time
+h = sys.argv[1]
+d = os.path.join(h, ".claude", "ccd", "accounts")
+ms = int(time.time() * 1000)
+def put(p, text):
+    with open(p, "w") as f:
+        f.write(text)
+    os.chmod(p, 0o600)
+def oauth(tag):
+    return {"accessToken": "AT-" + tag, "refreshToken": "RT-" + tag,
+            "expiresAt": ms + 3600000, "subscriptionType": "max"}
+for i, n in enumerate(("a", "b")):
+    put(os.path.join(d, n + ".json"), json.dumps({
+        "name": n, "account_uuid": "uuid-" + n, "priority": i + 1, "storage": "file",
+        "claudeAiOauth": oauth(n + "-stored"), "added_at": ms // 1000}))
+# ccd installed b a minute ago; the user signed in as a with /login since.
+put(os.path.join(d, ".active"), "b\n")
+put(os.path.join(d, ".active-at"), f"{ms - 60000}\n")
+put(os.path.join(h, ".claude", ".credentials.json"),
+    json.dumps({"claudeAiOauth": oauth("a-live")}))
+put(os.path.join(h, ".claude.json"), json.dumps({"oauthAccount": {
+    "accountUuid": "uuid-a", "emailAddress": "a@example.com",
+    "profileFetchedAt": ms - 30000}}))
+PY
+cat > "$PH/.p1.py" <<'PY'
+import importlib.machinery, importlib.util, os, sys, time
+loader = importlib.machinery.SourceFileLoader("ccdptr", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(m)
+home, real, paused = os.environ["HOME"], m._active_at, []
+def held():
+    # The profile has been read and judged newer than ccd's last install: the
+    # heal is decided. Hold here while another process swaps.
+    t = real()
+    if not paused:
+        paused.append(1)
+        open(os.path.join(home, ".paused"), "w").close()
+        end = time.time() + 30
+        while not os.path.exists(os.path.join(home, ".go")) and time.time() < end:
+            time.sleep(0.05)
+    return t
+m._active_at = held
+print(m.active_name())
+PY
+PYTHONDONTWRITEBYTECODE=1 HOME="$PH" CCD_CREDENTIALS_BACKEND=file \
+  python3 "$PH/.p1.py" "$ROOT/bin/ccd-account" > "$PH/.p1-out" 2>&1 & P1=$!
+n=0; while [ ! -e "$PH/.paused" ] && kill -0 "$P1" 2>/dev/null && [ $n -lt 100 ]; do
+  sleep 0.1; n=$((n+1)); done
+HOME="$PH" CCD_CREDENTIALS_BACKEND=file "$ROOT/bin/ccd-account" --no-color use b --force \
+  >/dev/null 2>&1; p2=$?
+: > "$PH/.go"; wait "$P1" 2>/dev/null
+{ [ -e "$PH/.paused" ] && [ "$p2" -eq 0 ] && grep -q 'AT-b-stored' "$PH/.claude/.credentials.json"; } \
+  || bad "race not staged" "paused=$([ -e "$PH/.paused" ] && echo yes || echo no) swap rc=$p2 p1: $(head -c 160 "$PH/.p1-out")"
+[ "$(cat "$PH/.claude/ccd/accounts/.active" 2>/dev/null)" = "b" ] \
+  && ok "a pointer repair decided before a swap cannot undo it" \
+  || bad "pointer repair undid a swap" "the pointer says $(cat "$PH/.claude/ccd/accounts/.active" 2>/dev/null) with b's credential live"
+HOME="$PH" CCD_CREDENTIALS_BACKEND=file "$ROOT/bin/ccd-account" --no-color use a --force >/dev/null 2>&1
+grep -q 'RT-b-' "$PH/.claude/ccd/accounts/a.json" \
+  && bad "tokens filed under the wrong account" "the next swap banked b's credential into a.json" \
+  || ok "...and the next swap does not bank b's credential under a"
+rm -rf "$PH"
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
