@@ -358,31 +358,31 @@ def _keychain_write(blob):
             account = getpass.getuser()
         except Exception:
             return False
-    payload = json.dumps(blob, ensure_ascii=False)
-    # The secret goes through argv, which is briefly visible in the process table
-    # on a multi-user machine. `security` offers no stdin path for the value, and
-    # this is the same trade every Claude Code account switcher makes. The window
-    # is one exec; the alternative is not being able to swap at all.
+    # The command goes to `security -i` on stdin, as Claude Code writes this item,
+    # so the credential never reaches the process table. A quote, backslash or
+    # newline in the account would change the -a word or cut the command short,
+    # writing another account's item or one with no password.
+    if any(c in account for c in '"\\\n'):
+        return False
+    args = ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", account]
+    args += ["-X", json.dumps(blob, ensure_ascii=False).encode().hex()]
+    line = " ".join(f'"{a}"' for a in args) + "\n"
+    # Interactive mode reads a line into 4096 bytes and runs the overflow as a
+    # command of its own. Past Claude Code's own limit for this item, argv it is.
+    stdin = len(line.encode()) <= 4032
     try:
         p = subprocess.run(
-            [
-                "security",
-                "add-generic-password",
-                "-U",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-                "-w",
-                payload,
-            ],
+            ["security", "-i"] if stdin else ["security", *args],
+            input=line if stdin else None,
             capture_output=True,
             text=True,
             timeout=15,
         )
     except Exception:
         return False
-    return p.returncode == 0
+    # Interactive mode exits with the last line's status cut to one byte, so a
+    # refusal can exit 0; the "<command>: returned <status>" it prints cannot.
+    return p.returncode == 0 and ": returned " not in p.stderr
 
 
 def use_keychain():
