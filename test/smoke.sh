@@ -8370,5 +8370,192 @@ grep -q 'RT-b-' "$PH/.claude/ccd/accounts/a.json" \
   || ok "...and the next swap does not bank b's credential under a"
 rm -rf "$PH"
 
+head_ "36. the keychain write keeps the credential off the command line"
+# `security add-generic-password -w <blob>` put both tokens in argv, readable by any
+# process on the machine for as long as it ran (#78). `security -i` reads the same
+# command from stdin, which is how Claude Code writes this item itself. The fake
+# stands where the others do, at subprocess.run, and reads a command the way the
+# real tool does (Apple's SecurityTool/macOS: readline.c, security.c,
+# keychain_add.c), so a line that would break there breaks here too.
+cat > "$FAKE/kcw-fake.py" <<'PYEOF'
+import importlib.machinery, importlib.util, json, os, sys, types
+os.environ["HOME"] = sys.argv[2]
+os.environ.pop("CCD_CREDENTIALS_BACKEND", None)
+os.environ["USER"] = "ccd-test"
+loader = importlib.machinery.SourceFileLoader("ccdkcw", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+m.use_keychain = lambda: True
+SVC, ME = m.KEYCHAIN_SERVICE, "ccd-test"
+OLD = b'{"claudeAiOauth": {"accessToken": "AT-old"}}'
+ITEMS = {(SVC, ME): OLD}   # the login this write replaces
+CALLS = []                 # (argv, stdin) of every exec
+REFUSE = []                # a status staged here refuses the next add
+BLOB = {"claudeAiOauth": {"accessToken": "AT-kcw-secret", "refreshToken": "RT-kcw-secret"},
+        "mcpOAuth": {"notion|x": {"accessToken": "MCP-kcw-secret",
+                                  "note": 'a "quoted" \\ \u00fcn\u00ef value'}}}
+class Unstaged(BaseException):
+    pass
+class Ran:
+    def __init__(self, rc, err):
+        self.returncode, self.stdout, self.stderr = rc, "", err
+def lines(text):
+    # readline(buffer, 4096): a line ends at a newline or after 4095 bytes, the rest
+    # is read as the next line, and a last line with no newline is never run.
+    out, cur = [], b""
+    for b in text.encode():
+        if len(cur) == 4095:
+            out.append(cur); cur = b""
+        if b == 10:
+            out.append(cur); cur = b""
+        else:
+            cur += bytes([b])
+    if len(cur) == 4095:
+        out.append(cur)
+    return [l.decode("utf-8", "replace") for l in out]
+def split_line(s):
+    # Words split on whitespace; one that opens with " or ' runs to the same quote;
+    # a backslash takes the next character as it is, inside quotes or not.
+    words, cur, state, q = [], "", "ws", ""
+    for ch in s:
+        if state == "ws":
+            if ch.isspace():
+                continue
+            cur, state = "", "w"
+            if ch in "\"'":
+                q, state = ch, "q"
+                continue
+        if state.endswith("\\"):
+            cur, state = cur + ch, state[0]
+        elif ch == "\\":
+            state += "\\"
+        elif ch.isspace() if state == "w" else ch == q:
+            words.append(cur); state = "ws"
+        else:
+            cur += ch
+    if state != "ws":
+        words.append(cur)
+    return words
+def add(args, err):
+    # getopt stops at the first word that is not an option; a word left over is a
+    # keychain name to the real tool, and ccd never names one.
+    o, i = {}, 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-U":
+            o["U"], i = True, i + 1
+        elif args[i][1:] in ("a", "s", "w", "X") and i + 1 < len(args):
+            o[args[i][1:]], i = args[i + 1], i + 2
+        else:
+            break
+    if i < len(args):
+        err.append("Usage: add-generic-password ...")
+        return 2
+    try:
+        data = bytes.fromhex(o["X"]) if "X" in o else o.get("w", "").encode()
+    except ValueError:
+        err.append("security: Unable to convert password data (-X must specify valid hex digits)")
+        return 2
+    if REFUSE:
+        status = REFUSE.pop(0)
+        err.append("security: SecKeychainItemCreateFromContent (<default>): %d" % status)
+        return status
+    key = (o.get("s"), o.get("a"))
+    if key in ITEMS and "U" not in o:
+        err.append("security: The specified item already exists in the keychain.")
+        return -25299
+    ITEMS[key] = data
+    return 0
+def execute(words, err):
+    if not words:
+        return 0
+    if words[0] != "add-generic-password":
+        err.append('security: unknown command "%s"' % words[0])
+        return 1
+    return add(words[1:], err)
+def fake_run(argv, *a, input=None, **k):
+    argv = list(argv)
+    CALLS.append((argv, input))
+    if argv[:1] != ["security"]:
+        raise Unstaged("unstaged external call: " + " ".join(argv[:2]))
+    err = []
+    if argv[1:] == ["-i"]:
+        # The exit status is the LAST line's, cut to one byte; every line that
+        # failed says so on stderr, whole.
+        rc = 0
+        for line in lines(input or ""):
+            words = split_line(line)
+            rc = execute(words, err)
+            if rc:
+                err.append("%s: returned %d" % (words[0], rc))
+    else:
+        rc = execute(argv[1:], err)
+    return Ran(rc & 0xFF, "".join(e + "\n" for e in err))
+m.subprocess = types.SimpleNamespace(run=fake_run)
+PYEOF
+kcw() { # $1=the case -> the assertion it failed, if any
+  rm -rf "$FAKE/kcw"; mkdir -p "$FAKE/kcw/.claude"
+  python3 -c "$(cat "$FAKE/kcw-fake.py")$1" "$ROOT/bin/ccd-account" "$FAKE/kcw" 2>&1 | tail -1
+}
+
+out=$(kcw '
+ok, failed, written = m.live_write(BLOB, ["keychain"])
+assert ok and written == ["keychain"], f"the write did not land: failed={failed}"
+seen = " ".join(" ".join(argv) for argv, _ in CALLS)
+for s in ("AT-kcw-secret", "RT-kcw-secret", "MCP-kcw-secret"):
+    for form in (s, s.encode().hex()):
+        assert form not in seen, f"{s} is on the command line: {seen[:100]}"
+') && ok "no token from the credential reaches argv, as itself or as hex" \
+  || bad "the credential is on the command line" "$out"
+
+out=$(kcw '
+ok, failed, written = m.live_write(BLOB, ["keychain"])
+assert any(stdin for _, stdin in CALLS), f"nothing came in on stdin: {[a[:2] for a, _ in CALLS]}"
+got = json.loads(ITEMS[(SVC, ME)].decode("utf-8"))
+assert got == BLOB, f"the item holds something else: {got!r}"
+') && ok "the write goes in on stdin, and the item decodes to exactly the blob written" \
+  || bad "the stdin write" "$out"
+
+out=$(kcw '
+REFUSE.append(-25308)      # errSecInteractionNotAllowed: a locked keychain
+ok, failed, written = m.live_write(BLOB, ["keychain"])
+assert not ok and failed == ["keychain"] and written == [], f"reported {ok, failed, written}"
+') && ok "a keychain that refuses the write inside security -i is a failed write" \
+  || bad "refused write" "$out"
+
+# The exit status carries the status modulo 256, and -67072 (errSecCSUnimplemented)
+# is a multiple of it: a refusal that exits 0. Only the "returned" line says so.
+out=$(kcw '
+REFUSE.append(-67072)
+ok, failed, written = m.live_write(BLOB, ["keychain"])
+assert not ok and failed == ["keychain"] and written == [], f"reported {ok, failed, written}"
+') && ok "...even when the refusal's status comes out as exit 0" \
+  || bad "a refusal that exits 0" "$out"
+
+# Past what one interactive line holds, argv is the only way left, as it is for
+# Claude Code. An mcpOAuth with enough servers is all it takes.
+out=$(kcw '
+BLOB["mcpOAuth"] = {"s%d" % i: {"accessToken": "x" * 40} for i in range(50)}
+ok, failed, written = m.live_write(BLOB, ["keychain"])
+assert ok, f"the write failed: {failed}"
+assert [a[1] for a, _ in CALLS] == ["add-generic-password"], f"calls: {[a[:2] for a, _ in CALLS]}"
+got = json.loads(ITEMS[(SVC, ME)].decode("utf-8"))
+assert got == BLOB, "the item holds something else"
+') && ok "a credential too long for one line falls back to argv, and still lands whole" \
+  || bad "oversized write" "$out"
+
+# A quote, backslash or newline in the account would change the -a word or cut the
+# command short, writing another account's item or one with no password.
+out=$(kcw '
+for name in ("ccd\"test", "ccd\\test", "ccd\ntest"):
+    os.environ["USER"] = name
+    ok, failed, written = m.live_write(BLOB, ["keychain"])
+    assert not ok and failed == ["keychain"], f"reported {ok, failed} for {name!r}"
+assert CALLS == [] and ITEMS == {(SVC, ME): OLD}, f"security ran: {[a[:2] for a, _ in CALLS]}"
+') && ok "an account name the line cannot carry is refused before security runs" \
+  || bad "unsafe account name" "$out"
+rm -rf "$FAKE/kcw" "$FAKE/kcw-fake.py"
+unset -f kcw
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
