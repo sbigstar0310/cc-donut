@@ -10,3 +10,8 @@ keys.env
 accounts/
 .credentials.json
 claude-creds-backup.json
+
+# Python writes bytecode next to the source when the suite imports bin/ccd-account
+# as a module; none of it belongs in the plugin (#77).
+__pycache__/
+*.pyc
