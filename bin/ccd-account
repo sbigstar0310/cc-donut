@@ -687,27 +687,38 @@ def active_name():
     answer, not a failure: callers must not fall back to the pointer then, or
     they would attribute this session's tokens to an account that does not own
     them."""
+    name, profiled = _signed_in()
+    if profiled and name and _pointer_name() != name:
+        # Self-heal after a /login, pointer only: ccd installed nothing. Decided
+        # again under the store lock: a swap that finished since the read above
+        # moved the pointer on purpose, and undoing it files the next backup under
+        # the wrong account (#73). A held lock is skipped, not waited for — a later
+        # call heals, and no reader should queue behind a swap to do it.
+        try:
+            with Lock(LOCK_FILE, wait=False):
+                name, profiled = _signed_in()
+                if profiled and name and _pointer_name() != name:
+                    active_set(name, stamp=False)
+        except (LockBusy, OSError):
+            pass
+    return name
+
+
+def _signed_in():
+    """active_name() without the repair: (account or None, whether the profile
+    answered)."""
     uuid, _, fetched_at = live_identity()
     # Strictly after, matching _bank_target(): equal stamps leave the order
     # undecidable, and swap_to() banks CREDENTIALS from this answer, so a tie
     # accepted here files one account's tokens under another.
     if uuid and fetched_at > _active_at():
-        for a in accounts_all():
-            if a.get("account_uuid") == uuid:
-                if _pointer_name() != a["name"]:
-                    try:
-                        # Self-heal: the user used /login. Pointer only — ccd
-                        # installed nothing, so it must not claim it did.
-                        active_set(a["name"], stamp=False)
-                    except OSError:
-                        pass
-                return a["name"]
-        return None            # signed into an account ccd does not know
-
+        # None: signed into an account ccd does not know.
+        return next((a["name"] for a in accounts_all()
+                     if a.get("account_uuid") == uuid), None), True
     # Either no identity is available (older Claude Code, unreadable config) or
     # the profile predates our swap and would answer with the account we just
     # left. The pointer is the better source in both cases.
-    return _pointer_name()
+    return _pointer_name(), False
 
 
 def active_set(name, stamp=True):
