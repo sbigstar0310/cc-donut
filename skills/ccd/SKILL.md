@@ -179,8 +179,10 @@ prices move and new models ship), do this:
   Anthropic usage endpoint it uses for spare accounts. Install claude-dashboard
   only for its own richer rows, which render above ccd's.
 - The statusline's `✓ Claude recovered` means a Claude 5-hour or 7-day quota
-  went from 100% to 0% after a reset. Then: `/exit`, and in the same terminal
-  `claude --resume`.
+  went from 100% to 0% after a reset AND every window the reading reports now
+  has room — the same bar the automatic return waits for, so the banner never
+  promises a return the hook would decline. Then: `/exit`, and in the same
+  terminal `claude --resume`.
 - Returning to the subscription is `/exit` then `claude --resume` in the same
   terminal. **Never `/logout`** — that genuinely logs the user out.
 - This path is officially unsupported by both Anthropic and OpenRouter. It can

@@ -166,8 +166,11 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
   restarts. Created by the first ccd of an outage and cleared automatically when
   a Claude quota reset is detected.
 - `✓ Claude recovered → /exit then claude --resume` — a Claude 5-hour or 7-day
-  quota went from exhausted (100%) to reset (0%). If both windows reset at the
-  same moment they merge into one notice. Shown once per reset.
+  quota went from exhausted (100%) to reset (0%), **and** every window the
+  current reading reports has room, which is the same thing the automatic return
+  waits for. A 5-hour window that came back while the weekly one is still spent
+  shows nothing: there would be nothing to go back to. If both windows reset at
+  the same moment they merge into one notice. Shown once per reset.
 
 ## Returning to the subscription
 
