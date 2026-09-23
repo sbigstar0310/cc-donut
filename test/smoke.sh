@@ -9158,5 +9158,148 @@ s39_done
 rm -f "$S39_HF" "$S39D/run-state.json" "$S39D/.usage-probe-backoff"
 unset -f s39_fixture s39_start s39_run s39_done
 
+head_ "40. the recovery banner reads every window"
+# #94. The banner is a promise — end this session and ccd takes you back — and it
+# was decided from recovery_notified_window alone: one window that had turned
+# over, with no reference to bin/spent-at and no look at the other window. Since
+# #93 the hook returns only when EVERY reported, unexpired window is below that
+# number, so a 5-hour reset beside a weekly window still at 100% had the row
+# promising a return the hook correctly declines — and the user ending a session
+# for nothing. The banner asks the hook's question, of the hook's own reading.
+S40D="$FAKE/.claude/ccd"
+S40_FUT=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=2)).isoformat())")
+S40_PAST=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=3)).isoformat())")
+S40_BANNER="✓ Claude recovered → 종료하면 구독으로 자동 복귀"
+# Each case seeds the whole world its row is drawn from: the reading, the record
+# beside it, and no dashboard at all — the dashboard's row is printed above ours,
+# and one left on disk by an earlier section would be read as this one's output.
+s40_fixture() { # $1=reading (empty: none on disk)  $2=run-state  [$3=age the reading by]
+  rm -rf "$FAKE/.claude/plugins/cache/claude-dashboard" \
+         "$FAKE/.claude/plugins/data/claude-dashboard-claude-dashboard" \
+         "$S40D/.dashboard-row" "$S40D/.dashboard-row.lock"
+  mkdir -p "$S40D"
+  rm -f "$S40D/quota-cache.json"
+  [ -n "$1" ] && printf '%s\n' "$1" > "$S40D/quota-cache.json"
+  printf '%s\n' "$2" > "$S40D/run-state.json"
+  [ -n "${3:-}" ] && python3 -c '
+import os, sys, time
+t = time.time() - int(sys.argv[2])
+os.utime(sys.argv[1], (t, t))' "$S40D/quota-cache.json" "$3"
+  return 0
+}
+# The row a ccd session renders. No model id in the payload: nothing here is about
+# the price half of the row, and naming a slug sends a price fetch out. CCD_HANDOFF
+# selects the supervised wording, the one that promises the return outright; the
+# unsupervised wording is checked once, in (a).
+s40_row() {
+  printf '%s' '{}' \
+    | CCD_ACTIVE=1 CCD_HANDOFF=00000000000000000000000000000002 HOME="$FAKE" \
+      "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g'
+}
+# The run-state of a recovered 5-hour window, as update_ccd_state leaves it. Only
+# the seven-day number differs between the cases below, and the reading beside it
+# is what the row must actually decide on.
+s40_state() { # $1=seven-day percent
+  printf '{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5,"recovery_notified_window":"five_hour","recovery_notified_reset":"%s","last_five_hour_percent":4,"last_five_hour_reset":"%s","last_seven_day_percent":%s,"last_seven_day_reset":"%s"}' \
+    "$S40_FUT" "$S40_FUT" "$1" "$S40_FUT"
+}
+
+# (a) The bug. The 5-hour window reset; the weekly one is still spent, so there is
+# nothing to go back to and the hook will not take this session back.
+s40_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S40_FUT\",\"sevenDayPercent\":100,\"sevenDayReset\":\"$S40_FUT\"}}" \
+  "$(s40_state 100)"
+row=$(s40_row)
+case "$row" in
+  *"$S40_BANNER"*) bad "promised a return the hook declines" "5-hour reset, weekly at 100%, row: $row" ;;
+  *"Claude recovered"*) bad "promised a return the hook declines" "in some other wording: $row" ;;
+  *) ok "a 5-hour reset beside a weekly window still at 100% promises no return" ;;
+esac
+# Withholding the promise is not blanking the row: everything else it carries is
+# still the only thing on screen during an outage.
+case "$row" in
+  *"run \$0.5000"*) ok "...and the rest of the row is untouched" ;;
+  *) bad "the row went with it" "got: $row" ;;
+esac
+row=$(printf '%s' '{}' | env -u CCD_HANDOFF CCD_ACTIVE=1 HOME="$FAKE" \
+        "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g')
+case "$row" in
+  *"Claude recovered"*) bad "promised a return the hook declines" "unsupervised wording: $row" ;;
+  *) ok "...and neither does the wording that tells an unsupervised user to walk back by hand" ;;
+esac
+
+# (b) Every window below spent-at: this is the state the banner exists for.
+s40_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S40_FUT\",\"sevenDayPercent\":31,\"sevenDayReset\":\"$S40_FUT\"}}" \
+  "$(s40_state 31)"
+row=$(s40_row)
+case "$row" in
+  *"$S40_BANNER"*) ok "every window below spent-at still shows the banner, word for word" ;;
+  *) bad "the banner stopped appearing" "got: $row" ;;
+esac
+# ...and the reading is a second condition, not a replacement for the first: room
+# with no reset recorded is not a recovery, and saying so would announce one on
+# every tick of an outage the subscription simply had headroom during.
+s40_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S40_FUT\",\"sevenDayPercent\":31,\"sevenDayReset\":\"$S40_FUT\"}}" \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"last_five_hour_percent\":4,\"last_five_hour_reset\":\"$S40_FUT\",\"last_seven_day_percent\":31,\"last_seven_day_reset\":\"$S40_FUT\"}"
+row=$(s40_row)
+case "$row" in
+  *"Claude recovered"*) bad "a reading with room is not a reset" "announced one with nothing recorded: $row" ;;
+  *) ok "...and room with no reset recorded still announces nothing" ;;
+esac
+
+# (c) The bar is spent-at, not a reserve below it (#57). 99% is still somewhere to
+# come back to, and a banner that waited for more would keep the user paying
+# beside a subscription they could be using.
+s40_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S40_FUT\",\"sevenDayPercent\":99,\"sevenDayReset\":\"$S40_FUT\"}}" \
+  "$(s40_state 99)"
+row=$(s40_row)
+case "$row" in
+  *"$S40_BANNER"*) ok "one point short of spent is still a place to come back to" ;;
+  *) bad "a reserve crept in below spent-at" "got: $row" ;;
+esac
+
+# (d) A window whose reset has passed says nothing about the quota that replaced
+# it — the same call expired() already makes everywhere else. 100% under a reset
+# in the past must not hold the promise back.
+s40_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S40_FUT\",\"sevenDayPercent\":100,\"sevenDayReset\":\"$S40_PAST\"}}" \
+  "$(s40_state 100)"
+row=$(s40_row)
+case "$row" in
+  *"$S40_BANNER"*) ok "...and a window that has already turned over is not counted against it" ;;
+  *) bad "held back by an expired window" "got: $row" ;;
+esac
+
+# (e) A promise needs a reading that is there, usable, and young enough to
+# describe now. The record beside it outlives the reading it came from, and the
+# last_*_percent written next to it carries no age bound at all (#94) — so a
+# memory of room is exactly what must not be enough. Each of these seeds one.
+s40_fixture "" "$(s40_state 31)"
+row=$(s40_row)
+case "$row" in
+  *"Claude recovered"*) bad "promised a return on no reading" "got: $row" ;;
+  *) ok "with no reading on disk the row promises nothing" ;;
+esac
+s40_fixture '{"claude":{"available":false,"error":true}}' "$(s40_state 31)"
+row=$(s40_row)
+case "$row" in
+  *"Claude recovered"*) bad "promised a return on an unusable reading" "got: $row" ;;
+  *) ok "...nor on one that could not be taken" ;;
+esac
+s40_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S40_FUT\",\"sevenDayPercent\":31,\"sevenDayReset\":\"$S40_FUT\"}}" \
+  "$(s40_state 31)" 7200
+row=$(s40_row)
+case "$row" in
+  *"Claude recovered"*) bad "promised a return on a stale reading" "got: $row" ;;
+  *) ok "...nor on one too old to describe the quota now" ;;
+esac
+
+rm -f "$S40D/run-state.json" "$S40D/quota-cache.json"
+unset -f s40_fixture s40_row s40_state
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
