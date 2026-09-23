@@ -9030,5 +9030,133 @@ n=$(grep -cxF "$S38_EXPORT" "$h/.zshrc")
 rm -rf "$FAKE"/s38.* "$FAKE"/s38bin.* "$FAKE"/s38nop.*
 unset -f s38_home s38_setup s38_claimed s38_brief
 
+head_ "39. the return from OpenRouter waits for every window"
+# v0.8.0 gave "spent" one meaning — bin/spent-at, on every window a reading
+# reports — for moving a session, for choosing where to move it and for deciding
+# to pay. The automatic return from the paid backbone was left behind on the old
+# per-window rule: one window that had turned over was enough. So a 5-hour reset
+# while the weekly window is still at 100% bought a relaunch out and a relaunch
+# back to arrive at the same wall within minutes, and with a short
+# HOP_RESET_SECONDS the launcher's `visited` guard can strand the session there.
+S39D="$FAKE/.claude/ccd"
+S39_HF="$S39D/handoff-00000000000000000000000000000002.json"
+S39_FUT=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=2)).isoformat())")
+S39_PAST=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=3)).isoformat())")
+# Every case seeds the whole world it is decided on. Nothing is registered, so the
+# escape-to-a-spare arm above this one never runs and what is armed here can only
+# have come from the recovery arm; and no refresh may replace the reading the case
+# is about, so the dashboard is gone and the probe is already backing off.
+s39_fixture() { # $1=reading  $2=run-state  [$3=seconds to age the reading by]
+  rm -rf "$S39D/accounts" "$S39D/readings" "$S39_HF" \
+         "$FAKE/.claude/plugins/cache/claude-dashboard"
+  mkdir -p "$S39D"
+  printf '%s\n' "$1" > "$S39D/quota-cache.json"
+  printf '%s\n' "$2" > "$S39D/run-state.json"
+  : > "$S39D/.usage-probe-backoff"
+  [ -n "${3:-}" ] && python3 -c '
+import os, sys, time
+t = time.time() - int(sys.argv[2])
+os.utime(sys.argv[1], (t, t))' "$S39D/quota-cache.json" "$3"
+  return 0
+}
+# A supervised session on the paid backbone, one prompt tick. The stand-in is what
+# a return would end, so whether it is still alive is the relaunch pair itself. It
+# is started outside s39_run because a case that reads the hook's stdout runs that
+# in a subshell, and a pid recorded there would not survive it.
+s39_start() { "$FAKE/sigbin/claude" 8 2>/dev/null & S39_PID=$!; sleep 0.3; }
+s39_run() { # $1=session id ; stdout is the hook's own
+  printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"UserPromptSubmit"}' "$1" \
+    | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
+      CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$S39_HF" \
+      CLAUDE_PID=$S39_PID CCD_STANDIN_PID=$S39_PID \
+      "$ROOT/scripts/quota-guard.sh" UserPromptSubmit 2>/dev/null
+  sleep 0.3
+}
+s39_done() { kill -9 "$S39_PID" 2>/dev/null; wait "$S39_PID" 2>/dev/null; }
+set +m 2>/dev/null
+
+# (a) The bug. The 5-hour window has reset and the weekly one is still spent, so
+# the subscription cannot take this session: returning to it lands back here.
+s39_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S39_FUT\",\"sevenDayPercent\":100,\"sevenDayReset\":\"$S39_FUT\"}}" \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"recovery_notified_window\":\"five_hour\",\"recovery_notified_reset\":\"$S39_FUT\",\"last_five_hour_percent\":100,\"last_five_hour_reset\":\"$S39_FUT\",\"last_seven_day_percent\":100,\"last_seven_day_reset\":\"$S39_FUT\"}"
+s39_start
+S39_OUT=$(s39_run sess-s39a)
+[ -z "$(hf_get armed)" ] \
+  && ok "a 5-hour reset beside a weekly window that is still spent arms no return" \
+  || bad "returned to a spent subscription" "armed=$(hf_get armed) direction=$(hf_get direction)"
+if kill -0 "$S39_PID" 2>/dev/null; then ok "...and the session is not ended for a relaunch pair that lands at the same wall"
+else bad "wasted relaunch" "ended the session to go back to an account with no room"; fi
+case "$S39_OUT" in
+  *"usable again"*) bad "premature recovery notice" "told the user the subscription is usable: $(printf '%s' "$S39_OUT" | tr '\n' ' ' | head -c 140)" ;;
+  *) ok "...and never says the subscription is usable again while a window is spent" ;;
+esac
+s39_done
+
+# (b) Both windows below the one number: this is what the return is for.
+s39_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S39_FUT\",\"sevenDayPercent\":31,\"sevenDayReset\":\"$S39_FUT\"}}" \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"recovery_notified_window\":\"five_hour\",\"recovery_notified_reset\":\"$S39_FUT\",\"last_five_hour_percent\":4,\"last_five_hour_reset\":\"$S39_FUT\",\"last_seven_day_percent\":31,\"last_seven_day_reset\":\"$S39_FUT\"}"
+s39_start
+s39_run sess-s39b >/dev/null
+[ "$(hf_get direction)" = "to_subscription" ] \
+  && ok "every window below spent-at still arms the plain return" \
+  || bad "return never armed" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s39_done
+
+# ...and the bar is spent-at, not a reserve below it. 99% is still somewhere to
+# come back to (has_headroom), and a return that waited for more would keep the
+# session on a paid backbone with a subscription sitting there unused.
+s39_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S39_FUT\",\"sevenDayPercent\":99,\"sevenDayReset\":\"$S39_FUT\"}}" \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"recovery_notified_window\":\"five_hour\",\"recovery_notified_reset\":\"$S39_FUT\",\"last_five_hour_percent\":4,\"last_five_hour_reset\":\"$S39_FUT\",\"last_seven_day_percent\":99,\"last_seven_day_reset\":\"$S39_FUT\"}"
+s39_start
+s39_run sess-s39b2 >/dev/null
+[ "$(hf_get direction)" = "to_subscription" ] \
+  && ok "...and one point short of spent is still a destination, not a reserve" \
+  || bad "reserve crept back" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s39_done
+
+# (c) A window whose reset time has passed says nothing about the quota that
+# replaced it — the rule `expired()` already applies to the peak the hook decides
+# everything else on. 100% under a reset that is in the past must not hold the
+# session on the paid backbone.
+s39_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S39_FUT\",\"sevenDayPercent\":100,\"sevenDayReset\":\"$S39_PAST\"}}" \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"recovery_notified_window\":\"five_hour\",\"recovery_notified_reset\":\"$S39_FUT\",\"last_five_hour_percent\":4,\"last_five_hour_reset\":\"$S39_FUT\",\"last_seven_day_percent\":100,\"last_seven_day_reset\":\"$S39_PAST\"}"
+s39_start
+s39_run sess-s39c >/dev/null
+[ "$(hf_get direction)" = "to_subscription" ] \
+  && ok "...and a window that has already turned over is not counted against it" \
+  || bad "held by an expired window" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s39_done
+
+# (d) No reading is not a reading that says yes. A recovery recorded on an earlier
+# tick outlives the reading it came from, so the arm has to be checked against a
+# reading that is there, usable and young enough to describe now.
+s39_fixture \
+  '{"claude":{"available":false,"error":true}}' \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"recovery_notified_window\":\"five_hour\",\"recovery_notified_reset\":\"$S39_FUT\",\"last_five_hour_percent\":4,\"last_five_hour_reset\":\"$S39_FUT\",\"last_seven_day_percent\":31,\"last_seven_day_reset\":\"$S39_FUT\"}"
+s39_start
+s39_run sess-s39d >/dev/null
+[ -z "$(hf_get armed)" ] \
+  && ok "a reading that cannot be read arms nothing" \
+  || bad "returned on no reading" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s39_done
+
+s39_fixture \
+  "{\"claude\":{\"available\":true,\"error\":false,\"fiveHourPercent\":4,\"fiveHourReset\":\"$S39_FUT\",\"sevenDayPercent\":31,\"sevenDayReset\":\"$S39_FUT\"}}" \
+  "{\"started_at\":\"t\",\"baseline_usage_usd\":0,\"ccd_spend_usd\":0.5,\"recovery_notified_window\":\"five_hour\",\"recovery_notified_reset\":\"$S39_FUT\",\"last_five_hour_percent\":4,\"last_five_hour_reset\":\"$S39_FUT\",\"last_seven_day_percent\":31,\"last_seven_day_reset\":\"$S39_FUT\"}" \
+  7200
+s39_start
+s39_run sess-s39e >/dev/null
+[ -z "$(hf_get armed)" ] \
+  && ok "...and neither does one too old to describe the quota now" \
+  || bad "returned on a stale reading" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s39_done
+
+rm -f "$S39_HF" "$S39D/run-state.json" "$S39D/.usage-probe-backoff"
+unset -f s39_fixture s39_start s39_run s39_done
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -1081,6 +1081,26 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": os.environ["EVENT"],
     ab=$(ccd_account_bin) && ("$ab" --no-color pick >/dev/null 2>&1 &) || true
   fi
 
+  # One window that has turned over does not make the subscription usable. "Spent"
+  # has one meaning for the whole of ccd — SPENT_AT, on EVERY window a reading
+  # reports — and the way back has to meet it on all of them, not on whichever one
+  # happened to reset. A 5-hour reset while the weekly window is still at 100%
+  # buys a relaunch out and a relaunch back to arrive at the same wall minutes
+  # later, and with a short HOP_RESET_SECONDS the launcher's `visited` guard can
+  # then strand the session instead of bringing it home.
+  #
+  # read_peak is this hook's has_headroom: the maximum over every window the
+  # reading reports that is not known to have turned over (expired), or empty when
+  # the reading is missing, unusable or too old to describe now. Empty is not a
+  # yes — the recovery record outlives the reading it came from, and nothing here
+  # may end a session on a memory. The detection above (prior >= 95) only says a
+  # reset happened; this says whether it left anything to come back to.
+  read_peak
+  case "$peak" in
+    ''|*[!0-9]*) exit 0 ;;
+    *) [ "$peak" -lt "$SPENT_AT" ] || exit 0 ;;
+  esac
+
   # AUTO is on only when the launcher is supervising this process; without it the
   # advice below must keep naming the manual commands, since nothing will relaunch.
   # Auto return needs the same readiness as the outbound trip: a supervising
