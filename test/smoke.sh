@@ -5651,14 +5651,41 @@ kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 # store holding the credential we meant to leave. Only the credential's own
 # identity can settle that: a plan is not an account, and two accounts on one plan
 # (which is what this fixture is) agree about every plan field there is.
-"$FAKE/sigbin/claude" 8 2>/dev/null & SWPID=$!
-sleep 0.3
+#
+# The write-back has to land in one window: after the swap wrote the store, and
+# before the confirmation read it. A background `sleep 0.7` guessed at that
+# window off the clock and lost it twice in CI (#88) — the hook is three Python
+# starts away from the swap, and on a runner that takes longer over them the
+# revert lands INSIDE the swap and is overwritten, which confirms and wakes.
+# So the revert is not timed at all: the ccd-account the hook resolves does it,
+# at the one point in the sequence where it belongs. `swap` records that the
+# credential moved; the `current --json` that confirms it puts the outgoing blob
+# back first and then hands the read to the real ccd-account, which still
+# decides the question on the store's actual contents. Ordering by construction,
+# on any machine, at any speed.
+mkdir -p "$FAKE/revertroot/bin"
+cat > "$FAKE/revertroot/bin/ccd-account" <<'REOF'
+#!/bin/sh
+for a in "$@"; do
+  [ "$a" = swap ] && { "$CCD_REAL_ACCOUNT" "$@"; rc=$?; : > "$HOME/.swap-done"; exit "$rc"; }
+done
+case " $* " in
+  *" current --json "*)
+    [ -e "$HOME/.swap-done" ] && cp "$HOME/.creds-before" "$SW_LIVE_CREDS" ;;
+esac
+exec "$CCD_REAL_ACCOUNT" "$@"
+REOF
+chmod +x "$FAKE/revertroot/bin/ccd-account"
+export CCD_REAL_ACCOUNT="$ACCT" SW_LIVE_CREDS="$CREDS"
+# Long-lived on purpose: `kill -0` below means "nothing signalled it", and only
+# a stand-in that cannot age out mid-block says that rather than how long the
+# block took. At `claude 8` the check ran with 2.1s to spare here and 1.1s under
+# load — the second half of #88's CI failure.
+"$FAKE/sigbin/claude" 60 2>/dev/null & SWPID=$!
 sw_fixture 58 100
 cp "$CREDS" "$FAKE/.creds-before"            # the outgoing account's live blob
-( sleep 0.7; cp "$FAKE/.creds-before" "$CREDS" ) &
-REVERT=$!
-rc=$(SW_SETTLE=2 sw_stopfail sess-sw9)
-wait "$REVERT" 2>/dev/null
+rm -f "$FAKE/.swap-done"
+rc=$(SW_ROOT="$FAKE/revertroot" sw_stopfail sess-sw9)
 [ "$rc" != "2" ] \
   && ok "a live store that no longer holds the credential we installed wakes nothing" \
   || bad "unconfirmed wake" "woke the session into the account it had just left"
@@ -5669,16 +5696,15 @@ wait "$REVERT" 2>/dev/null
 paid_optin_on
 sw_fixture 58 100
 cp "$CREDS" "$FAKE/.creds-before"
-( sleep 0.7; cp "$FAKE/.creds-before" "$CREDS" ) &
-REVERT=$!
-rc=$(SW_SETTLE=2 sw_stopfail sess-sw9b)
-wait "$REVERT" 2>/dev/null
+rm -f "$FAKE/.swap-done"
+rc=$(SW_ROOT="$FAKE/revertroot" sw_stopfail sess-sw9b)
 [ ! -f "$SWD/handoff-00000000000000000000000000000002.json" ] \
   && ok "...and arms no paid hop off a confirmation that failed" \
   || bad "unconfirmed paid hop" "armed $(hf_get direction) after a swap it could not confirm"
 if kill -0 "$SWPID" 2>/dev/null; then ok "...nor ends the session over one"
 else bad "unconfirmed paid hop" "signalled a session whose swap had already happened"; fi
 paid_optin_off
+unset SW_LIVE_CREDS
 kill -9 "$SWPID" 2>/dev/null; wait "$SWPID" 2>/dev/null
 
 # ── The wake has to be registered, and has to read like something ccd said ──
@@ -7141,7 +7167,7 @@ case "$out" in
 esac
 
 rm -rf "$ADIR" "$RQD" "$SWD/swapped-windows" "$SWD/accounts-keepalive" \
-       "$FAKE/.sw-out" "$FAKE/.sw-err" "$FAKE/.creds-before"
+       "$FAKE/.sw-out" "$FAKE/.sw-err" "$FAKE/.creds-before" "$FAKE/.swap-done"
 hf_reset
 unset CCD_USAGE_URL CCD_TOKEN_URL
 unset -f sw_hook sw_fixture sw_fixture3 sw_prompt sw_stopfail
