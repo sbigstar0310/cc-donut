@@ -10,8 +10,9 @@ trap 'rm -rf "$FAKE" 2>/dev/null || true' EXIT
 export HOME="$FAKE"
 # CLAUDE_CONFIG_DIR outranks HOME everywhere ccd looks, so an inherited one would
 # send fixture writes to the developer's real configuration. Cases that test it
-# set it themselves.
-unset CLAUDE_CONFIG_DIR
+# set it themselves. CLAUDE_SECURESTORAGE_CONFIG_DIR outranks both for where
+# Claude Code keeps its credential locks, which a swap takes.
+unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR
 # The suite imports bin/ccd-account as a module; Python would otherwise leave its
 # bytecode in bin/, and one such file shipped in v0.8.0 (#77).
 export PYTHONDONTWRITEBYTECODE=1
@@ -8582,6 +8583,310 @@ assert CALLS == [] and ITEMS == {(SVC, ME): OLD}, f"security ran: {[a[:2] for a,
   || bad "unsafe account name" "$out"
 rm -rf "$FAKE/kcw" "$FAKE/kcw-fake.py"
 unset -f kcw
+
+head_ "37. a swap waits for Claude Code's own credential locks"
+# Claude Code refreshes a token under locks of its own — directories, in this
+# order: <cfg>/.oauth_refresh.lock, <realpath(cfg)>.lock, and <cfg>/.storage-write.lock
+# around the save — and the save is a compare-and-swap: if the stored refresh token
+# is no longer the one it spent, it writes nothing. A swap that banks the outgoing
+# credential mid-refresh banks the token the server has just retired, installs the
+# next account, and Claude Code then throws the rotated one away: the account comes
+# back needing /login (#67). Every case has a HOME of its own, where a is signed in
+# (by the pointer) and b is a spare with a fresh reading.
+cl_home() { # $1=case -> its HOME
+  local h="$FAKE/cl-$1"
+  rm -rf "$h"; mkdir -p "$h/.claude/ccd/accounts" "$h/.claude/ccd/readings"
+  python3 - "$h" <<'PY'
+import json, os, sys, time
+h = sys.argv[1]
+cfg = os.path.join(h, ".claude")
+ms = int(time.time() * 1000)
+def put(p, obj):
+    with open(p, "w") as f:
+        f.write(obj if isinstance(obj, str) else json.dumps(obj))
+    os.chmod(p, 0o600)
+def oauth(tag):
+    return {"accessToken": "AT-" + tag, "refreshToken": "RT-" + tag,
+            "expiresAt": ms + 3600000, "subscriptionType": "max"}
+for i, n in enumerate(("a", "b")):
+    put(os.path.join(cfg, "ccd", "accounts", n + ".json"), {
+        "name": n, "account_uuid": "uuid-" + n, "priority": i + 1, "storage": "file",
+        "claudeAiOauth": oauth(n + "-stored"), "added_at": ms // 1000})
+put(os.path.join(cfg, "ccd", "accounts", ".active"), "a\n")
+put(os.path.join(cfg, "ccd", "accounts", ".active-at"), f"{ms}\n")
+put(os.path.join(cfg, ".credentials.json"), {"claudeAiOauth": oauth("a-live")})
+put(os.path.join(cfg, "ccd", "readings", "b.json"), {
+    "status": "ok", "checked_at": ms // 1000, "uuid": "uuid-b",
+    "five_hour_percent": 10, "seven_day_percent": 10})
+PY
+  printf '%s' "$h"
+}
+# Its three locks, placed as a stand-in would leave them: $2..$4 are the ages in
+# seconds of refresh, legacy and write ("-" for none; negative is the future).
+cl_locks() { # $1=HOME $2 $3 $4
+  python3 - "$@" <<'PY'
+import os, sys, time
+cfg = os.path.join(sys.argv[1], ".claude")
+paths = (os.path.join(cfg, ".oauth_refresh.lock"), os.path.realpath(cfg) + ".lock",
+         os.path.join(cfg, ".storage-write.lock"))
+now = time.time()
+for p, age in zip(paths, sys.argv[2:]):
+    if age != "-":
+        os.mkdir(p)
+        os.utime(p, (now - float(age), now - float(age)))
+PY
+}
+# ccd-account with a HOME and a hard limit: prints "<exit code|timeout> <seconds>",
+# and leaves its stderr in $HOME/.err.
+cl_run() { # $1=HOME $2=seconds allowed, then the arguments
+  python3 - "$ROOT/bin/ccd-account" "$@" <<'PY'
+import os, subprocess, sys, time
+acct, home, limit, args = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4:]
+t = time.time()
+with open(os.path.join(home, ".err"), "w") as err:
+    try:
+        rc = subprocess.run([acct, "--no-color"] + args, env=dict(os.environ, HOME=home),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=err, timeout=limit).returncode
+    except subprocess.TimeoutExpired:
+        rc = "timeout"
+print(rc, round(time.time() - t, 1))
+PY
+}
+# Assertions about a HOME's end state -> the one that failed, if any.
+cl_py() { # $1=HOME $2=python; RC and SECS are cl_run's answer
+  RC="${rc:-}" SECS="${secs:-0}" python3 -c '
+import json, os, sys, time
+H = sys.argv[1]
+RC, SECS = os.environ["RC"], float(os.environ["SECS"])
+cfg = os.path.join(H, ".claude")
+REFRESH, LEGACY = os.path.join(cfg, ".oauth_refresh.lock"), os.path.realpath(cfg) + ".lock"
+WRITE = os.path.join(cfg, ".storage-write.lock")
+def rt(n):
+    return json.load(open(os.path.join(cfg, "ccd", "accounts", n + ".json")))["claudeAiOauth"]["refreshToken"]
+def live():
+    return json.load(open(os.path.join(cfg, ".credentials.json")))["claudeAiOauth"]["accessToken"]
+def err():
+    return open(os.path.join(H, ".err")).read().replace("\n", " ")
+def untouched():
+    assert live() == "AT-a-live", f"the live store moved to {live()}"
+    a = rt("a")
+    assert a == "RT-a-stored", f"a was banked: {a}"
+    assert not os.path.exists(os.path.join(cfg, "ccd", "store-split")), "a stop was recorded"
+def age(p):
+    return time.time() - os.lstat(p).st_mtime
+'"$2" "$1" 2>&1 | tail -1
+}
+# In-process, for what only a spy can see: every mkdir of a lock, in order, with
+# the locks that already existed at that moment.
+CL_PRE='
+import importlib.machinery, importlib.util, json, os, sys, threading, time
+H = os.environ["HOME"] = sys.argv[2]
+loader = importlib.machinery.SourceFileLoader("ccdcl", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(m)
+def canon(p):              # one spelling per place: the legacy lock is named by a realpath
+    return os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
+def cc_locks(cfg):
+    return [canon(os.path.join(cfg, ".oauth_refresh.lock")), canon(os.path.realpath(cfg) + ".lock"),
+            canon(os.path.join(cfg, ".storage-write.lock"))]
+DEFAULT = cc_locks(os.path.join(H, ".claude"))
+TOOK, TRIED = [], []
+real_mkdir = os.mkdir
+def spy(p, *a, **k):
+    c = canon(os.fspath(p))
+    lock = c.endswith(".lock")
+    if lock:
+        TRIED.append((c, [q for q in DEFAULT if os.path.isdir(q)]))
+    real_mkdir(p, *a, **k)
+    if lock:
+        TOOK.append(c)
+os.mkdir = spy
+def live():
+    return json.load(open(m.credentials_file()))["claudeAiOauth"]["accessToken"]
+'
+
+# The regression. A stand-in Claude Code is mid-refresh of a: it holds the refresh
+# locks, and when its request answers it saves a′ under the write lock — only if the
+# store still holds the token it spent, as Claude Code does. `use b` arrives while it
+# waits on the server.
+H=$(cl_home race)
+cat > "$H/.standin.py" <<'PY'
+import json, os, sys, time
+h = sys.argv[1]
+cfg = os.path.join(h, ".claude")
+refresh, legacy = os.path.join(cfg, ".oauth_refresh.lock"), os.path.realpath(cfg) + ".lock"
+write, creds = os.path.join(cfg, ".storage-write.lock"), os.path.join(cfg, ".credentials.json")
+os.mkdir(refresh); os.mkdir(legacy)
+open(os.path.join(h, ".cc-holds"), "w").close()
+time.sleep(1.5)                                  # the server rotates a's refresh token
+end = time.time() + 10
+while True:
+    try:
+        os.mkdir(write); break
+    except FileExistsError:
+        if time.time() > end:
+            sys.exit("the write lock never came free")
+        time.sleep(0.05)
+blob = json.load(open(creds))
+if blob["claudeAiOauth"]["refreshToken"] == "RT-a-live":
+    blob["claudeAiOauth"] = {"accessToken": "AT-a-rotated", "refreshToken": "RT-a-rotated",
+                             "expiresAt": int(time.time() * 1000) + 3600000}
+    with open(creds + ".tmp", "w") as f:
+        json.dump(blob, f)
+    os.replace(creds + ".tmp", creds)
+    print("saved")
+else:
+    print("adopted")                             # somebody else's login is there: keep it
+os.rmdir(write); os.rmdir(legacy); os.rmdir(refresh)
+PY
+python3 "$H/.standin.py" "$H" > "$H/.cc-out" 2>&1 & CC=$!
+n=0; while [ ! -e "$H/.cc-holds" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n+1)); done
+read -r rc secs <<< "$(cl_run "$H" 15 use b --force)"
+wait "$CC" 2>/dev/null
+out=$(cl_py "$H" '
+assert live() == "AT-b-stored", f"the swap did not happen: {err()[:160]}"
+a = rt("a")
+assert a == "RT-a-rotated", f"a was banked as {a}; the rotated token was thrown away"
+left = [p for p in (REFRESH, LEGACY, WRITE) if os.path.lexists(p)]
+assert not left, f"left behind: {left}"
+') && ok "a refresh in flight finishes first, and the swap banks the token it produced" \
+  || bad "banked a spent token" "$out (stand-in: $(cat "$H/.cc-out"))"
+
+# The order is Claude Code's, and nothing is held while the refresh lock is awaited:
+# a write lock held there would make Claude Code's own save fail, and lose a′.
+H=$(cl_home order)
+out=$(python3 -c "$CL_PRE"'
+R, L, W = DEFAULT
+real_mkdir(R)                                    # Claude Code is mid-refresh
+def done():
+    time.sleep(0.5)
+    os.rmdir(R)
+threading.Thread(target=done).start()
+m.swap_to("b", force=True)
+assert live() == "AT-b-stored", "the swap did not happen"
+names = {R: "refresh", L: "legacy", W: "write"}
+assert [names.get(c, c) for c in TOOK] == ["refresh", "legacy", "write"], \
+    f"took {[names.get(c, c) for c in TOOK]}"
+waits = [held for c, held in TRIED if c == R]
+assert len(waits) > 1, f"never waited on the refresh lock: {TRIED}"
+assert not [h for h in waits if L in h or W in h], "held a lock while waiting on the refresh lock"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "the locks are taken in Claude Code's order, none held while the refresh lock is awaited" \
+  || bad "lock order" "$out"
+
+# A lock is abandoned once older than its window: 60s for the refresh pair, 15s for
+# the write lock. One taken over is released like any other.
+H=$(cl_home stale)
+cl_locks "$H" 90 90 20
+read -r rc secs <<< "$(cl_run "$H" 15 use b --force)"
+out=$(cl_py "$H" '
+assert live() == "AT-b-stored", f"the swap did not happen: {err()[:160]}"
+left = [p for p in (REFRESH, LEGACY, WRITE) if os.path.lexists(p)]
+assert not left, f"left behind: {left}"
+') && ok "stale locks are taken over, by each one's own window, and the swap proceeds" \
+  || bad "stale locks" "$out"
+
+# Held past the caller's deadline: nothing is written and the attempt fails, in time
+# for the hook's retry. A 20s-old refresh lock is fresh by its own 60s window.
+H=$(cl_home held)
+cl_locks "$H" 20 - -
+read -r rc secs <<< "$(cl_run "$H" 10 swap --from a --window x --no-probe --deadline 1)"
+out=$(cl_py "$H" '
+assert RC == "4", f"exit {RC} after {SECS}s: {err()[:160]}"
+assert SECS <= 4, f"took {SECS}s on a 1s deadline"
+untouched()
+assert os.path.isdir(REFRESH) and age(REFRESH) > 15, "the held lock was removed or touched"
+assert not os.path.lexists(LEGACY) and not os.path.lexists(WRITE), "a lock was left behind"
+assert ".oauth_refresh.lock" in err(), f"the reason names no lock: {err()[:160]}"
+') && ok "a lock held past the deadline fails the attempt in time, having written nothing" \
+  || bad "deadline" "$out"
+
+# A failure after the locks were taken still releases every one of them, and the
+# write it failed was made under all three.
+H=$(cl_home fail)
+out=$(python3 -c "$CL_PRE"'
+under = []
+real_write = m.write_json
+def failing(p, obj, mode=0o600):
+    if str(p) == m.credentials_file():
+        under.append([os.path.isdir(q) for q in DEFAULT])
+        raise OSError("disk full")
+    return real_write(p, obj, mode)
+m.write_json = failing
+try:
+    m.swap_to("b", force=True)
+    raise AssertionError("a failed write reported success")
+except SystemExit:
+    pass
+assert under == [[True, True, True]], f"the write was made under {under}"
+left = [q for q in DEFAULT if os.path.lexists(q)]
+assert not left, f"left behind: {left}"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "the live store is written under all three, and they are released when it fails" \
+  || bad "locks after a failure" "$out"
+
+# Claude Code's own lock bugs are not ccd's to repair. A lock dated in the future
+# never goes stale for Claude Code (anthropics/claude-code#95739), so it is held
+# here too; a lock left as a FILE (#95425) is nobody's lock, and the swap refuses at
+# once rather than wait out a lock that cannot be taken. Neither is deleted.
+H=$(cl_home future)
+cl_locks "$H" -3600 - -
+read -r rc secs <<< "$(cl_run "$H" 10 swap --from a --window x --no-probe --deadline 1)"
+out=$(cl_py "$H" '
+assert RC == "4", f"exit {RC} after {SECS}s: {err()[:160]}"
+untouched()
+assert os.path.isdir(REFRESH) and age(REFRESH) < -3000, "the future-dated lock was removed or touched"
+assert ".oauth_refresh.lock" in err() and "future" in err(), f"the reason: {err()[:200]}"
+') && ok "a lock dated in the future is held, not deleted, and the reason says so" \
+  || bad "future-dated lock" "$out"
+
+H=$(cl_home file)
+printf 'not a lock' > "$H/.claude/.storage-write.lock"
+read -r rc secs <<< "$(cl_run "$H" 15 use b --force)"
+out=$(cl_py "$H" '
+assert RC not in ("0", "timeout"), f"exit {RC}"
+assert SECS < 4, f"waited {SECS}s on a lock that can never be taken"
+untouched()
+assert open(WRITE).read() == "not a lock", "the file was changed or removed"
+assert not os.path.lexists(REFRESH) and not os.path.lexists(LEGACY), "a lock was left behind"
+assert ".storage-write.lock" in err(), f"the reason names no path: {err()[:160]}"
+') && ok "a lock left as a file refuses the swap at once, naming it, and stays as it was" \
+  || bad "lock left as a file" "$out"
+
+# The locks live where Claude Code keeps its credentials:
+# CLAUDE_SECURESTORAGE_CONFIG_DIR, then CLAUDE_CONFIG_DIR, then ~/.claude — and the
+# legacy one is named after the realpath. A directory that does not exist holds no
+# store to guard, and ccd does not create it.
+H=$(cl_home dirs)
+mkdir -p "$H/real" "$H/sec"; ln -s "$H/real" "$H/link"
+out=$(python3 -c "$CL_PRE"'
+def case(env, want):
+    for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        os.environ.pop(k, None)
+    os.environ.update(env)
+    with open(m.credentials_file(), "w") as f:
+        json.dump({"claudeAiOauth": {"accessToken": "AT-a-live", "refreshToken": "RT-a-live"}}, f)
+    with open(os.path.join(m.ACCOUNTS_DIR, ".active"), "w") as f:
+        f.write("a\n")
+    del TOOK[:]
+    m.swap_to("b", force=True)
+    assert live() == "AT-b-stored", f"{env}: the swap did not happen"
+    if want is not None:
+        assert TOOK == want, f"{env}: took {TOOK}, not {want}"
+    left = [q for q in set(TOOK) | set(want or []) if os.path.lexists(q)]
+    assert not left, f"{env}: left behind {left}"
+case({"CLAUDE_CONFIG_DIR": H + "/link"}, cc_locks(H + "/link"))
+assert canon(os.path.realpath(H + "/link") + ".lock") in TOOK, "the legacy lock ignored the realpath"
+case({"CLAUDE_CONFIG_DIR": H + "/real", "CLAUDE_SECURESTORAGE_CONFIG_DIR": H + "/sec"}, cc_locks(H + "/sec"))
+case({"CLAUDE_CONFIG_DIR": H + "/real", "CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}, DEFAULT)
+case({"CLAUDE_CONFIG_DIR": H + "/real", "CLAUDE_SECURESTORAGE_CONFIG_DIR": H + "/nowhere"}, None)
+assert not os.path.lexists(H + "/nowhere"), "created a config directory"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "the locks follow CLAUDE_SECURESTORAGE_CONFIG_DIR, then CLAUDE_CONFIG_DIR, as Claude Code's do" \
+  || bad "lock location" "$out"
+rm -rf "$FAKE"/cl-*
+unset -f cl_home cl_locks cl_run cl_py
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -36,6 +36,7 @@ Commands:
 """
 
 import argparse
+import contextlib
 import datetime
 import errno
 import hashlib
@@ -46,6 +47,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -599,6 +601,121 @@ def live_write(blob, sources):
         except Exception:
             failed.append("file")
     return (bool(targets) and not failed), failed, written
+
+
+# Claude Code refreshes a token under locks of its own, and its save is a
+# compare-and-swap: when the stored refresh token is no longer the one it spent,
+# it writes nothing. A swap that banked the outgoing credential mid-refresh banked
+# a token the server had just retired, and the rotated one was then thrown away —
+# that account came back needing /login (#67). Taking the same locks in the same
+# order lets the refresh finish first, so what the swap reads is what it produced.
+#
+# Claude Code's internal protocol, not a contract: its bundled proper-lockfile, as
+# 2.1.273–2.1.278 use it. A lock is a directory made with mkdir, its holder keeps
+# the mtime fresh, and one older than its stale window was abandoned. Should the
+# names change, these guard nothing — which is where ccd stood before.
+def claude_code_locks_at():
+    """(path, stale seconds), in the order Claude Code's refresh takes them."""
+    cfg = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    cfg = (claude_config_dir() if cfg is None else cfg) or os.path.join(
+        os.path.expanduser("~"), ".claude")
+    return ((os.path.join(cfg, ".oauth_refresh.lock"), 60),   # around the request
+            (os.path.realpath(cfg) + ".lock", 60),            # its older name
+            (os.path.join(cfg, ".storage-write.lock"), 15))   # around every write
+
+
+def _claude_code_lock(path, stale, deadline):
+    """mkdir `path` by `deadline`, or die. False when its directory does not
+    exist: no store lives there to guard, and ccd does not create it.
+
+    Nothing that is not ours is deleted but what Claude Code would take over
+    itself. A lock dated in the future never goes stale for Claude Code
+    (anthropics/claude-code#95739), so it is held here too; one left as a file is
+    nobody's lock (#95425), and waiting could never take it."""
+    try:
+        while True:
+            try:
+                os.mkdir(path)
+                return True
+            except FileExistsError:
+                pass
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue                        # released between the two calls
+            if not stat.S_ISDIR(st.st_mode):
+                die(f"{_tilde(path)} is a file, not a lock — Claude Code cannot save "
+                    "a login past it (anthropics/claude-code#95425). Nothing was "
+                    "changed; remove it and try again")
+            age = time.time() - st.st_mtime
+            if age > stale:
+                try:
+                    os.rmdir(path)              # abandoned, by Claude Code's own rule
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                if age < -2:                    # proper-lockfile itself dates ~1s ahead
+                    die(f"{_tilde(path)} is dated in the future and never goes stale "
+                        "(anthropics/claude-code#95739). Nothing was changed; remove "
+                        "it if no Claude Code is signing in")
+                die(f"Claude Code is holding {_tilde(path)}; nothing was changed — "
+                    "try again")
+            time.sleep(0.1)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        die(f"cannot take Claude Code's lock {_tilde(path)} ({e.strerror}); "
+            "nothing was changed")
+
+
+@contextlib.contextmanager
+def claude_code_locks(deadline):
+    """Hold Claude Code's credential locks around a read and write of the live
+    store: all of them, taken by `deadline`, or die() having written nothing.
+
+    Only the refresh lock is ever waited on with nothing held, so Claude Code's
+    own save never finds the write lock taken by somebody waiting on it.
+
+    Released in the finally, die() included, and only while still ours. A
+    SIGKILL leaves them behind; Claude Code takes them over once stale, so its
+    refresh is held off for up to a minute."""
+    held = {}                                   # path -> the mtime we gave it
+    stop = threading.Event()
+
+    def ours(p):
+        try:
+            return os.lstat(p).st_mtime_ns == held[p]
+        except OSError:
+            return False
+
+    def keep_fresh():
+        # A keychain call may take its full 15s, past the write lock's window;
+        # Claude Code's holders touch theirs every 5s, and so does this.
+        while not stop.wait(5):
+            for p in [p for p in list(held) if ours(p)]:
+                try:
+                    os.utime(p)
+                    held[p] = os.lstat(p).st_mtime_ns
+                except OSError:
+                    pass
+
+    keeper = threading.Thread(target=keep_fresh, daemon=True)
+    keeper.start()
+    try:
+        for path, stale in claude_code_locks_at():
+            if _claude_code_lock(path, stale, deadline):
+                held[path] = os.lstat(path).st_mtime_ns
+        yield
+    finally:
+        stop.set()
+        keeper.join()
+        for p in reversed(list(held)):
+            if ours(p):
+                try:
+                    os.rmdir(p)
+                except OSError:
+                    pass
 
 
 # ── Account store ────────────────────────────────────────────────────────────
@@ -1461,14 +1578,16 @@ def swap_guard_record(name, window):
 
 
 
-def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
+def swap_to(name, force=False, deadline=None):
     """Replace only the claudeAiOauth subtree of the live blob.
 
     Called with a session live and mid-turn: the quota hook swaps in place (#57).
-    No coordination is needed even so — Claude Code reads this store per request
-    and writes it only when it rotates a token, and the write is atomic either
-    way. Measured: a swapped session kept working for 16.9 hours across two
-    refreshes without a restart.
+    Claude Code reads this store per request and writes it only when it rotates a
+    token. Measured: a swapped session kept working for 16.9 hours across two
+    refreshes without a restart. The one coordination it needs is Claude Code's
+    own locks, held from the first read of the live store to the last check of it
+    (claude_code_locks), so a rotation in flight lands before the backup reads.
+    `deadline` bounds every wait for a lock, ours and Claude Code's alike.
 
     Returns (account, installed credential, replaced credential). The first names
     what a confirmation should find live; the second names what it must NOT find,
@@ -1478,7 +1597,11 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
     have been replaced by the time it is written — every refresh mints a new
     one-time token, so installing a snapshot hands the session a token the server
     has retired, which is a dead spare at the worst possible moment."""
-    with Lock(LOCK_FILE, timeout=lock_timeout):
+    if deadline is None:
+        deadline = time.time() + LOCK_TIMEOUT
+    # Ours first: Claude Code never takes it, so nothing can wait in a cycle.
+    with Lock(LOCK_FILE, timeout=max(0.5, deadline - time.time())), \
+            claude_code_locks(deadline):
         split = store_split_now()
         if split:
             die(split_text(split))
@@ -1603,11 +1726,10 @@ def swap_to(name, force=False, lock_timeout=LOCK_TIMEOUT):
             except OSError:
                 pass
             # The RECORD is what waits for evidence. Two writes succeeding proves
-            # only that ccd wrote twice: Claude Code shares no lock with ccd, and a
-            # refresh of the outgoing account can land on one backend between
-            # them. So it goes away by the same rule as always — stores SEEN to
-            # agree — and otherwise stands, stopping every bank, swap and exchange
-            # until they are. This narrows that race; it does not close it (#67).
+            # only that ccd wrote twice, and Claude Code's locks bind only a
+            # Claude Code that takes them. So it goes away by the same rule as
+            # always — stores SEEN to agree — and otherwise stands, stopping every
+            # bank, swap and exchange until they are.
             # Not fatal: the swap happened, and a caller told otherwise retries
             # into a store that has already moved.
             split = store_split_now()
@@ -1925,7 +2047,7 @@ def cmd_swap(args):
             if args.from_account and cur and args.from_account != cur:
                 return _swap_no("the store moved while this was being decided")
             _, installed, replaced = swap_to(a["name"], force=True,
-                                             lock_timeout=left)
+                                             deadline=deadline)
             if cur:
                 swap_guard_record(cur, args.window)
     except SystemExit:

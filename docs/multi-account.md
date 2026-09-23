@@ -68,8 +68,8 @@
 - ~~세션 중 라이브 스왑~~. **0.4.0 의 비목표였으나 #57 에서 뒤집혔다.** 계정 간 스왑은
   이제 살아 있는 세션 안에서 일어난다. Claude Code 는 크레덴셜 저장소를 요청마다 읽고
   토큰을 회전시킬 때만 쓴다. 실측으로 스왑된 세션이 토큰 갱신 두 번을 넘겨 16.9시간 동안
-  재시작 없이 계속 돌았다. 경합이 없다는 뜻은 아니다 — Claude Code 의 쓰기와 ccd 의 쓰기
-  사이의 창은 좁혔을 뿐 닫지 못했고, #67 로 추적한다 (§6.1).
+  재시작 없이 계속 돌았다. 경합이 없다는 뜻은 아니다 — 그래서 스왑은 Claude Code 자신의
+  크레덴셜 락을 잡고 한다 (#67, §6.1).
 - 계정 공유 지원. 한 사람이 소유한 여러 구독을 대상으로 한다 (§9).
 
 ## 2. 현재 구조 (변경 대상)
@@ -287,11 +287,42 @@ cswap/clauth 는 **claude 가 살아 있는 동안** 키체인을 갈아끼운�
 사용자 트랜스크립트에서 스왑된 세션이 한 프로세스, 한 세션 id 로 **16.9시간** 동안
 1,159번 성공했고, 그 사이 access token 이 최소 두 번 갱신됐다. 재시작은 없었다.
 
-**경합이 없다는 뜻은 아니다.** Claude Code 는 ccd 의 락을 모르기 때문에, 떠나는 계정의
-토큰 refresh 가 ccd 의 두 백엔드 쓰기 사이에 끼어들 수 있다. 그래서 설치 뒤에도
-`store-split` 기록은 백엔드들이 일치하는 것이 **보일 때만** 지운다 (§6.2 5a). 이건 창을
-좁힐 뿐 닫지는 못한다. 닫으려면 Claude Code 쪽 writer 와의 조율이 필요하고, #67 로
-추적한다.
+**경합이 없다는 뜻은 아니다.** Claude Code 는 토큰을 자기 락 안에서 refresh 하고, 저장은
+비교-후-교체다: 저장소의 refresh token 이 자기가 쓴 것과 다르면 아무것도 쓰지 않고 저장된
+쪽을 따른다. 그래서 진짜 피해는 저장소가 갈라지는 게 아니라 **토큰 하나를 잃는 것**이었다 —
+Claude Code 가 A 를 refresh 하는 도중(서버는 이미 A 의 refresh token 을 회전시켰다) ccd 가
+B 로 스왑하면서 A 의 **회전 전** 자격증명을 백업하고, Claude Code 는 저장소에서 B 를 보고
+A′ 를 버린다. ccd 의 A 사본은 이미 쓰인 토큰을 들고 있고, A 로 돌아오는 날 `/login` 이
+필요해진다 (#67).
+
+**그래서 ccd 는 Claude Code 의 락을 그대로 잡는다** (`claude_code_locks`). Claude Code 의
+refresh 와 같은 순서로 — `<cfg>/.oauth_refresh.lock` → `<realpath(cfg)>.lock`
+(= `~/.claude.lock`) → `<cfg>/.storage-write.lock` — 잡고, 떠나는 자격증명은 **그 안에서**
+다시 읽어 백업한다. 진행 중이던 refresh 는 먼저 끝나고, 백업되는 건 A′ 다. `<cfg>` 는
+Claude Code 와 같은 규칙이다: `CLAUDE_SECURESTORAGE_CONFIG_DIR` › `CLAUDE_CONFIG_DIR` ›
+`~/.claude`.
+
+- ccd 의 저장소 락을 먼저 잡는다. Claude Code 는 그 락을 잡지 않으므로 순환 대기가 없다.
+- refresh 락을 기다리는 동안에는 아무것도 쥐지 않는다. write 락을 쥔 채 기다리면 Claude
+  Code 자신의 저장이 실패하고 회전된 토큰을 잃는다.
+- 락은 proper-lockfile 규칙 그대로다: `mkdir` 로 만든 디렉터리, `now − mtime` 이 stale
+  (refresh 쌍 60초, write 15초) 을 넘으면 버려진 것으로 보고 가져온다. 쥐고 있는 동안은
+  5초마다 mtime 을 갱신한다 (키체인 호출 하나가 15초까지 걸릴 수 있다).
+- 기다림은 호출자의 기한 안에서만 (`--deadline`: 프롬프트 틱 3초, StopFailure 60초,
+  `ccd account use` 5초). 넘기면 **아무것도 쓰지 않고** 실패하고, 기존의 3회 시도 후 알림이
+  처리한다.
+- 해제는 `finally` 에서, 아직 우리 것일 때만 한다. SIGKILL 이면 남지만 Claude Code 가 stale
+  규칙으로 가져간다 (그동안 refresh 는 최대 1분 밀린다).
+- 우리 것이 아닌 건 지우지 않는다. mtime 이 미래인 락은 Claude Code 에게도 영영 stale 이 되지
+  않으므로 (anthropics/claude-code#95739) 여기서도 쥐어진 것으로 보고, 실패 메시지가 그 경로와
+  이유를 말한다. 파일로 남은 락은 (#95425) 누구의 락도 아니라 즉시 거절하고 경로를 알려준다.
+- 락의 디렉터리가 없으면 (Claude Code 가 한 번도 쓰지 않은 설정 디렉터리) 지킬 저장소가 없으므로
+  그 락은 건너뛰고, 디렉터리를 만들지 않는다.
+
+이건 Claude Code 의 **내부 프로토콜**이다 (2.1.273–2.1.278 바이너리에서 확인). 이름이 바뀌면 이
+락들은 아무것도 지키지 않게 되지만, 그건 락을 잡기 전과 같은 자리다. 설치 뒤 `store-split`
+기록은 여전히 백엔드들이 일치하는 것이 **보일 때만** 지운다 (§6.2 5a) — 락은 그걸 잡는
+writer 만 묶기 때문이다.
 
 그래서 스왑은 세션 안에서 일어난다. 세션을 끝내는 홉은 OpenRouter 로 나가는 길(자동은 증명·키·옵트인·런처가 모두 있을 때만, 그 밖에는 `ccd -c`)과
 거기서 돌아오는 길뿐이다 — 그동안 백본은 프로세스의 환경 변수라서, 파일을 아무리 고쳐도
@@ -321,8 +352,10 @@ swap(--from cur, --window key):
   0a. 저장소 락 획득, 예산 안에서 대기
   0b. 활성 계정 재확인 — cur 과 다르면 이 결정은 이미 낡았다, 아무것도 하지 않는다
   ↓ swap_to(name):
-  1. 락 획득          ~/.claude/ccd/accounts/.lock  (flock, 5s 타임아웃)
-  1a. 대상 계정 로드   반드시 락 안에서 — 락 밖에서 읽은 사본은 이미 회전됐을 수 있다
+  1. 락 획득          ~/.claude/ccd/accounts/.lock  (flock, 호출자의 기한 — 기본 5s)
+  1a. Claude Code 의 락  .oauth_refresh.lock → ~/.claude.lock → .storage-write.lock (§6.1),
+                      같은 기한 안에서. 못 잡으면 아무것도 쓰지 않는다. 7 까지 쥔다
+  1b. 대상 계정 로드   반드시 락 안에서 — 락 밖에서 읽은 사본은 이미 회전됐을 수 있다
   2. 현재 blob 읽기    keychain(macOS) 또는 .credentials.json(Linux)
   3. 현재 계정 백업    live blob 의 claudeAiOauth → accounts/<active>.json 에 갱신 저장
                       (Claude Code 가 세션 중 회전시킨 최신 토큰을 잃지 않기 위함)
