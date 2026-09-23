@@ -171,6 +171,12 @@ ccd │ openai/gpt-5.6-luna:floor · high │ in $0.10/M · out $0.60/M │ run 
 
 ## Returning to the subscription
 
+The way back waits for **every** quota window, not just the one that reset: ccd
+returns only when each window the reading still reports is under 100%, so a
+5-hour reset while the weekly window is spent keeps the session where it is. A
+reading that is missing or too old to describe the quota now is not a reason to
+go back either — nothing returns on a memory.
+
 When the recovery signal appears (or whenever you want to go back), **end the
 current ccd session first.**
 

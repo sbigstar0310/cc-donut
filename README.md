@@ -156,7 +156,10 @@ official installer owns. Say no to the prompt and ccd prints the line for you.
 
 Then start sessions as usual with `claude`. The launcher runs the real claude and
 watches its exit code, so when every subscription is spent the conversation
-continues on OpenRouter by itself, and comes back when the quota resets.
+continues on OpenRouter by itself, and comes back when the quota resets. Coming
+back waits for every window the reading reports, not just the one that reset: a
+5-hour window that has come back while the weekly one is still at 100% would
+land the session at the same wall minutes later.
 
 Conditions and limits:
 
