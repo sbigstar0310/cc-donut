@@ -8888,5 +8888,147 @@ assert not os.path.lexists(H + "/nowhere"), "created a config directory"
 rm -rf "$FAKE"/cl-*
 unset -f cl_home cl_locks cl_run cl_py
 
+# ── setup reports what it verified, not what it attempted ───────────────────
+head_ "38. setup reports what it verified, not what it attempted"
+# One habit, two halves.
+#
+# The shim: mkdir, the heredoc and chmod were all unchecked, so a read-only
+# ~/.claude/ccd — or a chmod that did not take — ended with "✓ OpenRouter handoff
+# installed" printed over an empty directory. Nothing then shadows `claude`,
+# exec_claude has no launcher, and a `ccd -c` session never returns from OpenRouter
+# by itself: the meter keeps running on the user's own key (#29).
+#
+# The PATH line: "already in" was answered by OUR marker comment rather than by the
+# export that does the work. A marker whose line had been deleted read as success,
+# and a line the user wrote themselves got a second copy under --yes (#51). The
+# marker exists so REMOVAL never touches a line we did not write; presence is a
+# different question, and this call site was asking the wrong one.
+#
+# Every case seeds its own HOME and its own rc file. These assertions are about what
+# ONE run leaves on disk, and an inherited fixture would answer for it.
+
+# A foreign `claude` ahead of everything, so shim_leads_path() is decidedly false and
+# the PATH branch is the branch under test wherever this suite runs.
+S38_BIN=$(mktemp -d "$FAKE/s38bin.XXXXXX")
+printf '#!/bin/sh\nexit 0\n' > "$S38_BIN/claude"; chmod +x "$S38_BIN/claude"
+S38_PATH="$S38_BIN:$PATH"
+S38_EXPORT='export PATH="$HOME/.claude/ccd/bin:$PATH"'
+S38_MARKER='# ccd-auto-handoff-path v1 (managed by: ccd setup --auto)'
+s38_home() {   # a fresh HOME whose .zshrc is the user's own; prints its path
+  local h; h=$(mktemp -d "$FAKE/s38.XXXXXX")
+  mkdir -p "$h/.claude"
+  printf '# my own file\n' > "$h/.zshrc"
+  printf '%s' "$h"
+}
+s38_setup() {  # `setup --auto --yes` in HOME=$1 → S38_OUT, S38_ST
+  S38_OUT=$(HOME="$1" SHELL=/bin/zsh PATH="${2:-$S38_PATH}" \
+              "$ROOT/bin/ccd" setup --auto --yes 2>&1); S38_ST=$?
+}
+s38_claimed() { case "$S38_OUT" in *"OpenRouter handoff installed"*) return 0 ;; esac; return 1; }
+s38_brief()   { printf '%s' "$S38_OUT" | tr '\n' ' ' | head -c 140; }
+
+# (a) A file where the shim's directory goes: mkdir cannot make it, so nothing is
+# written and there is nothing to report.
+h=$(s38_home); mkdir -p "$h/.claude/ccd"; : > "$h/.claude/ccd/bin"
+s38_setup "$h"
+s38_claimed \
+  && bad "shim dir" "claimed an install with a file where the shim directory goes" \
+  || ok "a shim directory that cannot be created is not reported as an install"
+[ "$S38_ST" -ne 0 ] \
+  && ok "...and setup exits non-zero (got $S38_ST)" \
+  || bad "shim dir" "exited 0 with no launcher on disk"
+case "$S38_OUT" in
+  *"ccd setup --auto"*) ok "...and names the command to re-run once it is fixed" ;;
+  *) bad "shim dir" "no remedy: $(s38_brief)" ;;
+esac
+
+# (b) The directory is there but refuses the write. Only meaningful as a non-root
+# user — root writes through a read-only directory.
+if [ "$(id -u)" -ne 0 ]; then
+  h=$(s38_home); mkdir -p "$h/.claude/ccd/bin"; chmod 500 "$h/.claude/ccd/bin"
+  s38_setup "$h"
+  chmod 700 "$h/.claude/ccd/bin"
+  [ ! -e "$h/.claude/ccd/bin/claude" ] \
+    && ok "an unwritable shim directory really does leave no launcher" \
+    || bad "shim write" "the fixture wrote one anyway — this case proves nothing"
+  s38_claimed \
+    && bad "shim write" "claimed an install the write never made: $(s38_brief)" \
+    || ok "...and setup does not claim it installed one"
+  [ "$S38_ST" -ne 0 ] \
+    && ok "...and exits non-zero (got $S38_ST)" \
+    || bad "shim write" "exited 0 after a failed shim write"
+fi
+
+# (c) The bytes land but the executable bit does not. A shim the shell will not run
+# is not a launcher, however right its contents are.
+h=$(s38_home)
+S38_NOP=$(mktemp -d "$FAKE/s38nop.XXXXXX")
+printf '#!/bin/sh\nexit 0\n' > "$S38_NOP/chmod"; chmod +x "$S38_NOP/chmod"
+s38_setup "$h" "$S38_NOP:$S38_PATH"
+{ [ -f "$h/.claude/ccd/bin/claude" ] && [ ! -x "$h/.claude/ccd/bin/claude" ]; } \
+  && ok "a chmod that does not take really does leave the shim non-executable" \
+  || bad "shim chmod" "the fixture did not produce a non-executable shim"
+s38_claimed \
+  && bad "shim chmod" "called a non-executable file an installed launcher: $(s38_brief)" \
+  || ok "...and setup does not call it an installed launcher"
+[ "$S38_ST" -ne 0 ] \
+  && ok "...and exits non-zero (got $S38_ST)" \
+  || bad "shim chmod" "exited 0 with a launcher the shell cannot run"
+
+# (d) The marker outliving the line it marks. Someone tidying their dotfiles keeps
+# the comment and deletes the export under it; the wiring is gone, and only the
+# export can say so.
+h=$(s38_home)
+printf '# my own file\n%s\n' "$S38_MARKER" > "$h/.zshrc"
+s38_setup "$h"
+grep -qxF "$S38_EXPORT" "$h/.zshrc" \
+  && ok "a marker whose export was deleted gets the export put back" \
+  || bad "orphan marker" "left the rc file with our marker and no line that does the work"
+case "$S38_OUT" in
+  *"already in"*) bad "orphan marker" "reported a PATH line that was not there: $(s38_brief)" ;;
+  *) ok "...instead of reporting a line that was not there" ;;
+esac
+[ "$S38_ST" -eq 0 ] \
+  && ok "...and the repaired run reports success" \
+  || bad "orphan marker" "exited $S38_ST: $(s38_brief)"
+
+# (e) The other direction: the export is already there, written by the user, so it
+# carries no marker of ours. --yes must not take that as permission to add a second.
+h=$(s38_home)
+printf '# my own file\n%s\n' "$S38_EXPORT" > "$h/.zshrc"
+s38_setup "$h"; s38_setup "$h"
+n=$(grep -cxF "$S38_EXPORT" "$h/.zshrc")
+[ "$n" = "1" ] \
+  && ok "--yes twice over a line the user wrote adds no second copy" \
+  || bad "duplicate export" "the export now appears $n times"
+grep -q 'ccd-auto-handoff-path' "$h/.zshrc" \
+  && bad "duplicate export" "claimed their line by marking it as ours" \
+  || ok "...and their line is still theirs, unmarked"
+[ "$S38_ST" -eq 0 ] \
+  && ok "...and neither run is reported as a failed install" \
+  || bad "duplicate export" "exited $S38_ST although the wiring was done"
+
+# (f) And the install that works still says so — the point is not to report failure,
+# it is to report what is on disk.
+h=$(s38_home)
+s38_setup "$h"
+{ [ "$S38_ST" -eq 0 ] && [ -x "$h/.claude/ccd/bin/claude" ]; } \
+  && ok "a complete install exits 0 with an executable launcher on disk" \
+  || bad "happy path" "exited $S38_ST with shim=$([ -x "$h/.claude/ccd/bin/claude" ] && echo x || echo none)"
+s38_claimed \
+  && ok "...and reports the launcher it verified" \
+  || bad "happy path" "installed it and said nothing: $(s38_brief)"
+grep -qxF "$S38_EXPORT" "$h/.zshrc" \
+  && ok "...and the export it wrote is in the rc file" \
+  || bad "happy path" "reported success with no export in the rc file"
+s38_setup "$h"
+n=$(grep -cxF "$S38_EXPORT" "$h/.zshrc")
+{ [ "$S38_ST" -eq 0 ] && [ "$n" = "1" ]; } \
+  && ok "...and a second --yes run neither fails nor writes the line twice" \
+  || bad "happy path" "exited $S38_ST with $n copies of the export"
+
+rm -rf "$FAKE"/s38.* "$FAKE"/s38bin.* "$FAKE"/s38nop.*
+unset -f s38_home s38_setup s38_claimed s38_brief
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
