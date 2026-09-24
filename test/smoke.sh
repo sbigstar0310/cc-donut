@@ -11,8 +11,11 @@ export HOME="$FAKE"
 # CLAUDE_CONFIG_DIR outranks HOME everywhere ccd looks, so an inherited one would
 # send fixture writes to the developer's real configuration. Cases that test it
 # set it themselves. CLAUDE_SECURESTORAGE_CONFIG_DIR outranks both for where
-# Claude Code keeps its credential locks, which a swap takes.
-unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR
+# Claude Code keeps its credential locks, which a swap takes. ZDOTDIR outranks it
+# for the zsh startup file `ccd setup` edits: where a developer keeps zsh dotfiles
+# outside $HOME, an inherited one sent the fixture's PATH line to their real
+# ~/.zshrc (#100). §18d is the only case with any use for it, and sets it itself.
+unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR ZDOTDIR
 # The suite imports bin/ccd-account as a module; Python would otherwise leave its
 # bytecode in bin/, and one such file shipped in v0.8.0 (#77).
 export PYTHONDONTWRITEBYTECODE=1
@@ -54,7 +57,12 @@ rq_scatter() { # $1=that file, possibly edited → back to one file per account
 }
 # The suite must behave identically when launched from inside a ccd session:
 # CCD_ACTIVE would suppress quota-guard warnings and flip the statusline branch.
-unset CCD_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
+# CCD_HANDOFF_STATE is worse than a flipped branch — it names the file quota-guard
+# arms and deletes, and a supervised session exports one under the REAL
+# ~/.claude/ccd, so a fixture hook run could consume the handoff of the session
+# running the tests. CCD_HANDOFF is the token that unlocks that path.
+unset CCD_ACTIVE CCD_HANDOFF CCD_HANDOFF_STATE \
+      ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
       ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
       ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
       ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
@@ -79,6 +87,37 @@ export CCD_CREDENTIALS_BACKEND=file
 # must stop a handoff then measure the developer's environment instead of the
 # code. Those passed in CI and failed only on the machine of whoever set a key.
 unset OPENROUTER_API_KEY 2>/dev/null || true
+
+# §41 re-runs THIS file with the environment a developer's shell can carry — a
+# ZDOTDIR and XDG_* naming directories outside $HOME — and reports where a
+# `setup --yes` landed. It has to be this file and not a copy of the unsets above:
+# a copy would go on passing after one of them was deleted. Any line printed here
+# is a stray; the only expected one is `wrote .zshrc`.
+if [ "${1:-}" = "--setup-canary" ]; then
+  # A foreign `claude` first on PATH, so the run reaches the startup file instead
+  # of reporting that a shim already leads — which it would if the developer has
+  # one installed, leaving the canary clean and proving nothing.
+  mkdir -p "$FAKE/bin"
+  printf '#!/bin/sh\nexit 0\n' > "$FAKE/bin/claude"; chmod +x "$FAKE/bin/claude"
+  SHELL=/bin/zsh PATH="$FAKE/bin:$PATH" "$ROOT/bin/ccd" setup --auto --yes >/dev/null 2>&1
+  # setup's own record of every startup file it edited — the receipt that this run
+  # really wrote a PATH line, and the only place the path it chose survives.
+  if [ -f "$HOME/.claude/ccd/auto-path" ]; then
+    while read -r t; do
+      case "$t" in "$HOME"/*) printf 'wrote %s\n' "${t#"$HOME"/}" ;;
+                   *)         printf 'OUTSIDE %s\n' "$t" ;; esac
+    done < "$HOME/.claude/ccd/auto-path"
+  fi
+  ls -A "${2:?canary directory}" 2>/dev/null | sed 's/^/CANARY /'
+  # Every variable the preamble severs because it outranks these fixtures. The
+  # canary catches the ones `setup` itself resolves; this catches the rest, so
+  # deleting any one of those unsets cannot go unnoticed.
+  for v in ZDOTDIR CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR \
+           CCD_HANDOFF CCD_HANDOFF_STATE; do
+    [ -z "${!v-}" ] || printf 'SURVIVED %s\n' "$v"
+  done
+  exit 0
+fi
 
 pass=0 fail=0
 
@@ -9300,6 +9339,29 @@ esac
 
 rm -f "$S40D/run-state.json" "$S40D/quota-cache.json"
 unset -f s40_fixture s40_row s40_state
+
+head_ "41. a fixture setup writes nothing outside its HOME"
+# `ccd setup` resolves the zsh startup file as ${ZDOTDIR:-$HOME}/.zshrc, so HOME is
+# not the only variable that decides where it writes. A suite that replaces HOME and
+# inherits the rest appends its PATH line to the developer's REAL rc file (#100) —
+# and only on a machine that sets ZDOTDIR, which is why no run here ever showed it.
+# So stage that machine: every variable that can name a directory for a ccd writer
+# points at a canary that must stay empty, and the run's own HOME is the only place
+# anything may land. The receipt matters as much as the canary — a run that edited
+# no startup file at all would leave the canary clean and prove nothing.
+S41C="$FAKE/s41-canary"
+rm -rf "$S41C"; mkdir -p "$S41C"
+s41=$(env ZDOTDIR="$S41C" XDG_CONFIG_HOME="$S41C" XDG_DATA_HOME="$S41C" \
+          XDG_STATE_HOME="$S41C" XDG_CACHE_HOME="$S41C" \
+          CLAUDE_CONFIG_DIR="$S41C" CLAUDE_SECURESTORAGE_CONFIG_DIR="$S41C" \
+          CCD_HANDOFF=00000000000000000000000000000002 \
+          CCD_HANDOFF_STATE="$S41C/handoff.json" \
+          bash "$ROOT/test/smoke.sh" --setup-canary "$S41C" 2>&1)
+[ "$s41" = "wrote .zshrc" ] \
+  && ok "setup --yes writes its PATH line inside the fixture HOME and nowhere else" \
+  || bad "a fixture setup escaped its HOME" \
+         "expected 'wrote .zshrc', got: $(printf '%s' "$s41" | tr '\n' '|')"
+rm -rf "$S41C"
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
