@@ -8925,7 +8925,9 @@ assert not os.path.lexists(H + "/nowhere"), "created a config directory"
   && ok "the locks follow CLAUDE_SECURESTORAGE_CONFIG_DIR, then CLAUDE_CONFIG_DIR, as Claude Code's do" \
   || bad "lock location" "$out"
 rm -rf "$FAKE"/cl-*
-unset -f cl_home cl_locks cl_run cl_py
+# cl_home, cl_locks, cl_run, cl_py and CL_PRE stay defined: §42 asks the other
+# half of the same question — not whether the locks are taken, but whether they
+# are still held when the writing starts — and it stages it from here.
 
 # ── setup reports what it verified, not what it attempted ───────────────────
 head_ "38. setup reports what it verified, not what it attempted"
@@ -9362,6 +9364,245 @@ s41=$(env ZDOTDIR="$S41C" XDG_CONFIG_HOME="$S41C" XDG_DATA_HOME="$S41C" \
   || bad "a fixture setup escaped its HOME" \
          "expected 'wrote .zshrc', got: $(printf '%s' "$s41" | tr '\n' '|')"
 rm -rf "$S41C"
+
+# ── a swap stops when its hold on Claude Code's locks lapses ────────────────
+head_ "42. a swap stops when its hold on Claude Code's locks lapses"
+# Taking Claude Code's locks (§37) is not keeping them. A process that stalls past
+# a stale window — a sleeping laptop, a suspended hook, a keychain call that takes
+# its full 15s — is overtaken: Claude Code makes the lock its own and starts
+# refreshing the account the swap has already read. Installing from that read is
+# #67 again through the narrow door (#96): Claude Code's compare-and-swap discards
+# the token it just minted, and the bank keeps the retired one. Acquiring was
+# checked; KEEPING it was not, and only the writer can act on the answer — so it
+# asks before it banks and before every live-store write, and the deadline bounds
+# every acquisition, not only the ones that had to wait.
+#
+# §37's fixtures, and three shared helpers: what die() said, how a stand-in takes a
+# lock over, and the end state of a HOME where a swap must have written nothing.
+CL_LEASE="$CL_PRE"'
+import contextlib, io
+def dies(fn):                    # what die() said, or an assertion when it did not
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            fn()
+    except SystemExit:
+        return buf.getvalue().replace("\n", " ")
+    raise AssertionError("the swap wrote with a lock it had lost: "
+                         + buf.getvalue().replace("\n", " ")[:160])
+def taken(p):                    # a stand-in Claude Code takes this lock over
+    os.rmdir(p); real_mkdir(p)
+    # Dated as its own holder dates it — proper-lockfile writes an mtime about a
+    # second ahead — and a real takeover only happens once the lock has gone stale,
+    # so the new one is at least a window newer than the mtime ccd recorded.
+    # Without that the staging is invisible on a filesystem whose directory
+    # timestamps are coarse and whose inodes are reused: on the container overlay
+    # an instant rmdir+mkdir comes back byte-identical, and no holder anywhere
+    # could tell the difference.
+    t = time.time() + 1
+    os.utime(p, (t, t))
+def banked(n):
+    p = os.path.join(m.ACCOUNTS_DIR, n + ".json")
+    return json.load(open(p))["claudeAiOauth"]["refreshToken"]
+def untouched():
+    assert live() == "AT-a-live", f"the live store moved to {live()}"
+    a = banked("a")
+    assert a == "RT-a-stored", f"a was banked as {a}"
+    assert not os.path.exists(m.STORE_SPLIT), "a stop was recorded"
+'
+
+# The lease lapses between the read and the bank: a stand-in Claude Code takes the
+# write lock over, as it may once this process has stalled past the 15s window.
+# What ccd read while the lock was its own is now a snapshot of a credential
+# somebody else is rotating — banking it retires the spare.
+H=$(cl_home lease)
+out=$(python3 -c "$CL_LEASE"'
+R, L, W = DEFAULT
+real_read = m.live_read
+def read_then_taken():
+    got = real_read()
+    taken(W)                         # Claude Code takes the write lock over
+    return got
+m.live_read = read_then_taken
+msg = dies(lambda: m.swap_to("b", force=True))
+untouched()
+assert ".storage-write.lock" in msg and "took it over" in msg, f"the reason: {msg[:200]}"
+assert not os.path.lexists(R) and not os.path.lexists(L), "a lock of ours was left behind"
+assert os.path.isdir(W), "removed a lock that was no longer ours"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "a lease lost before the bank writes nothing, and the reason names the lock" \
+  || bad "lost lease before the bank" "$out"
+
+# And asked again after it, because the install is a write of its own and the
+# window is still open. Here the lock goes as the bank lands: the new credential
+# must not be installed — and the stop the swap wrote ahead of itself must come
+# back down, because nothing was touched, the stores still agree, and a stop
+# standing over them would block every bank and swap after this one.
+H=$(cl_home after)
+out=$(python3 -c "$CL_LEASE"'
+R, L, W = DEFAULT
+real_save = m.account_save
+def save_then_taken(name, obj):
+    real_save(name, obj)
+    taken(W)                         # the bank landed, and the lock is no longer ours
+m.account_save = save_then_taken
+msg = dies(lambda: m.swap_to("b", force=True))
+assert live() == "AT-a-live", f"the live store moved to {live()}"
+a = banked("a")
+assert a == "RT-a-live", f"the bank never happened, so this proves nothing: {a}"
+who = open(m.ACTIVE_FILE).read().strip()
+assert who == "a", f"the pointer moved to {who}"
+assert not os.path.exists(m.STORE_SPLIT), "a stop was left over stores nothing touched"
+assert ".storage-write.lock" in msg and "took it over" in msg, f"the reason: {msg[:200]}"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "a lease lost between the bank and the install installs nothing, and leaves no stop" \
+  || bad "lost lease before the install" "$out"
+
+# A refresh that FAILS ends the lease as surely as a takeover: a lock whose mtime
+# we cannot keep current goes stale under us and is taken over at somebody else's
+# leisure. Swallowing the error left the writer the only one not told.
+H=$(cl_home touch)
+out=$(python3 -c "$CL_LEASE"'
+m.LOCK_TOUCH = 0.05                  # the heartbeat, dialled down for the test
+def refused(*a, **k):
+    raise OSError(1, "Operation not permitted")
+os.utime = refused
+real_read = m.live_read
+def slow_read():
+    got = real_read()
+    time.sleep(0.4)                  # a stall, long enough for several refreshes
+    return got
+m.live_read = slow_read
+msg = dies(lambda: m.swap_to("b", force=True))
+untouched()
+assert ".lock" in msg and "keep it fresh" in msg, f"the reason: {msg[:200]}"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "a lock the heartbeat cannot refresh is a lock the writer stops for" \
+  || bad "a swallowed utime failure" "$out"
+
+# Every live-store write is asked, not only the install. `use a` while a is signed
+# in installs nothing — it puts the two stores back in step — and that write lands
+# on the same store Claude Code refreshes. Here the lock goes after the bank, so
+# the evening write is the first thing the check has to stop.
+H=$(cl_home even)
+out=$(python3 -c "$CL_LEASE"'
+R, L, W = DEFAULT
+wrote = []
+real_live_write = m.live_write
+def spy(blob, sources):
+    wrote.append(sorted(sources))
+    return real_live_write(blob, sources)
+m.live_write = spy
+real_save = m.account_save
+def save_then_taken(name, obj):
+    real_save(name, obj)
+    taken(W)                         # the bank landed, and the lock is no longer ours
+m.account_save = save_then_taken
+msg = dies(lambda: m.swap_to("a", force=True))
+assert not wrote, f"evened the stores without the lock: {wrote}"
+assert ".storage-write.lock" in msg and "took it over" in msg, f"the reason: {msg[:200]}"
+assert not os.path.exists(m.STORE_SPLIT), "a stop was recorded"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "the same-account evening write stops on a lapsed lease too" \
+  || bad "evening write without the lock" "$out"
+
+# The rollback is a write as well. An install that lands on one store and not the
+# other is put back — but only while the lock that makes putting it back safe is
+# still ours. Once it is not, the backend that took the new credential keeps it and
+# the write-ahead stop stands over it: a restore made without the lock is the #67
+# write over again, in the other direction.
+H=$(cl_home undo)
+out=$(python3 -c "$CL_LEASE"'
+R, L, W = DEFAULT
+chain = {"claudeAiOauth": {"accessToken": "AT-a-live", "refreshToken": "RT-a-live",
+                           "expiresAt": int(time.time() * 1000) + 3600000}}
+m.use_keychain = lambda: True
+m._keychain_read = lambda: json.loads(json.dumps(chain))
+def kwrite(blob):
+    chain.clear(); chain.update(json.loads(json.dumps(blob))); return True
+m._keychain_write = kwrite
+real_write_json = m.write_json
+def failing(p, obj, mode=0o600):
+    if str(p) == m.credentials_file():
+        taken(W)                     # half installed, and the lock goes right there
+        raise OSError("disk full")
+    return real_write_json(p, obj, mode)
+m.write_json = failing
+msg = dies(lambda: m.swap_to("b", force=True))
+at = chain["claudeAiOauth"]["accessToken"]
+assert at == "AT-b-stored", f"the keychain was written back without the lock: {at}"
+rec = json.load(open(m.STORE_SPLIT))
+assert "keychain" in str(rec.get("detail")), f"the stop does not name what is stuck: {rec}"
+assert "did not restore" in msg and "took it over" in msg, f"the reason: {msg[:200]}"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "a rollback is not written without the lock, and the stop stands over what is stuck" \
+  || bad "rollback without the lock" "$out"
+
+# The deadline bounds every acquisition path, not only the ones that had to wait.
+# A lock standing free — or released a moment after the budget ran out — is still
+# one this swap has no time left to use, and mkdir succeeding was never checked
+# against the clock, so the write started anyway.
+H=$(cl_home late)
+read -r rc secs <<< "$(cl_run "$H" 10 swap --from a --window x --no-probe --deadline 0)"
+out=$(cl_py "$H" '
+assert RC == "4", f"exit {RC} after {SECS}s: {err()[:200]}"
+untouched()
+assert ".oauth_refresh.lock" in err(), f"the reason names no lock: {err()[:200]}"
+left = [p for p in (REFRESH, LEGACY, WRITE) if os.path.lexists(p)]
+assert not left, f"took a lock with no budget left: {left}"
+') && ok "no budget left takes no lock, free or not, and writes nothing" \
+  || bad "deadline on a free lock" "$out"
+
+# And where the lock was there to be taken OVER. A stale lock is Claude Code's
+# abandoned one, but removing it and taking its place is still a write beginning
+# after the caller stopped waiting — that branch looped straight past the check.
+H=$(cl_home stalelate)
+cl_locks "$H" 90 90 20
+read -r rc secs <<< "$(cl_run "$H" 10 swap --from a --window x --no-probe --deadline 0)"
+out=$(cl_py "$H" '
+assert RC == "4", f"exit {RC} after {SECS}s: {err()[:200]}"
+untouched()
+assert os.path.isdir(REFRESH), "took over a stale lock with no budget left"
+') && ok "the stale-takeover path respects the deadline as well" \
+  || bad "deadline on a stale takeover" "$out"
+
+# ccd's own store lock got a floor of its own on top: half a second in which a
+# swap whose budget was already spent could still start writing.
+H=$(cl_home floor)
+out=$(python3 -c "$CL_LEASE"'
+given = []
+real_lock = m.Lock
+class Spy(real_lock):
+    def __init__(self, path, timeout=m.LOCK_TIMEOUT, *a, **k):
+        if path == m.LOCK_FILE:
+            given.append(timeout)
+        real_lock.__init__(self, path, timeout, *a, **k)
+m.Lock = Spy
+dies(lambda: m.swap_to("b", force=True, deadline=time.time() - 1))
+untouched()
+assert given and given[0] <= 0, f"the store lock was given {given[0]}s past the deadline"
+' "$ROOT/bin/ccd-account" "$H" 2>&1 | tail -1) \
+  && ok "an expired budget buys the store lock no extra half second" \
+  || bad "store lock floor" "$out"
+
+# The guard: locks free, budget intact, and the swap still does all of its work.
+H=$(cl_home whole)
+read -r rc secs <<< "$(cl_run "$H" 15 use b --force)"
+out=$(cl_py "$H" '
+assert RC == "0", f"exit {RC}: {err()[:200]}"
+assert live() == "AT-b-stored", f"the swap did not happen: {err()[:200]}"
+a = rt("a")
+assert a == "RT-a-live", f"the outgoing credential was not banked: {a}"
+who = open(os.path.join(cfg, "ccd", "accounts", ".active")).read().strip()
+assert who == "b", f"the pointer says {who}"
+assert not os.path.exists(os.path.join(cfg, "ccd", "store-split")), "a stop was recorded"
+left = [p for p in (REFRESH, LEGACY, WRITE) if os.path.lexists(p)]
+assert not left, f"left behind: {left}"
+') && ok "a swap that keeps its lease banks, installs, moves the pointer and lets go" \
+  || bad "a whole swap" "$out"
+rm -rf "$FAKE"/cl-*
+unset -f cl_home cl_locks cl_run cl_py
+unset CL_PRE CL_LEASE
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
