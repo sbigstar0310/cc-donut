@@ -11,8 +11,11 @@ export HOME="$FAKE"
 # CLAUDE_CONFIG_DIR outranks HOME everywhere ccd looks, so an inherited one would
 # send fixture writes to the developer's real configuration. Cases that test it
 # set it themselves. CLAUDE_SECURESTORAGE_CONFIG_DIR outranks both for where
-# Claude Code keeps its credential locks, which a swap takes.
-unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR
+# Claude Code keeps its credential locks, which a swap takes. ZDOTDIR outranks it
+# for the zsh startup file `ccd setup` edits: where a developer keeps zsh dotfiles
+# outside $HOME, an inherited one sent the fixture's PATH line to their real
+# ~/.zshrc (#100). §18d is the only case with any use for it, and sets it itself.
+unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR ZDOTDIR
 # The suite imports bin/ccd-account as a module; Python would otherwise leave its
 # bytecode in bin/, and one such file shipped in v0.8.0 (#77).
 export PYTHONDONTWRITEBYTECODE=1
@@ -54,7 +57,12 @@ rq_scatter() { # $1=that file, possibly edited → back to one file per account
 }
 # The suite must behave identically when launched from inside a ccd session:
 # CCD_ACTIVE would suppress quota-guard warnings and flip the statusline branch.
-unset CCD_ACTIVE ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
+# CCD_HANDOFF_STATE is worse than a flipped branch — it names the file quota-guard
+# arms and deletes, and a supervised session exports one under the REAL
+# ~/.claude/ccd, so a fixture hook run could consume the handoff of the session
+# running the tests. CCD_HANDOFF is the token that unlocks that path.
+unset CCD_ACTIVE CCD_HANDOFF CCD_HANDOFF_STATE \
+      ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL \
       ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
       ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
       ANTHROPIC_CUSTOM_MODEL_OPTION ANTHROPIC_CUSTOM_MODEL_OPTION_NAME \
