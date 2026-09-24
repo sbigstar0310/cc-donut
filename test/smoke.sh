@@ -9604,5 +9604,244 @@ rm -rf "$FAKE"/cl-*
 unset -f cl_home cl_locks cl_run cl_py
 unset CL_PRE CL_LEASE
 
+# ── a launcher is installed whole, or not at all ───────────────────────────
+head_ "43. a launcher is installed whole, or not at all"
+# §38 made setup verify the launcher before printing ✓: is_ccd_shim plus the
+# executable bit. On a REINSTALL both can be true over a file that cannot run. The
+# bytes go straight to the final path, so a short write — a full disk, a filesystem
+# going read-only mid-write — keeps the signature, which is the second line, while
+# the body is gone, and the executable bit survives from the file that was there
+# before. `cat`'s own exit status was never asked. Setup then prints ✓ over a
+# `claude` that does nothing: exec_claude hands the session to it, a `ccd -c` run
+# never comes back from OpenRouter by itself, and the meter keeps running on the
+# user's own key — #29 again, through the door #92 left open (#97).
+#
+# One habit, three files: ~/.claude/ccd/bin/claude, ~/.local/bin/ccd and
+# ~/.claude/ccd/statusline-launcher.sh are each a heredoc into the final path
+# followed by an unchecked chmod. So each is asked the same two questions: a write
+# that stops partway, and a chmod that refuses.
+#
+# A short write IS `cat` stopping partway and exiting non-zero — that is what ENOSPC
+# and an EIO on a dying filesystem hand it. So the stand-in below is a `cat` that
+# copies the first bytes of the real heredoc and then fails. It fires only for the
+# file a case names, keeps what it was handed, and records that it fired: a fix that
+# stopped writing with `cat` would leave the log empty and every case here would say
+# so rather than pass on nothing. Each case seeds its own HOME, and every variable
+# that outranks HOME for where ccd writes is severed for the run.
+S43=$(mktemp -d "$FAKE/s43.XXXXXX")
+S43_SIG='# ccd-auto-handoff-shim v1 (managed by: ccd setup --auto)'
+S43_REAL_CAT=$(command -v cat); S43_REAL_CHMOD=$(command -v chmod)
+
+# A `claude` that is decidedly not ours, and the only one these fixtures can reach:
+# it makes shim_leads_path() false wherever this suite runs, and it is what a whole
+# launcher falls through to when no plugin is installed — so "REAL-CLAUDE" on stdout
+# is proof that a launcher ran all the way to its last line.
+S43_BIN="$S43/bin"; mkdir -p "$S43_BIN"
+printf '#!/bin/sh\necho REAL-CLAUDE\n' > "$S43_BIN/claude"; chmod +x "$S43_BIN/claude"
+
+S43_TOOLS="$S43/tools"; mkdir -p "$S43_TOOLS"
+cat > "$S43_TOOLS/cat" <<'S43_CAT'
+#!/bin/sh
+# Only the heredoc form is ours; `cat FILE` passes straight through.
+R=${CCD_T_CAT:-/bin/cat}
+[ $# -eq 0 ] && [ -n "${CCD_T_TRUNC:-}" ] || exec "$R" "$@"
+b="$CCD_T_LOG.buf"
+"$R" > "$b"
+if grep -qF "$CCD_T_TRUNC" "$b"; then
+  cp "$b" "$CCD_T_LOG.kept"
+  head -c "${CCD_T_BYTES:-100}" "$b"
+  echo truncated >> "$CCD_T_LOG"
+  exit 1
+fi
+exec "$R" "$b"
+S43_CAT
+cat > "$S43_TOOLS/chmod" <<'S43_CHMOD'
+#!/bin/sh
+# A chmod that refuses the path a case names, and is the real one everywhere else.
+R=${CCD_T_CHMOD:-/bin/chmod}
+if [ -n "${CCD_T_CHMOD_FAIL:-}" ]; then
+  for a in "$@"; do
+    case "$a" in *"$CCD_T_CHMOD_FAIL"*)
+      echo "refused $a" >> "$CCD_T_LOG"
+      echo "chmod: $a: Read-only file system" >&2
+      exit 1 ;;
+    esac
+  done
+fi
+exec "$R" "$@"
+S43_CHMOD
+chmod +x "$S43_TOOLS/cat" "$S43_TOOLS/chmod"
+
+s43_home() {   # a fresh HOME with a .zshrc of the user's own; prints its path
+  local h; h=$(mktemp -d "$S43/h.XXXXXX")
+  mkdir -p "$h/.claude" "$h/.local/bin" "$h/.claude/ccd/bin"
+  printf '# my own file\n' > "$h/.zshrc"
+  printf '%s' "$h"
+}
+# The launcher that is already there when setup runs again — complete, executable
+# and saying which one it is. The shim carries our signature or setup would refuse
+# to touch it at all.
+s43_seed() {   # $1=HOME $2=shim|cmd|sl
+  local p
+  case "$2" in
+    shim) p="$1/.claude/ccd/bin/claude"
+          printf '#!/bin/sh\n%s\necho PREVIOUS-SHIM\n' "$S43_SIG" > "$p" ;;
+    cmd)  p="$1/.local/bin/ccd";                printf '#!/bin/sh\necho PREVIOUS-CCD\n' > "$p" ;;
+    sl)   p="$1/.claude/ccd/statusline-launcher.sh"; printf '#!/bin/sh\necho PREVIOUS-SL\n' > "$p" ;;
+  esac
+  chmod +x "$p"
+}
+s43_setup() {  # $1=HOME $2=heredoc to truncate $3=path chmod refuses → S43_OUT, S43_ST
+  S43_LOG="$1/.tool-log"; : > "$S43_LOG"; rm -f "$S43_LOG.kept" "$S43_LOG.buf"
+  S43_OUT=$(env -u ZDOTDIR -u CLAUDE_CONFIG_DIR -u CLAUDE_SECURESTORAGE_CONFIG_DIR \
+              HOME="$1" SHELL=/bin/zsh PATH="$S43_TOOLS:$S43_BIN:$PATH" \
+              CCD_T_CAT="$S43_REAL_CAT" CCD_T_CHMOD="$S43_REAL_CHMOD" \
+              CCD_T_LOG="$S43_LOG" CCD_T_TRUNC="${2:-}" CCD_T_CHMOD_FAIL="${3:-}" \
+              "$ROOT/bin/ccd" setup --auto --yes 2>&1); S43_ST=$?
+}
+# Run an installed launcher where the only `claude` reachable is the stand-in: a
+# broken one must never be able to reach the developer's real Claude Code.
+s43_run()   { local h="$1"; shift
+              env -u ZDOTDIR HOME="$h" PATH="$S43_BIN:/usr/bin:/bin" "$@" 2>&1; }
+s43_said()  { case "$S43_OUT" in *"$1"*) return 0 ;; esac; return 1; }
+s43_brief() { printf '%s' "$S43_OUT" | tr '\n' ' ' | head -c 140; }
+
+# (a) The reinstall in the issue: a launcher of ours is already there, and the new
+# write stops in the middle of the body.
+h=$(s43_home); s43_seed "$h" shim
+s43_setup "$h" "$S43_SIG"
+grep -q truncated "$S43_LOG" \
+  && ok "a write that stops partway really does stop partway" \
+  || bad "short write" "the stand-in never fired — this case proves nothing"
+head -c 100 "$S43_LOG.kept" 2>/dev/null | grep -qxF "$S43_SIG" \
+  && ok "...and the bytes that landed still carry the signature is_ccd_shim looks for" \
+  || bad "short write" "the truncation dropped the signature, so this is not #97's case"
+[ "$(s43_run "$h" "$h/.claude/ccd/bin/claude")" = "PREVIOUS-SHIM" ] \
+  && ok "...and the launcher that was there is untouched, and still runs" \
+  || bad "short write" "the previous launcher is gone: $(s43_run "$h" "$h/.claude/ccd/bin/claude" | tr '\n' ' ' | head -c 60)"
+s43_said "OpenRouter handoff installed" \
+  && bad "short write" "claimed an install the write never finished: $(s43_brief)" \
+  || ok "...and setup does not claim it installed one"
+[ "$S43_ST" -ne 0 ] \
+  && ok "...and exits non-zero (got $S43_ST)" \
+  || bad "short write" "exited 0 over a launcher that was never written whole"
+s43_said "ccd setup --auto" \
+  && ok "...and names the command that repairs it" \
+  || bad "short write" "no remedy: $(s43_brief)"
+
+# (b) The same short write with nothing there before. Nothing may be left at the
+# final path: a half-written file with our signature on it is one every later run —
+# and uninstall, and the handoff — reads as a launcher of ours.
+h=$(s43_home)
+s43_setup "$h" "$S43_SIG"
+[ ! -e "$h/.claude/ccd/bin/claude" ] \
+  && ok "a first install that fails mid-write leaves nothing behind" \
+  || bad "short write" "left $(wc -c < "$h/.claude/ccd/bin/claude" | tr -d ' ') bytes that is_ccd_shim calls ours"
+s43_said "OpenRouter handoff installed" \
+  && bad "short write" "claimed a launcher that is only a header: $(s43_brief)" \
+  || ok "...and reports no launcher, because there is none"
+
+# (c) The bytes all land, and the chmod refuses. A launcher is not installed until
+# it is runnable, and the executable bit of the file it replaces does not count.
+h=$(s43_home); s43_seed "$h" shim
+s43_setup "$h" "" "/.claude/ccd/bin/"
+grep -q '^refused ' "$S43_LOG" \
+  && ok "a chmod that refuses really was asked" \
+  || bad "shim chmod fails" "the stand-in never fired — this case proves nothing"
+[ "$(s43_run "$h" "$h/.claude/ccd/bin/claude")" = "PREVIOUS-SHIM" ] \
+  && ok "...and the launcher that was there is untouched, and still runs" \
+  || bad "shim chmod fails" "replaced a working launcher with one it could not make runnable"
+s43_said "OpenRouter handoff installed" \
+  && bad "shim chmod fails" "counted the old file's executable bit as this install's: $(s43_brief)" \
+  || ok "...and setup does not claim it installed one"
+[ "$S43_ST" -ne 0 ] \
+  && ok "...and exits non-zero (got $S43_ST)" \
+  || bad "shim chmod fails" "exited 0 after a chmod that failed"
+
+# (d) And the clean run still installs a whole launcher — the point is not to report
+# failure, it is that what ✓ is printed over can be run.
+h=$(s43_home); s43_seed "$h" shim
+s43_setup "$h"
+{ [ "$S43_ST" -eq 0 ] && [ -x "$h/.claude/ccd/bin/claude" ]; } \
+  && ok "a clean run exits 0 with an executable launcher on disk" \
+  || bad "happy path" "exited $S43_ST: $(s43_brief)"
+grep -qF 'CCD_SHIM_PATH="$self" exec' "$h/.claude/ccd/bin/claude" \
+  && ok "...whose last line is there, so the body is whole" \
+  || bad "happy path" "the installed launcher stops short of its last line"
+[ "$(s43_run "$h" "$h/.claude/ccd/bin/claude")" = "REAL-CLAUDE" ] \
+  && ok "...and it runs: with no plugin installed it hands over to the real claude" \
+  || bad "happy path" "the installed launcher does not run: $(s43_run "$h" "$h/.claude/ccd/bin/claude" | tr '\n' ' ' | head -c 60)"
+s43_said "OpenRouter handoff installed" \
+  && ok "...and setup says so" \
+  || bad "happy path" "installed it and said nothing: $(s43_brief)"
+
+# (e) ~/.local/bin/ccd is written the same way, and it is the whole command: a
+# header with no body is a `ccd` that exits 0 without doing anything, so `ccd -c`
+# stops being a way out at all.
+h=$(s43_home); s43_seed "$h" cmd
+s43_setup "$h" "# ccd launcher "
+grep -q truncated "$S43_LOG" \
+  && ok "the ccd command's write stops partway too" \
+  || bad "ccd command" "the stand-in never fired — this case proves nothing"
+[ "$(s43_run "$h" "$h/.local/bin/ccd")" = "PREVIOUS-CCD" ] \
+  && ok "...and the ccd command that was there is untouched, and still runs" \
+  || bad "ccd command" "the previous command is gone: $(s43_run "$h" "$h/.local/bin/ccd" | tr '\n' ' ' | head -c 60)"
+s43_said "ccd command installed" \
+  && bad "ccd command" "claimed a command the write never finished: $(s43_brief)" \
+  || ok "...and setup does not claim it installed one"
+[ "$S43_ST" -ne 0 ] \
+  && ok "...and exits non-zero (got $S43_ST)" \
+  || bad "ccd command" "exited 0 over a half-written ccd command"
+
+h=$(s43_home); s43_seed "$h" cmd
+s43_setup "$h" "" "/.local/bin/"
+[ "$(s43_run "$h" "$h/.local/bin/ccd")" = "PREVIOUS-CCD" ] \
+  && ok "a chmod that refuses leaves the ccd command that was there" \
+  || bad "ccd command chmod" "replaced a working command with one it could not make runnable"
+{ ! s43_said "ccd command installed" && [ "$S43_ST" -ne 0 ]; } \
+  && ok "...and setup reports the failure instead of the ✓ (exit $S43_ST)" \
+  || bad "ccd command chmod" "exited $S43_ST: $(s43_brief)"
+
+# (f) The statusline launcher, last of the three. Truncated, it prints nothing, the
+# status line goes blank, and the quota warning the whole product turns on is the
+# thing that stops being shown.
+h=$(s43_home); s43_seed "$h" sl
+s43_setup "$h" "# ccd statusline launcher"
+grep -q truncated "$S43_LOG" \
+  && ok "the statusline launcher's write stops partway too" \
+  || bad "statusline launcher" "the stand-in never fired — this case proves nothing"
+[ "$(s43_run "$h" bash "$h/.claude/ccd/statusline-launcher.sh")" = "PREVIOUS-SL" ] \
+  && ok "...and the statusline launcher that was there is untouched, and still runs" \
+  || bad "statusline launcher" "the previous launcher is gone: $(s43_run "$h" bash "$h/.claude/ccd/statusline-launcher.sh" | tr '\n' ' ' | head -c 60)"
+s43_said "statusline wired" \
+  && bad "statusline launcher" "claimed a launcher the write never finished: $(s43_brief)" \
+  || ok "...and setup does not claim it wired one"
+[ "$S43_ST" -ne 0 ] \
+  && ok "...and exits non-zero (got $S43_ST)" \
+  || bad "statusline launcher" "exited 0 over a half-written statusline launcher"
+
+# (g) Both of those installed clean by the same run that installs the shim, and no
+# half-written sibling left lying next to any of the three.
+h=$(s43_home)
+s43_setup "$h"
+{ [ "$S43_ST" -eq 0 ] && [ -x "$h/.local/bin/ccd" ] \
+  && [ -x "$h/.claude/ccd/statusline-launcher.sh" ]; } \
+  && ok "a clean run installs all three, executable, and exits 0" \
+  || bad "happy path" "exited $S43_ST with ccd=$([ -x "$h/.local/bin/ccd" ] && echo x || echo none) statusline=$([ -x "$h/.claude/ccd/statusline-launcher.sh" ] && echo x || echo none)"
+case "$(s43_run "$h" "$h/.local/bin/ccd")" in
+  *"plugin not found"*) ok "...and the ccd command runs its own body to the end" ;;
+  *) bad "happy path" "the installed ccd command does nothing: $(s43_run "$h" "$h/.local/bin/ccd" | tr '\n' ' ' | head -c 60)" ;;
+esac
+# Named by what belongs there rather than by what a temporary file is called, so
+# this keeps its meaning whatever the sibling is named.
+left="$(ls -A "$h/.local/bin" | grep -vx ccd)$(ls -A "$h/.claude/ccd/bin" | grep -vx claude)$(ls -A "$h/.claude/ccd" | grep '^statusline-launcher\.sh\.')"
+[ -z "$left" ] \
+  && ok "...and leaves no half-written sibling beside any of them" \
+  || bad "happy path" "left behind: $(printf '%s' "$left" | tr '\n' ' ')"
+
+rm -rf "$S43"
+unset -f s43_home s43_seed s43_setup s43_run s43_said s43_brief
+unset S43 S43_SIG S43_REAL_CAT S43_REAL_CHMOD S43_BIN S43_TOOLS S43_LOG S43_OUT S43_ST
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
