@@ -112,6 +112,10 @@ REFRESH_SKEW = 300
 # the suite for ten seconds per account while quietly calling Anthropic.
 HTTP_TIMEOUT = int(os.environ.get("CCD_HTTP_TIMEOUT", "10"))
 LOCK_TIMEOUT = 5
+# How often a held Claude Code lock's mtime is refreshed. A keychain call may take
+# its full 15s, past the write lock's stale window; Claude Code's own holders touch
+# theirs every 5s, and so does this (claude_code_locks).
+LOCK_TOUCH = 5
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -628,12 +632,29 @@ def _claude_code_lock(path, stale, deadline):
     """mkdir `path` by `deadline`, or die. False when its directory does not
     exist: no store lives there to guard, and ccd does not create it.
 
+    The deadline bounds every turn of the loop, mkdir included. A lock standing
+    free — or released a moment after the budget ran out, or abandoned and there
+    for the taking — is still a lock this swap has no time left to use, and taking
+    it starts a write the caller has already stopped waiting for. Only the waiting
+    paths were checked, so those three walked straight past it.
+
     Nothing that is not ours is deleted but what Claude Code would take over
     itself. A lock dated in the future never goes stale for Claude Code
     (anthropics/claude-code#95739), so it is held here too; one left as a file is
     nobody's lock (#95425), and waiting could never take it."""
+    waited = None                               # the age it had when last in the way
     try:
         while True:
+            if time.time() >= deadline:
+                if waited is None:
+                    die(f"no time left to take Claude Code's lock {_tilde(path)}; "
+                        "nothing was changed — try again")
+                if waited < -2:                 # proper-lockfile itself dates ~1s ahead
+                    die(f"{_tilde(path)} is dated in the future and never goes stale "
+                        "(anthropics/claude-code#95739). Nothing was changed; remove "
+                        "it if no Claude Code is signing in")
+                die(f"Claude Code is holding {_tilde(path)}; nothing was changed — "
+                    "try again")
             try:
                 os.mkdir(path)
                 return True
@@ -654,13 +675,7 @@ def _claude_code_lock(path, stale, deadline):
                 except FileNotFoundError:
                     pass
                 continue
-            if time.time() >= deadline:
-                if age < -2:                    # proper-lockfile itself dates ~1s ahead
-                    die(f"{_tilde(path)} is dated in the future and never goes stale "
-                        "(anthropics/claude-code#95739). Nothing was changed; remove "
-                        "it if no Claude Code is signing in")
-                die(f"Claude Code is holding {_tilde(path)}; nothing was changed — "
-                    "try again")
+            waited = age                        # genuinely held, and worth waiting out
             time.sleep(0.1)
     except FileNotFoundError:
         return False
@@ -669,10 +684,92 @@ def _claude_code_lock(path, stale, deadline):
             "nothing was changed")
 
 
+class Lease:
+    """What a swap still holds of Claude Code's locks — asked, not assumed.
+
+    Taking them is not keeping them. A process that stalls past a stale window (a
+    sleeping laptop, a suspended hook, a keychain call that takes its full 15s) is
+    overtaken: Claude Code makes the lock its own and starts refreshing the account
+    the swap has already read. Installing from that read is #67 again through the
+    narrow door (#96) — Claude Code's compare-and-swap discards the token it just
+    minted, and the bank keeps the retired one. Losing the lease was visible only
+    to the heartbeat, which stopped touching it and said nothing; the one process
+    that had to know was the writer.
+
+    Once lapsed, lapsed. A lock that comes free again says nothing about what its
+    taker did while it was theirs."""
+
+    def __init__(self):
+        self.held = {}                          # lock path -> the mtime we gave it
+        self.gone = None                        # the first lock that stopped being ours
+        self.why = None
+        self._guard = threading.Lock()          # the refresher rewrites held mtimes
+
+    def _mine(self, p):
+        try:
+            return os.lstat(p).st_mtime_ns == self.held[p]
+        except (OSError, KeyError):
+            return False
+
+    def _lapse(self, p, why):
+        if self.gone is None:
+            self.gone, self.why = p, why
+
+    def took(self, p):
+        with self._guard:
+            self.held[p] = os.lstat(p).st_mtime_ns
+
+    def mine(self, p):
+        """Is this one lock still ours? What the release asks: a lapsed lease can
+        hold the others yet, and those are ours to give back."""
+        with self._guard:
+            return self._mine(p)
+
+    def refresh(self):
+        """Keep what we hold fresh, as Claude Code's holders do. A touch that
+        FAILS ends the lease too: a lock whose mtime we cannot keep current goes
+        stale under us and is taken over at somebody else's leisure, so a lock
+        that cannot be refreshed is one nothing may be written under."""
+        with self._guard:
+            for p in list(self.held):
+                if not self._mine(p):
+                    self._lapse(p, "another process took it over")
+                    continue
+                try:
+                    os.utime(p)
+                    self.held[p] = os.lstat(p).st_mtime_ns
+                except OSError as e:
+                    self._lapse(p, "its heartbeat could not keep it fresh: "
+                                   f"{e.strerror}")
+
+    def lapsed(self):
+        """The first lock that is no longer ours, or None while every one is."""
+        with self._guard:
+            if self.gone is None:
+                for p in list(self.held):
+                    if not self._mine(p):
+                        self._lapse(p, "another process took it over")
+                        break
+            return self.gone
+
+    def note(self):
+        return f"this swap lost Claude Code's lock {_tilde(self.gone)} ({self.why})"
+
+    def hold(self, kept):
+        """Write nothing once the lease has lapsed: die(), the way an expired
+        deadline already fails, so the hook's three-attempts-then-a-note path
+        takes it from there. `kept` says what the store was left holding."""
+        if self.lapsed():
+            die(f"{self.note()} — {kept}. Try again")
+
+
 @contextlib.contextmanager
 def claude_code_locks(deadline):
     """Hold Claude Code's credential locks around a read and write of the live
     store: all of them, taken by `deadline`, or die() having written nothing.
+
+    Yields the Lease, because taking them is only half of holding them and the
+    writer is the one that has to ask (#96).
 
     Only the refresh lock is ever waited on with nothing held, so Claude Code's
     own save never finds the write lock taken by somebody waiting on it.
@@ -680,38 +777,25 @@ def claude_code_locks(deadline):
     Released in the finally, die() included, and only while still ours. A
     SIGKILL leaves them behind; Claude Code takes them over once stale, so its
     refresh is held off for up to a minute."""
-    held = {}                                   # path -> the mtime we gave it
+    lease = Lease()
     stop = threading.Event()
 
-    def ours(p):
-        try:
-            return os.lstat(p).st_mtime_ns == held[p]
-        except OSError:
-            return False
-
     def keep_fresh():
-        # A keychain call may take its full 15s, past the write lock's window;
-        # Claude Code's holders touch theirs every 5s, and so does this.
-        while not stop.wait(5):
-            for p in [p for p in list(held) if ours(p)]:
-                try:
-                    os.utime(p)
-                    held[p] = os.lstat(p).st_mtime_ns
-                except OSError:
-                    pass
+        while not stop.wait(LOCK_TOUCH):
+            lease.refresh()
 
     keeper = threading.Thread(target=keep_fresh, daemon=True)
     keeper.start()
     try:
         for path, stale in claude_code_locks_at():
             if _claude_code_lock(path, stale, deadline):
-                held[path] = os.lstat(path).st_mtime_ns
-        yield
+                lease.took(path)
+        yield lease
     finally:
         stop.set()
         keeper.join()
-        for p in reversed(list(held)):
-            if ours(p):
+        for p in reversed(list(lease.held)):
+            if lease.mine(p):
                 try:
                     os.rmdir(p)
                 except OSError:
@@ -1587,7 +1671,12 @@ def swap_to(name, force=False, deadline=None):
     refreshes without a restart. The one coordination it needs is Claude Code's
     own locks, held from the first read of the live store to the last check of it
     (claude_code_locks), so a rotation in flight lands before the backup reads.
-    `deadline` bounds every wait for a lock, ours and Claude Code's alike.
+    `deadline` bounds every wait for a lock, ours and Claude Code's alike, and an
+    expired one means no write at all.
+
+    Holding them at the start is not holding them now, so the lease is asked again
+    before the bank and before every live-store write, and a lapsed one writes
+    nothing (#96).
 
     Returns (account, installed credential, replaced credential). The first names
     what a confirmation should find live; the second names what it must NOT find,
@@ -1599,9 +1688,11 @@ def swap_to(name, force=False, deadline=None):
     has retired, which is a dead spare at the worst possible moment."""
     if deadline is None:
         deadline = time.time() + LOCK_TIMEOUT
-    # Ours first: Claude Code never takes it, so nothing can wait in a cycle.
-    with Lock(LOCK_FILE, timeout=max(0.5, deadline - time.time())), \
-            claude_code_locks(deadline):
+    # Ours first: Claude Code never takes it, so nothing can wait in a cycle. And
+    # no floor under the wait — half a second granted on top of a budget that has
+    # run out is half a second in which this process can still start writing.
+    with Lock(LOCK_FILE, timeout=max(0.0, deadline - time.time())), \
+            claude_code_locks(deadline) as lease:
         split = store_split_now()
         if split:
             die(split_text(split))
@@ -1639,6 +1730,11 @@ def swap_to(name, force=False, deadline=None):
             if prev:
                 prev["claudeAiOauth"] = live_oauth
                 prev["refreshed_at"] = now()
+                # Only while the locks are still ours. Lost since the read, they
+                # were somebody's to refresh under — and what this is about to bank
+                # is then a token the server may already have retired, which is a
+                # dead spare filed as a live one (#96).
+                lease.hold("nothing was changed")
                 account_save(cur, prev)
 
         # Already signed in as the target: the live blob is this account's own and
@@ -1657,6 +1753,7 @@ def swap_to(name, force=False, deadline=None):
             # copied over the login in the file, erasing the only credential.
             evened, failed = True, []
             if has_login:
+                lease.hold("the credential stores were not touched")
                 evened, failed, _ = live_write(blob, sources)
             else:
                 warn("the credentials Claude Code is reading hold no login — nothing "
@@ -1682,6 +1779,13 @@ def swap_to(name, force=False, deadline=None):
                 die("cannot record what this swap is about to change ("
                     + STORE_SPLIT + ") — refusing to touch the credential stores "
                     "without it")
+            # The last look before the write that matters. A lease lost here means
+            # the record is standing over stores nothing has touched, so it comes
+            # back down: they still agree, and a stop nobody needs would block
+            # every bank and swap after this one.
+            if lease.lapsed():
+                clear_store_split()
+                lease.hold("the credential stores were not touched")
             installed, failed, written = live_write(new_blob, sources)
             if not installed:
                 # Some backends took the new credential and some did not: the
@@ -1690,7 +1794,15 @@ def swap_to(name, force=False, deadline=None):
                 # still holding.
                 note = ", ".join(failed)
                 stuck = list(written)
-                if written:
+                if written and lease.lapsed():
+                    # Putting it back is a write too, and this one would be made
+                    # without the lock — the #67 write over again, in the other
+                    # direction, over whatever the lock's new owner is saving. So
+                    # the backends that took the new credential keep it, and the
+                    # record stands over them.
+                    note += ("; did not restore " + ", ".join(written)
+                             + " — " + lease.note())
+                elif written:
                     _, undo_failed, _ = live_write(blob, sources)
                     # What the ROLLBACK achieved, not what the install attempted: a
                     # backend that refused the new credential refuses the redundant
