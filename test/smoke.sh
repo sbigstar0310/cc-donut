@@ -9847,5 +9847,206 @@ rm -rf "$S43"
 unset -f s43_home s43_seed s43_setup s43_run s43_said s43_brief
 unset S43 S43_SIG S43_REAL_CAT S43_REAL_CHMOD S43_BIN S43_TOOLS S43_LOG S43_OUT S43_ST
 
+# ── one freshness rule, on both sides of the reading ─────────────────────────
+head_ "44. a reading from the future is unusable everywhere"
+# #98. After the clock steps backward the quota cache is dated ahead of now. The
+# hook's quota_peak read that age as "-900, which is ≤ 1800" and armed a return
+# from it, while the banner (#95) asks 0 ≤ age ≤ WARN_MAX_AGE and stayed silent:
+# one reading, two verdicts, and they part exactly where the reading is least
+# worth trusting. The same negative age was also "not older than the TTL", so the
+# ordinary refresh never fired either and the reading nobody trusted was pinned
+# there for good. One rule now — 0 ≤ age ≤ MAX_READING_AGE, in whole seconds
+# wherever it is asked — so every case below asks the hook AND the row, and the
+# two cannot drift apart again without a case going red.
+S44D="$FAKE/.claude/ccd"
+S44_HF="$S44D/handoff-00000000000000000000000000000002.json"
+S44_FUT=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=2)).isoformat())")
+S44_BANNER="✓ Claude recovered → 종료하면 구독으로 자동 복귀"
+S44_DASH="$FAKE/.claude/plugins/cache/claude-dashboard/claude-dashboard/1.0.0/dist"
+# The reading a recovered subscription leaves, and the record beside it. Every
+# case uses this one pair and changes nothing but the date on the file, so age is
+# the only thing any of them can be deciding.
+s44_reading() { # $1=five-hour percent
+  printf '{"claude":{"available":true,"error":false,"fiveHourPercent":%s,"fiveHourReset":"%s","sevenDayPercent":31,"sevenDayReset":"%s"}}\n' \
+    "$1" "$S44_FUT" "$S44_FUT"
+}
+s44_state() {
+  printf '{"started_at":"t","baseline_usage_usd":0,"ccd_spend_usd":0.5,"recovery_notified_window":"five_hour","recovery_notified_reset":"%s","last_five_hour_percent":4,"last_five_hour_reset":"%s","last_seven_day_percent":31,"last_seven_day_reset":"%s"}\n' \
+    "$S44_FUT" "$S44_FUT" "$S44_FUT"
+}
+# A pinned clock for the row, and only when a case asks for one. Whole seconds and
+# fractional seconds can only disagree inside one second, which is far too narrow
+# a window for a fixture to hold open by racing it — so (e) stops the row's clock
+# instead and the case becomes a fact about the two rules.
+mkdir -p "$FAKE/s44py"
+cat > "$FAKE/s44py/sitecustomize.py" <<'S44PY'
+import os, time
+_n = os.environ.get("CCD_S44_NOW")
+if _n:
+    time.time = lambda _f=float(_n): _f
+S44PY
+# Each case seeds its whole world: the reading, the date on it, the record beside
+# it, and whether anything here could replace it. Nothing is registered, so the
+# escape-to-a-spare arm never runs; no dashboard and a probe already backing off,
+# so a refresh cannot quietly rewrite the file the case is about — except in (b),
+# where being rewritten IS the assertion.
+S44_NOW=""
+s44_fixture() { # $1=how to date the cache: seconds from now, or "sub"   $2=dash → a dashboard that can refresh it
+  rm -rf "$S44D/accounts" "$S44D/readings" "$S44_HF" "$S44D/refresh-failed" \
+         "$FAKE/.claude/plugins/cache/claude-dashboard" \
+         "$FAKE/.claude/plugins/data/claude-dashboard-claude-dashboard" \
+         "$S44D/.dashboard-row" "$S44D/.dashboard-row.lock"
+  mkdir -p "$S44D"
+  s44_reading 4 > "$S44D/quota-cache.json"
+  s44_state > "$S44D/run-state.json"
+  : > "$S44D/.usage-probe-backoff"
+  if [ "${2:-}" = "dash" ]; then
+    mkdir -p "$S44_DASH"; : > "$S44_DASH/check-usage.js"
+    s44_reading 7 > "$FAKE/.stub-usage.json"
+  fi
+  S44_NOW=$(python3 - "$S44D/quota-cache.json" "$1" <<'S44SEED'
+import os, sys, time
+if sys.argv[2] == "sub":
+    # Half a second into the second that is running now. Whole-second arithmetic
+    # cannot see that half second — `date +%s` and `stat %m` both drop it — so the
+    # hook reads this file as 0s old however long it takes to get here, while a
+    # fractional reading of the same file calls it future-dated. The clock the row
+    # is judged on is pinned a quarter second in, so what the two say about this
+    # file is a fact about the two rules and not about which ran first.
+    n = int(time.time())
+    t, pinned = n + 0.5, n + 0.25
+else:
+    t, pinned = time.time() + float(sys.argv[2]), ""
+os.utime(sys.argv[1], (t, t))
+print(pinned)
+S44SEED
+)
+}
+# One prompt tick of a supervised ccd session — the tick that arms the way home.
+s44_start() { "$FAKE/sigbin/claude" 8 2>/dev/null & S44_PID=$!; sleep 0.3; }
+s44_run() { # $1=session id
+  printf '{"session_id":"%s","cwd":"/tmp/w","hook_event_name":"UserPromptSubmit"}' "$1" \
+    | CCD_ACTIVE=1 ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_AUTH_TOKEN=x \
+      CCD_HANDOFF=00000000000000000000000000000002 CCD_HANDOFF_STATE="$S44_HF" \
+      CLAUDE_PID=$S44_PID CCD_STANDIN_PID=$S44_PID \
+      "$ROOT/scripts/quota-guard.sh" UserPromptSubmit >/dev/null 2>&1
+  sleep 0.3
+}
+s44_done() { kill -9 "$S44_PID" 2>/dev/null; wait "$S44_PID" 2>/dev/null; }
+# The row that same session renders. CCD_S44_NOW is empty unless the case pinned a
+# clock, and the module above is inert without it.
+s44_row() {
+  printf '%s' '{}' \
+    | env PYTHONPATH="$FAKE/s44py" CCD_S44_NOW="$S44_NOW" \
+      CCD_ACTIVE=1 CCD_HANDOFF=00000000000000000000000000000002 HOME="$FAKE" \
+      "$ROOT/bin/ccd-statusline" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g'
+}
+# What `ccd doctor` says about the same file. It is the third reader of this one
+# rule, and the only place a user goes to ask why nothing is happening.
+s44_doctor() {
+  "$ROOT/bin/ccd" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g' | sed -n '/Quota readings/,/^$/p'
+}
+
+# (a) The bug. The clock stepped back a quarter of an hour, so the cache is dated
+# ahead of now. Nothing may be armed off it, and nothing may be promised from it.
+s44_fixture 900
+s44_start
+s44_run sess-s44a
+[ -z "$(hf_get armed)" ] \
+  && ok "a reading dated in the future arms no return" \
+  || bad "armed off a reading from the future" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s44_done
+s44_fixture 900
+row=$(s44_row)
+case "$row" in
+  *"Claude recovered"*) bad "the row promised a return off a reading from the future" "got: $row" ;;
+  *) ok "...and the row promises none from it either" ;;
+esac
+s44_fixture 900
+s44_doc=$(s44_doctor)
+case "$s44_doc" in
+  *"✓ 5h"*) bad "doctor called a reading from the future healthy" \
+                "got: $(printf '%s' "$s44_doc" | tr '\n' ' ' | head -c 140)" ;;
+  *) ok "...and doctor does not report it as a working reading" ;;
+esac
+
+# (b) ...and it is replaced, not pinned. The same negative age read as "not older
+# than the ten-minute TTL", so the ordinary refresh skipped it and the reading
+# stayed there until the clock caught up — which for a backward step is exactly
+# as long as the step itself.
+s44_fixture 900 dash
+s44_start
+s44_run sess-s44b
+s44_done
+s44_after=$(python3 - "$S44D/quota-cache.json" <<'S44CHK'
+import json, os, sys, time
+p = sys.argv[1]
+try:
+    pct = json.load(open(p))["claude"]["fiveHourPercent"]
+except Exception as e:
+    pct = f"unreadable ({e})"
+print(f"{pct} {'ahead' if os.path.getmtime(p) > time.time() else 'behind'}")
+S44CHK
+)
+[ "$s44_after" = "7 behind" ] \
+  && ok "...and a refresh replaces it instead of being blocked by it" \
+  || bad "a reading from the future was pinned" "the cache still reads: $s44_after"
+
+# (c) Too old is the other end of the same rule, and it was never in dispute.
+# Both sides refuse, and this case is here so a change to either end shows up.
+s44_fixture -7200
+s44_start
+s44_run sess-s44c
+[ -z "$(hf_get armed)" ] \
+  && ok "a reading older than the bound still arms nothing" \
+  || bad "armed off a stale reading" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s44_done
+s44_fixture -7200
+row=$(s44_row)
+case "$row" in
+  *"Claude recovered"*) bad "the row promised a return off a stale reading" "got: $row" ;;
+  *) ok "...and the row refuses it on the same bound" ;;
+esac
+
+# (d) Inside the bound, both still work. A rule that refuses everything is not the
+# fix; it is the same outage with nothing left to end it.
+s44_fixture -60
+s44_start
+s44_run sess-s44d
+[ "$(hf_get direction)" = "to_subscription" ] \
+  && ok "a reading inside the bound still arms the return" \
+  || bad "the return stopped arming" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s44_done
+s44_fixture -60
+row=$(s44_row)
+case "$row" in
+  *"$S44_BANNER"*) ok "...and the row still shows the banner, word for word" ;;
+  *) bad "the banner stopped appearing" "got: $row" ;;
+esac
+
+# (e) The sub-second half of the same disagreement. The hook measures age in whole
+# seconds and the row measured it fractionally, so a file half a second into the
+# current second was 0s old to one and future-dated to the other — one reading,
+# two verdicts again, a second below the resolution either of them can act on.
+# Whole seconds is the answer both give now.
+s44_fixture sub
+s44_start
+s44_run sess-s44e
+[ "$(hf_get direction)" = "to_subscription" ] \
+  && ok "a reading dated inside the current second is usable to the hook" \
+  || bad "the hook refused a reading from this second" "armed=$(hf_get armed) direction=$(hf_get direction)"
+s44_done
+s44_fixture sub
+row=$(s44_row)
+case "$row" in
+  *"$S44_BANNER"*) ok "...and the row says the same, to the same whole second" ;;
+  *) bad "whole seconds on one side, fractional on the other" "the row read the same file as future-dated: $row" ;;
+esac
+
+rm -rf "$FAKE/s44py" "$S44_HF" "$S44D/run-state.json" "$S44D/quota-cache.json" \
+       "$S44D/.usage-probe-backoff" "$S44D/refresh-failed"
+unset -f s44_reading s44_state s44_fixture s44_start s44_run s44_done s44_row s44_doctor
+unset S44_NOW S44_BANNER S44_DASH S44_FUT s44_after s44_doc
+
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

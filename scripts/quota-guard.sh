@@ -127,8 +127,24 @@ valid_session_id() {
   esac
 }
 
+# Seconds since a file was written, in whole seconds — and never a negative
+# number. This is the lower half of the one freshness rule (#98): a file dated
+# ahead of the clock is a backward clock step or a poisoned file, never something
+# fresh, and every caller here wants the same answer for it as for a file that is
+# not there. Returning the age unsigned made a future stamp "younger than the
+# bound" to every one of them at once: quota_peak armed a return from a reading it
+# could not stand behind, the ten-minute refresh saw nothing worth replacing and
+# left it pinned there, and the backoff and warning stamps suppressed their own
+# work until the clock caught up. Ancient is the answer that keeps each of them
+# doing what a missing file already makes them do.
+#
+# The upper half of the rule lives with the bound each caller applies. The
+# statusline and `ccd doctor` ask the same question in Python and must give the
+# same answer, so both compute it the same way: whole seconds, truncating the
+# clock and the mtime separately, exactly as `date +%s` and `stat` do here.
+# Three copies, one rule — #63 is the refactor that would give it one home.
 file_age() {
-  local f="$1" now mtime
+  local f="$1" now mtime age
   now=$(date +%s)
   [ -f "$f" ] || { echo 999999; return; }
   # GNU first, BSD second, and the fallback MUST be outside the command
@@ -139,7 +155,9 @@ file_age() {
   case "$mtime" in
     ''|*[!0-9]*) echo 999999; return ;;   # unusable → treat as ancient, never as fresh
   esac
-  echo $((now - mtime))
+  age=$((now - mtime))
+  [ "$age" -lt 0 ] && age=999999          # dated ahead of the clock → the same
+  echo "$age"
 }
 
 # Refresh the dashboard's Claude quota cache regardless of ccd state,
@@ -376,6 +394,12 @@ fi
 # fresh quota would then look corroborated. Three consecutive failed refreshes
 # (the refresh runs on a ten-minute timer) is the point where the sample stops
 # being evidence about now.
+#
+# The whole rule is 0 ≤ age ≤ MAX_READING_AGE. Its other end is in file_age, which
+# never returns a negative age, so a reading dated ahead of the clock is refused
+# here and replaced by the refresh above rather than pinned in place (#98). The
+# statusline's WARN_MAX_AGE and `ccd doctor` are the same number and the same two
+# bounds, held in step by hand until #63.
 MAX_READING_AGE=1800
 quota_peak() {
   [ -f "$CACHE" ] || return 0
@@ -1299,8 +1323,14 @@ except Exception:
     pass
 # An empty file is one O_CREAT just made, not a claim: its mtime is "now" and
 # would otherwise silence every first warning. A claim writes the time.
+#
+# The shell pre-filter above judged this same file with file_age, so this asks the
+# same question the same way: whole seconds, and bounded at both ends. Fractional
+# seconds answered the pre-filter's question differently inside any one second,
+# and an unbounded lower end let a mark dated ahead of the clock hold the warning
+# back for as long as the clock was behind (#98).
 st = os.fstat(fd)
-if st.st_size and time.time() - st.st_mtime <= int(sys.argv[4]):
+if st.st_size and 0 <= int(time.time()) - int(st.st_mtime) <= int(sys.argv[4]):
     sys.exit(0)
 os.ftruncate(fd, 0); os.write(fd, str(int(time.time())).encode())
 print(json.dumps({"hookSpecificOutput": {"hookEventName": sys.argv[2],
