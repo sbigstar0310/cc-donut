@@ -9006,9 +9006,13 @@ h=$(s38_home)
 S38_NOP=$(mktemp -d "$FAKE/s38nop.XXXXXX")
 printf '#!/bin/sh\nexit 0\n' > "$S38_NOP/chmod"; chmod +x "$S38_NOP/chmod"
 s38_setup "$h" "$S38_NOP:$S38_PATH"
-{ [ -f "$h/.claude/ccd/bin/claude" ] && [ ! -x "$h/.claude/ccd/bin/claude" ]; } \
-  && ok "a chmod that does not take really does leave the shim non-executable" \
-  || bad "shim chmod" "the fixture did not produce a non-executable shim"
+# Asked of the final path, not of a file at it: since §43 the bytes go to a sibling
+# and a chmod that did not take stops them being moved over, so there is nothing
+# there at all. Either way the stand-in is what put it that way — the real chmod
+# would have left an executable shim — so this still says the fixture worked.
+[ ! -x "$h/.claude/ccd/bin/claude" ] \
+  && ok "a chmod that does not take really does leave no runnable shim" \
+  || bad "shim chmod" "the fixture produced a runnable shim anyway"
 s38_claimed \
   && bad "shim chmod" "called a non-executable file an installed launcher: $(s38_brief)" \
   || ok "...and setup does not call it an installed launcher"
