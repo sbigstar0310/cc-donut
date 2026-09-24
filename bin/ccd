@@ -672,6 +672,22 @@ except (OSError, ValueError, AttributeError):
     claude = None
 usable = (isinstance(claude, dict) and claude.get("available") is True
           and claude.get("error") is False)
+# The one freshness rule, the third copy of it: 0 <= age <= MAX_READING_AGE, in
+# whole seconds (#98; #63 is the refactor that would give it one home). Both ends
+# matter. A reading dated ahead of the clock is a backward clock step, the handoff
+# stopped trusting it the moment it arrived, and reporting it as a working reading
+# sent the one user who came here to ask why away with a green check.
+MAX_READING_AGE = 1800
+fresh = age is not None and 0 <= age <= MAX_READING_AGE
+
+
+def age_note(age):
+    """How old, in the words the user can act on — and never a negative minute."""
+    if age is None:
+        return ""
+    if age < 0:
+        return f" {DIM}(dated {-age // 60}m ahead of this clock){RS}"
+    return f" {DIM}({age // 60}m old){RS}"
 
 
 def expired(reset):
@@ -708,13 +724,16 @@ if vals:
     # Reporting healthy up to some friendlier number would be the exact failure
     # this section exists to end: a green check on a reading that the handoff has
     # already stopped trusting.
-    stale = age is None or age > 1800
+    stale = not fresh
     mark = f"{Y}△{RS}" if stale else f"{G}✓{RS}"
-    when = f" {DIM}({age // 60}m old){RS}" if age is not None else ""
-    print(f"  {mark} {' · '.join(vals)}{when}")
-    if stale:
+    print(f"  {mark} {' · '.join(vals)}{age_note(age)}")
+    if stale and age is not None and age < 0:
+        print(f"      {Y}Dated ahead of this clock, so it arms nothing.{RS}"
+              f" {DIM}The clock stepped backwards; the next prompt replaces it.{RS}")
+    elif stale:
         print(f"      {Y}Too old to arm a handoff.{RS} {DIM}Refreshes have stopped;"
               f" the reading has to be under 30 minutes old.{RS}")
+    if stale:
         try:
             with open(os.environ["QF"], encoding="utf-8") as f:
                 for line in f.read().splitlines():
@@ -734,9 +753,8 @@ elif dropped:
             failure = f.read().strip()
     except OSError:
         pass
-    if failure or age is None or age > 1800:
-        when = f" {DIM}({age // 60}m old){RS}" if age is not None else ""
-        print(f"      {Y}Refreshes have stopped.{RS}{when}")
+    if failure or not fresh:
+        print(f"      {Y}Refreshes have stopped.{RS}{age_note(age)}")
         for line in failure.splitlines():
             if line.strip():
                 print(f"      {DIM}{line.strip()}{RS}")

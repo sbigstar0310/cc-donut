@@ -44,7 +44,10 @@ ACCT_MAX_STALE=${CCD_ACCT_MAX_STALE:-3600}  # the same rule, applied to account 
 # being the same expression, not by being imported — this file spawns nothing.
 
 # What the arming path calls MAX_READING_AGE. The warning and the handoff answer the
-# same question — is the subscription spent right now — so they get the same bound.
+# same question — is the subscription spent right now — so they get the same bound,
+# and the same two ends of it: a reading is usable when 0 ≤ age ≤ this, measured in
+# whole seconds (reading_fresh below). The third copy of that number and that rule
+# is `ccd doctor`; #63 is the refactor that would give them one home.
 WARN_MAX_AGE=${CCD_WARN_MAX_AGE:-1800}
 DASH_TIMEOUT=${CCD_DASH_TIMEOUT:-20}        # a hung child must not outlive its row
 
@@ -216,6 +219,22 @@ def load(path):
     except Exception:
         return {}
 
+def reading_fresh(path, max_age):
+    """The one freshness rule: 0 <= age <= max_age, in whole seconds (#98).
+
+    Whole seconds, truncating the clock and the mtime separately, is exactly what
+    the hook measures with `date +%s` and `stat`; answering fractionally made the
+    two disagree about the same file inside any one second. The lower end carries
+    the same weight as the upper one: after a backward clock step the file is
+    dated ahead of now, and an age allowed to go negative reads as fresher than
+    fresh — which is how the hook armed a return the row would not promise.
+    Kept identical here, in scripts/quota-guard.sh and in `ccd doctor` by hand;
+    #63 is the refactor that would give it one home."""
+    try:
+        return 0 <= int(time.time()) - int(os.path.getmtime(path)) <= max_age
+    except OSError:
+        return False
+
 state = load(sys.argv[1])
 prices = load(sys.argv[2]).get("models", {})
 try:
@@ -365,13 +384,12 @@ def has_room():
     and the last_*_percent in run-state.json carry no age bound of their own, so
     nothing here is decided on them."""
     try:
-        age = time.time() - os.path.getmtime(sys.argv[4])
         c = json.load(open(sys.argv[4])).get("claude") or {}
         spent_at = int(os.environ["SPENT_AT"])
         max_age = int(os.environ["WARN_MAX_AGE"])
     except Exception:
         return False
-    if not 0 <= age <= max_age:
+    if not reading_fresh(sys.argv[4], max_age):
         return False
     if c.get("available") is not True or c.get("error") is not False:
         return False
@@ -446,6 +464,22 @@ row=$(ACCT_MAX_STALE="$ACCT_MAX_STALE" WARN_MAX_AGE="$WARN_MAX_AGE" \
            "$CACHE" "$CCD_DIR/providers/keys.env" 2>/dev/null <<'PY'
 import datetime, hashlib, json, os, re, sys, time
 adir, qdir, cache_file, keys_file = sys.argv[1:5]
+
+def reading_fresh(path, max_age):
+    """The one freshness rule: 0 <= age <= max_age, in whole seconds (#98).
+
+    Whole seconds, truncating the clock and the mtime separately, is exactly what
+    the hook measures with `date +%s` and `stat`; answering fractionally made the
+    two disagree about the same file inside any one second. The lower end carries
+    the same weight as the upper one: after a backward clock step the file is
+    dated ahead of now, and an age allowed to go negative reads as fresher than
+    fresh — which is how the hook armed a return the row would not promise.
+    Kept identical here, in scripts/quota-guard.sh and in `ccd doctor` by hand;
+    #63 is the refactor that would give it one home."""
+    try:
+        return 0 <= int(time.time()) - int(os.path.getmtime(path)) <= max_age
+    except OSError:
+        return False
 
 # The ready/full bound is ccd's one meaning of "spent" (bin/spent-at), read from
 # the same file ccd-account and the hook read. Drawing the line anywhere else here
@@ -555,11 +589,15 @@ def fresh(rec):
     """Was this measured recently enough to describe now?
 
     A future stamp is a clock that moved or a file someone edited; either way it
-    is not evidence, and treating it as fresh would make it immortal."""
+    is not evidence, and treating it as fresh would make it immortal.
+
+    Whole seconds, because ccd-account stamps checked_at with int(time.time()) and
+    judges it there with the same arithmetic (reading_fresh): a fractional answer
+    here disagreed with the tool that wrote the row, inside any one second (#98)."""
     t = rec.get("checked_at")
     if not isinstance(t, (int, float)):
         return False
-    return 0 <= (time.time() - t) <= MAX_STALE
+    return 0 <= int(time.time()) - int(t) <= MAX_STALE
 
 
 quota = {n: r for n, r in quota.items()
@@ -801,8 +839,7 @@ if paid_hop and not supervised and have_key():
 warn = ""
 try:
     c = (json.load(open(cache_file)).get("claude") or {})
-    fresh_enough = 0 <= time.time() - os.path.getmtime(cache_file) <= int(
-        os.environ.get("WARN_MAX_AGE", "1800"))
+    fresh_enough = reading_fresh(cache_file, int(os.environ.get("WARN_MAX_AGE", "1800")))
 except Exception:
     c, fresh_enough = {}, False
 vals = [p for p, r in ((c.get("fiveHourPercent"), c.get("fiveHourReset")),
@@ -845,13 +882,16 @@ print("\n".join(x for x in (acct, warn) if x), end="")
 # registered account a spare (#41), and the cache's age is one stat. Deciding it in
 # the shell instead would cost a second python on every render and a second copy of
 # that rule. A future stamp is not freshness, the same call dash_age makes.
+#
+# Whole seconds, and the same bound the hook applies to readings_age, so the two
+# triggers cannot ask for a refresh on different ticks of the same second (#98).
 try:
     TTL = int(os.environ.get("CCD_CANDIDATE_TTL", "300"))
 except ValueError:
     TTL = 300
 try:
-    age = time.time() - max(os.path.getmtime(os.path.join(qdir, f)) for f in os.listdir(qdir)
-                            if f.endswith(".json"))
+    age = int(time.time()) - int(max(os.path.getmtime(os.path.join(qdir, f))
+                                     for f in os.listdir(qdir) if f.endswith(".json")))
 except (OSError, ValueError):       # no directory, or nothing in it yet
     age = float("inf")
 raise SystemExit(3 if spares and not 0 <= age < TTL else 0)
