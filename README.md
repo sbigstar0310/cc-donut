@@ -367,7 +367,6 @@ test/docker.sh alpine:3.20    # and on musl/BusyBox
 The assertions live in `test/cases/`, one file per product area, each run in its own
 process with its own throwaway HOME and each runnable on its own.
 
-
 No network, no real key, no writes outside the temp HOME. Run the container tests
 before releasing: GNU/BSD differences (`stat`, for one) go unnoticed on macOS and
 fail for Linux users. CI runs all three on every push.
