@@ -15,7 +15,12 @@ export HOME="$FAKE"
 # for the zsh startup file `ccd setup` edits: where a developer keeps zsh dotfiles
 # outside $HOME, an inherited one sent the fixture's PATH line to their real
 # ~/.zshrc (#100). §18d is the only case with any use for it, and sets it itself.
-unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR ZDOTDIR
+# CCD_PROVIDERS_DIR, and CLAUDE_PROVIDERS_DIR behind it, outrank HOME for the
+# directory keys.env lives in, so on a machine that sets either one §7's `ccd key`
+# overwrote the developer's REAL OpenRouter key — and every run bootstrapped config
+# files into their directory (#109).
+unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR ZDOTDIR \
+      CCD_PROVIDERS_DIR CLAUDE_PROVIDERS_DIR
 # The suite imports bin/ccd-account as a module; Python would otherwise leave its
 # bytecode in bin/, and one such file shipped in v0.8.0 (#77).
 export PYTHONDONTWRITEBYTECODE=1
@@ -113,6 +118,7 @@ if [ "${1:-}" = "--setup-canary" ]; then
   # canary catches the ones `setup` itself resolves; this catches the rest, so
   # deleting any one of those unsets cannot go unnoticed.
   for v in ZDOTDIR CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR \
+           CCD_PROVIDERS_DIR CLAUDE_PROVIDERS_DIR \
            CCD_HANDOFF CCD_HANDOFF_STATE; do
     [ -z "${!v-}" ] || printf 'SURVIVED %s\n' "$v"
   done
@@ -9355,11 +9361,15 @@ head_ "41. a fixture setup writes nothing outside its HOME"
 # points at a canary that must stay empty, and the run's own HOME is the only place
 # anything may land. The receipt matters as much as the canary — a run that edited
 # no startup file at all would leave the canary clean and prove nothing.
+# CCD_PROVIDERS_DIR and CLAUDE_PROVIDERS_DIR are the same hole one directory down:
+# bin/ccd resolves keys.env under them, so on a machine that sets one, §7's
+# `ccd key` overwrote the developer's REAL OpenRouter key (#109).
 S41C="$FAKE/s41-canary"
 rm -rf "$S41C"; mkdir -p "$S41C"
 s41=$(env ZDOTDIR="$S41C" XDG_CONFIG_HOME="$S41C" XDG_DATA_HOME="$S41C" \
           XDG_STATE_HOME="$S41C" XDG_CACHE_HOME="$S41C" \
           CLAUDE_CONFIG_DIR="$S41C" CLAUDE_SECURESTORAGE_CONFIG_DIR="$S41C" \
+          CCD_PROVIDERS_DIR="$S41C" CLAUDE_PROVIDERS_DIR="$S41C" \
           CCD_HANDOFF=00000000000000000000000000000002 \
           CCD_HANDOFF_STATE="$S41C/handoff.json" \
           bash "$ROOT/test/smoke.sh" --setup-canary "$S41C" 2>&1)
@@ -10047,6 +10057,50 @@ rm -rf "$FAKE/s44py" "$S44_HF" "$S44D/run-state.json" "$S44D/quota-cache.json" \
        "$S44D/.usage-probe-backoff" "$S44D/refresh-failed"
 unset -f s44_reading s44_state s44_fixture s44_start s44_run s44_done s44_row s44_doctor
 unset S44_NOW S44_BANNER S44_DASH S44_FUT s44_after s44_doc
+
+head_ "45. a revocation that could not happen is the failure that is reported"
+# `ccd setup --no-auto` withdraws the paid-hop consent by deleting its marker. On a
+# ~/.claude/ccd that refuses writes the delete fails and the consent stands — the one
+# failure in setup that still costs money, because a supervised session can go on
+# hopping to OpenRouter on the user's own key. setup keeps going after a failure so
+# the rest still installs, but it has a single slot for the failure and the remedy
+# that repairs it, and the statusline launcher in that same unwritable directory
+# fails too (#106): the later message took the slot, and the user was sent to
+# `ccd setup`, which installs a statusline and revokes nothing.
+# Only meaningful as a non-root user — root writes through a read-only directory.
+if [ "$(id -u)" -ne 0 ]; then
+  s45h=$(mktemp -d "$FAKE/s45.XXXXXX")
+  mkdir -p "$s45h/.claude/ccd/providers" "$s45h/.local/bin"
+  # Both would be written into the unwritable directory on the way past; pre-placing
+  # them keeps this case's output about the two failures it is here for.
+  cp "$ROOT/QUOTA-SOS.md" "$s45h/.claude/ccd/QUOTA-SOS.md"
+  : > "$s45h/.claude/ccd/paid-handoff"
+  chmod 500 "$s45h/.claude/ccd"
+  s45=$(HOME="$s45h" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --no-auto 2>&1); s45st=$?
+  chmod 700 "$s45h/.claude/ccd"
+  [ -f "$s45h/.claude/ccd/paid-handoff" ] \
+    && ok "an unwritable ~/.claude/ccd really does leave the paid opt-in in place" \
+    || bad "revocation fixture" "the marker went anyway — this case proves nothing"
+  case "$s45" in
+    *"opt-in could not be removed"*) ok "...and setup names the consent it could not withdraw" ;;
+    *) bad "revocation overwritten" "a later failure took its place: $(printf '%s' "$s45" | tr '\n' ' ' | tail -c 200)" ;;
+  esac
+  case "$s45" in
+    *"Fix:  delete ~/.claude/ccd/paid-handoff, or re-run: ccd setup --no-auto"*)
+      ok "...and the remedy beside it is the one that withdraws the consent" ;;
+    *) bad "revocation remedy" "no remedy that revokes: $(printf '%s' "$s45" | tr '\n' ' ' | tail -c 200)" ;;
+  esac
+  case "$s45" in
+    *"then re-run: ccd setup"*)
+      bad "revocation remedy" "sent the user to a plain \`ccd setup\`, which revokes nothing" ;;
+    *) ok "...and not to a plain \`ccd setup\`, which revokes nothing" ;;
+  esac
+  [ "$s45st" -ne 0 ] \
+    && ok "...and setup exits non-zero (got $s45st)" \
+    || bad "revocation" "exited 0 with the paid opt-in still in effect"
+  rm -rf "$FAKE"/s45.*
+  unset s45 s45st s45h
+fi
 
 printf '\n──────────\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

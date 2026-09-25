@@ -1161,13 +1161,24 @@ RC_OTHERS
   return "$removed"
 }
 
+# Fills setup()'s one failure slot, and only while it is empty. setup carries on
+# after a failure so the rest still installs, which used to mean the LAST failure
+# was the one reported — and it took the earlier remedy with it. That cost money:
+# with ~/.claude/ccd unwritable, `setup --no-auto` could not delete the paid-hop
+# marker, then could not write the statusline, and only the statusline's "re-run:
+# ccd setup" reached the screen — a command that revokes nothing, so a supervised
+# session went on hopping to OpenRouter on the user's key (#109). The first failure
+# is also the one whose remedy repairs the rest: they fail on the same directory.
+note_fail() { [ -n "$fail" ] || { fail="$1"; fix="$2"; }; }
+
 setup() {
   local launcher="$HOME/.local/bin/ccd" statusline_launcher="$CCD_DIR/statusline-launcher.sh"
   local settings="$HOME/.claude/settings.json"
   # What went wrong, and what to do about it. Reported at the very end and as this
   # function's exit status, because an install that produced nothing runnable is a
   # failed install however much else went right. The remedy travels with the
-  # failure: `--yes` repairs a declined prompt and nothing else.
+  # failure: `--yes` repairs a declined prompt and nothing else — which is why
+  # note_fail() fills this slot once and a later failure cannot take it over.
   local auto=0 assume_yes=0 auto_next="" fail="" fix=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1264,8 +1275,8 @@ CCD_CLAUDE_SHIM
       # cannot happen — the same class of silent half-install this release exists
       # to end.
       if ! { : > "$CCD_PAID_OPTIN"; } 2>/dev/null; then
-        fail="the paid-hop opt-in could not be recorded — subscription hops still work"
-        fix="make $(tilde "$CCD_DIR") writable, then re-run: ccd setup --auto"
+        note_fail "the paid-hop opt-in could not be recorded — subscription hops still work" \
+                  "make $(tilde "$CCD_DIR") writable, then re-run: ccd setup --auto"
       fi
       # Report the file, not the three commands that were supposed to produce it.
       # A full disk, a read-only ~/.claude/ccd or a chmod that did not take used to
@@ -1286,8 +1297,8 @@ CCD_CLAUDE_SHIM
         printf '  %swhen every subscription is spent, and back when the quota resets.%s\n' "$d" "$r"
       else
         shim_ok=0
-        fail="the OpenRouter launcher could not be installed at $(tilde "$claude_shim")"
-        fix="make $(tilde "$CCD_SHIM_DIR") a writable directory, then re-run: ccd setup --auto"
+        note_fail "the OpenRouter launcher could not be installed at $(tilde "$claude_shim")" \
+                  "make $(tilde "$CCD_SHIM_DIR") a writable directory, then re-run: ccd setup --auto"
       fi
 
       # The shim is only reachable if its directory comes before the real claude
@@ -1332,23 +1343,23 @@ CCD_CLAUDE_SHIM
               printf '%s⚠ could not record ownership in %s — leaving %s alone.%s\n' \
                 "$ylw" "$(tilde "$CCD_PATH_TARGET")" "$(tilde "$rc")" "$r"
               printf '  %sAdd the line yourself, then open a new terminal.%s\n' "$d" "$r"
-              fail="automatic handoff is installed but not active"
-              fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
+              note_fail "automatic handoff is installed but not active" \
+                        "add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
             elif { printf '\n%s\n%s\n' "$CCD_PATH_SIG" "$CCD_PATH_LINE" >> "$rc"; } 2>/dev/null; then
               printf '✓ added to %s\n' "$(tilde "$rc")"
               auto_next="source $(tilde "$rc")"
             else
               printf '%s⚠ could not write %s — add the line yourself%s\n' "$ylw" "$(tilde "$rc")" "$r"
-              fail="automatic handoff is installed but not active"
-              fix="add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
+              note_fail "automatic handoff is installed but not active" \
+                        "add this line to $(tilde "$rc") yourself:  $CCD_PATH_LINE"
             fi
           else
             printf '  %sSkipped — the OpenRouter handoff is installed but not active yet.%s\n' "$ylw" "$r"
             printf '  %sAdd that line yourself, or re-run: ccd setup --auto --yes%s\n' "$d" "$r"
-            fail="the OpenRouter handoff is installed but not active"
             # --auto, not a bare setup: a bare one installs no launcher now, so it
             # would not go near the PATH line this is about.
-            fix="ccd setup --auto --yes   (then open a new terminal)"
+            note_fail "the OpenRouter handoff is installed but not active" \
+                      "ccd setup --auto --yes   (then open a new terminal)"
           fi
         elif [ -n "${rc:-}" ]; then
           printf '✓ PATH line already in %s — open a new terminal if `claude` is not ours yet\n' "$(tilde "$rc")"
@@ -1357,8 +1368,8 @@ CCD_CLAUDE_SHIM
           printf '    %s%s%s\n' "$b" "$CCD_PATH_LINE" "$r"
           # rc_file() declined to name a startup file for this shell, and --yes
           # cannot change that. Only the user can place the line.
-          fail="automatic handoff is installed but not active"
-          fix="add the line above to your shell startup file, then open a new terminal"
+          note_fail "automatic handoff is installed but not active" \
+                    "add the line above to your shell startup file, then open a new terminal"
         fi
       fi
       ;;
@@ -1374,8 +1385,8 @@ CCD_CLAUDE_SHIM
       # only failure here that can still cost money.
       rm -f "$CCD_PAID_OPTIN" 2>/dev/null
       if [ -f "$CCD_PAID_OPTIN" ]; then
-        fail="the paid-hop opt-in could not be removed — it is still in effect"
-        fix="delete $(tilde "$CCD_PAID_OPTIN") to withdraw it"
+        note_fail "the paid-hop opt-in could not be removed — it is still in effect" \
+                  "delete $(tilde "$CCD_PAID_OPTIN"), or re-run: ccd setup --no-auto"
       fi
       # Take the PATH line back out with the shim: an entry pointing at a
       # directory we just emptied is litter in someone's startup file.
@@ -1429,14 +1440,14 @@ PY
   if [ "$cmd_written" -eq 0 ]; then
     printf '✓ ccd command installed (~/.local/bin/ccd)\n'
   else
-    fail="the ccd command could not be installed at $(tilde "$launcher")"
-    fix="make $(tilde "$HOME/.local/bin") a writable directory, then re-run: ccd setup"
+    note_fail "the ccd command could not be installed at $(tilde "$launcher")" \
+              "make $(tilde "$HOME/.local/bin") a writable directory, then re-run: ccd setup"
   fi
   if [ "$statusline_written" -eq 0 ]; then
     printf '✓ statusline wired — dashboard output preserved\n'
   else
-    fail="the statusline launcher could not be installed at $(tilde "$statusline_launcher")"
-    fix="make $(tilde "$CCD_DIR") a writable directory, then re-run: ccd setup"
+    note_fail "the statusline launcher could not be installed at $(tilde "$statusline_launcher")" \
+              "make $(tilde "$CCD_DIR") a writable directory, then re-run: ccd setup"
   fi
   printf '→ In a running Claude Code session: /reload-plugins activates the hooks\n'
   case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) printf '→ Add to PATH: export PATH="$HOME/.local/bin:$PATH"\n' ;; esac
