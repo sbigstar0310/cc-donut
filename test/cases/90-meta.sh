@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 90-meta — the suite, and the gate that runs it.
-# Sections: §33, §34, §41
+# Sections: §33, §34, §41, §46, §47
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 head_ "33. the container gate checks the image's architecture"
@@ -112,8 +112,6 @@ s41=$(env ZDOTDIR="$S41C" XDG_CONFIG_HOME="$S41C" XDG_DATA_HOME="$S41C" \
          "expected 'wrote .zshrc', got: $(printf '%s' "$s41" | tr '\n' '|')"
 rm -rf "$S41C"
 
-# ── a swap stops when its hold on Claude Code's locks lapses ────────────────
-
 head_ "46. every case file reaches the fixture HOME before anything else"
 # lib/common.sh is what replaces HOME, unsets the variables that outrank it and
 # forces the file credential backend. A file that sourced it second would pass its
@@ -130,5 +128,48 @@ done
 [ -z "$s46" ] \
   && ok "every file under test/cases/ sources lib/common.sh as its first executable line" \
   || bad "a case file could reach the real HOME" "$s46"
+
+
+head_ "47. the runner believes a case's exit status, not only its tally"
+# A case writes its tally in `finish`, before its last line runs — so the tally can
+# say zero failures and the file still die after it: a signal, or a teardown that
+# kills one of the background stand-ins these cases leave running. The monolith was
+# a single shell, so such a death WAS the suite's own nonzero exit. Reading only
+# the tally gives that back as a green run over a case that never finished.
+# The runner is exercised against stub cases in a tree of its own: the real files
+# take minutes, and none of them can be made to die on purpose.
+S47="$FAKE/s47"
+rm -rf "$S47"; mkdir -p "$S47/test/cases"
+cp "$ROOT/test/smoke.sh" "$S47/test/smoke.sh"
+s47_run() {  # $1 = the stub case's body → the runner's own last line
+  printf '%s\n' "$1" > "$S47/test/cases/10-stub.sh"
+  bash "$S47/test/smoke.sh" 2>&1 | tail -1
+}
+
+s47=$(s47_run 'printf "3 0\n" > "$CCD_TALLY_OUT"; exit 0')
+[ "$s47" = "3 passed, 0 failed" ] && ok "a case that reports and exits 0 is summed as it reported" \
+  || bad "an ordinary tally" "got: $s47"
+
+s47=$(s47_run 'printf "3 0\n" > "$CCD_TALLY_OUT"; exit 143')
+[ "$s47" = "3 passed, 1 failed" ] \
+  && ok "...a clean tally followed by a nonzero exit is counted as a failure" \
+  || bad "a death the tally never mentioned" "got: $s47"
+
+printf '%s\n' 'printf "3 0\n" > "$CCD_TALLY_OUT"; exit 143' > "$S47/test/cases/10-stub.sh"
+bash "$S47/test/smoke.sh" >/dev/null 2>&1; s47_rc=$?
+[ "$s47_rc" -ne 0 ] && ok "...and the run exits non-zero over it" \
+  || bad "a death the tally never mentioned" "the runner exited 0"
+
+# A file that reports its own failures already exits non-zero through `finish`;
+# counting that again would report two failures where the case found one.
+s47=$(s47_run 'printf "2 1\n" > "$CCD_TALLY_OUT"; exit 1')
+[ "$s47" = "2 passed, 1 failed" ] \
+  && ok "...while a case that reports its failures is not counted twice" \
+  || bad "a reported failure counted twice" "got: $s47"
+
+s47=$(s47_run 'exit 1')
+[ "$s47" = "0 passed, 1 failed" ] && ok "...and a case that reports nothing at all is a failure" \
+  || bad "a missing tally" "got: $s47"
+rm -rf "$S47"
 
 finish

@@ -57,6 +57,16 @@ for f in "${files[@]}"; do
     fail=$((fail + 1))
   else
     pass=$((pass + p)); fail=$((fail + q))
+    # A tally is written before the file's last line runs, so it can be clean and
+    # the file still die after it — a signal, or a teardown that kills the
+    # background stand-ins these cases leave running. The monolith was one shell,
+    # so such a death was the suite's own nonzero exit; here it has to be counted
+    # or the run goes green over a case that never finished. `finish` already
+    # exits nonzero when it reports failures, so only a clean tally is news.
+    if [ "$rc" -ne 0 ] && [ "$q" -eq 0 ]; then
+      printf '  ✗ %s reported %s passed, 0 failed and then exited %s\n' "${f##*/}" "$p" "$rc"
+      fail=$((fail + 1))
+    fi
   fi
 done
 
