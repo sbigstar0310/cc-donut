@@ -94,11 +94,15 @@ head_ "41. a fixture setup writes nothing outside its HOME"
 # points at a canary that must stay empty, and the run's own HOME is the only place
 # anything may land. The receipt matters as much as the canary — a run that edited
 # no startup file at all would leave the canary clean and prove nothing.
+# CCD_PROVIDERS_DIR and CLAUDE_PROVIDERS_DIR are the same hole one directory down:
+# bin/ccd resolves keys.env under them, so on a machine that sets one, §7's
+# `ccd key` overwrote the developer's REAL OpenRouter key (#109).
 S41C="$FAKE/s41-canary"
 rm -rf "$S41C"; mkdir -p "$S41C"
 s41=$(env ZDOTDIR="$S41C" XDG_CONFIG_HOME="$S41C" XDG_DATA_HOME="$S41C" \
           XDG_STATE_HOME="$S41C" XDG_CACHE_HOME="$S41C" \
           CLAUDE_CONFIG_DIR="$S41C" CLAUDE_SECURESTORAGE_CONFIG_DIR="$S41C" \
+          CCD_PROVIDERS_DIR="$S41C" CLAUDE_PROVIDERS_DIR="$S41C" \
           CCD_HANDOFF=00000000000000000000000000000002 \
           CCD_HANDOFF_STATE="$S41C/handoff.json" \
           bash "$ROOT/test/smoke.sh" --setup-canary "$S41C" 2>&1)
@@ -110,21 +114,21 @@ rm -rf "$S41C"
 
 # ── a swap stops when its hold on Claude Code's locks lapses ────────────────
 
-head_ "45. every case file reaches the fixture HOME before anything else"
+head_ "46. every case file reaches the fixture HOME before anything else"
 # lib/common.sh is what replaces HOME, unsets the variables that outrank it and
 # forces the file credential backend. A file that sourced it second would pass its
 # own assertions and write somewhere real on the way to them — the real ~/.claude, a
 # real rc file, the keychain. So it has to be the first thing every one of them does.
-s45=
+s46=
 for f in "$ROOT"/test/cases/*.sh; do
   first=$(grep -vE '^[[:space:]]*(#|$)' "$f" | head -1)
   case "$first" in
     *lib/common.sh*) ;;
-    *) s45="$s45 ${f##*/}:[$first]" ;;
+    *) s46="$s46 ${f##*/}:[$first]" ;;
   esac
 done
-[ -z "$s45" ] \
+[ -z "$s46" ] \
   && ok "every file under test/cases/ sources lib/common.sh as its first executable line" \
-  || bad "a case file could reach the real HOME" "$s45"
+  || bad "a case file could reach the real HOME" "$s46"
 
 finish

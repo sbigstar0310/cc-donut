@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 30-setup-install — what `ccd setup` installs, and what it reports.
-# Sections: §6, §7, §14, §18c, §38, §43
+# Sections: §6, §7, §14, §18c, §38, §43, §45
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 head_ "6. ccd setup / statusline / uninstall"
@@ -587,5 +587,49 @@ unset -f s43_home s43_seed s43_setup s43_run s43_said s43_brief
 unset S43 S43_SIG S43_REAL_CAT S43_REAL_CHMOD S43_BIN S43_TOOLS S43_LOG S43_OUT S43_ST
 
 # ── one freshness rule, on both sides of the reading ─────────────────────────
+
+head_ "45. a revocation that could not happen is the failure that is reported"
+# `ccd setup --no-auto` withdraws the paid-hop consent by deleting its marker. On a
+# ~/.claude/ccd that refuses writes the delete fails and the consent stands — the one
+# failure in setup that still costs money, because a supervised session can go on
+# hopping to OpenRouter on the user's own key. setup keeps going after a failure so
+# the rest still installs, but it has a single slot for the failure and the remedy
+# that repairs it, and the statusline launcher in that same unwritable directory
+# fails too (#106): the later message took the slot, and the user was sent to
+# `ccd setup`, which installs a statusline and revokes nothing.
+# Only meaningful as a non-root user — root writes through a read-only directory.
+if [ "$(id -u)" -ne 0 ]; then
+  s45h=$(mktemp -d "$FAKE/s45.XXXXXX")
+  mkdir -p "$s45h/.claude/ccd/providers" "$s45h/.local/bin"
+  # Both would be written into the unwritable directory on the way past; pre-placing
+  # them keeps this case's output about the two failures it is here for.
+  cp "$ROOT/QUOTA-SOS.md" "$s45h/.claude/ccd/QUOTA-SOS.md"
+  : > "$s45h/.claude/ccd/paid-handoff"
+  chmod 500 "$s45h/.claude/ccd"
+  s45=$(HOME="$s45h" SHELL=/bin/zsh "$ROOT/bin/ccd" setup --no-auto 2>&1); s45st=$?
+  chmod 700 "$s45h/.claude/ccd"
+  [ -f "$s45h/.claude/ccd/paid-handoff" ] \
+    && ok "an unwritable ~/.claude/ccd really does leave the paid opt-in in place" \
+    || bad "revocation fixture" "the marker went anyway — this case proves nothing"
+  case "$s45" in
+    *"opt-in could not be removed"*) ok "...and setup names the consent it could not withdraw" ;;
+    *) bad "revocation overwritten" "a later failure took its place: $(printf '%s' "$s45" | tr '\n' ' ' | tail -c 200)" ;;
+  esac
+  case "$s45" in
+    *"Fix:  delete ~/.claude/ccd/paid-handoff, or re-run: ccd setup --no-auto"*)
+      ok "...and the remedy beside it is the one that withdraws the consent" ;;
+    *) bad "revocation remedy" "no remedy that revokes: $(printf '%s' "$s45" | tr '\n' ' ' | tail -c 200)" ;;
+  esac
+  case "$s45" in
+    *"then re-run: ccd setup"*)
+      bad "revocation remedy" "sent the user to a plain \`ccd setup\`, which revokes nothing" ;;
+    *) ok "...and not to a plain \`ccd setup\`, which revokes nothing" ;;
+  esac
+  [ "$s45st" -ne 0 ] \
+    && ok "...and setup exits non-zero (got $s45st)" \
+    || bad "revocation" "exited 0 with the paid opt-in still in effect"
+  rm -rf "$FAKE"/s45.*
+  unset s45 s45st s45h
+fi
 
 finish
