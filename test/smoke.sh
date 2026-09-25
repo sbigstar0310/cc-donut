@@ -15,7 +15,12 @@ export HOME="$FAKE"
 # for the zsh startup file `ccd setup` edits: where a developer keeps zsh dotfiles
 # outside $HOME, an inherited one sent the fixture's PATH line to their real
 # ~/.zshrc (#100). §18d is the only case with any use for it, and sets it itself.
-unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR ZDOTDIR
+# CCD_PROVIDERS_DIR, and CLAUDE_PROVIDERS_DIR behind it, outrank HOME for the
+# directory keys.env lives in, so on a machine that sets either one §7's `ccd key`
+# overwrote the developer's REAL OpenRouter key — and every run bootstrapped config
+# files into their directory (#109).
+unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR ZDOTDIR \
+      CCD_PROVIDERS_DIR CLAUDE_PROVIDERS_DIR
 # The suite imports bin/ccd-account as a module; Python would otherwise leave its
 # bytecode in bin/, and one such file shipped in v0.8.0 (#77).
 export PYTHONDONTWRITEBYTECODE=1
