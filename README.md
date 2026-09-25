@@ -359,9 +359,14 @@ macOS-specific (osascript); elsewhere it falls back to a hidden terminal prompt.
 
 ```sh
 test/smoke.sh                 # portable checks against the real scripts in a throwaway HOME
+test/smoke.sh statusline      # just one area — the case files whose name carries that word
 test/docker.sh                # same suite in a clean Debian container
 test/docker.sh alpine:3.20    # and on musl/BusyBox
 ```
+
+The assertions live in `test/cases/`, one file per product area, each run in its own
+process with its own throwaway HOME and each runnable on its own.
+
 
 No network, no real key, no writes outside the temp HOME. Run the container tests
 before releasing: GNU/BSD differences (`stat`, for one) go unnoticed on macOS and
