@@ -340,9 +340,13 @@ macOS와 Linux, bash / python3 / curl이 필요합니다. 키 입력창만 macOS
 
 ```sh
 test/smoke.sh                 # 임시 HOME에서 실제 스크립트를 상대로 돌리는 이식성 검사
+test/smoke.sh statusline      # 한 영역만 — 이름에 그 단어가 든 케이스 파일
 test/docker.sh                # 깨끗한 Debian 컨테이너에서 같은 스위트
 test/docker.sh alpine:3.20    # musl/BusyBox에서도
 ```
+
+검증은 `test/cases/`에 제품 영역별로 한 파일씩 들어 있고, 각 파일은 자기 임시 HOME을
+가진 자기 프로세스에서 돌며 혼자서도 돌 수 있습니다.
 
 네트워크 없음, 실제 키 없음, 임시 HOME 밖으로 쓰지 않음. 릴리스 전에 컨테이너 테스트를
 돌리세요. GNU/BSD 차이(예: `stat`)로 인해 macOS에서는 문제가 없던 코드가 Linux에서는
